@@ -631,6 +631,16 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                     # Mono -> Mono: Passthrough
                     audio_filter = "aresample=async=1"
 
+                # [ADDED] Dynamic CRF Adjustment for Live Action Profile
+                base_crf = int(ENCODING_CONFIG["VIDEO_CRF"])
+                profile = job.get('content_profile', 'standard')
+                
+                if profile == 'live_action':
+                    target_crf = base_crf - 6
+                    log(worker_id, f"Live Action profile detected! Allocating 2x bitrate (CRF: {target_crf})")
+                else:
+                    target_crf = base_crf
+
                 cmd = [FFMPEG_CMD, '-y', '-i', local_src, '-map', '0:v:0', '-map', f'0:{audio_index}']
                 for idx in subtitle_indices: cmd.extend(['-map', f'0:{idx}'])
                 
@@ -639,7 +649,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                     '-avoid_negative_ts', 'make_zero',
                     '-c:v', ENCODING_CONFIG["VIDEO_CODEC"], 
                     '-preset', ENCODING_CONFIG["VIDEO_PRESET"], 
-                    '-crf', ENCODING_CONFIG["VIDEO_CRF"], 
+                    '-crf', str(target_crf),   # [CHANGED] Uses dynamically calculated CRF
                     '-pix_fmt', ENCODING_CONFIG["VIDEO_PIX_FMT"], 
                     '-vf', video_filter, 
                     '-c:a', ENCODING_CONFIG["AUDIO_CODEC"], 
