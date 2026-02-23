@@ -23,7 +23,7 @@ from datetime import datetime, timedelta
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "2.6.0" # Incremented for Mono Downmix
+WORKER_VERSION = "2.7.0" # Incremented for linux exit fix
 
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
@@ -33,6 +33,7 @@ LAST_UPDATE_CHECK = 0
 CHECK_LOCK = threading.Lock()
 CONSOLE_LOCK = threading.Lock()
 PROGRESS_LOCK = threading.Lock()
+MONITOR_PAUSED = threading.Event()
 WORKER_PROGRESS = {} 
 PAUSE_REQUESTED = False
 ACTIVE_PROCS = {}
@@ -269,7 +270,7 @@ def print_progress(worker_id, current, total, prefix='', suffix=''):
 
 def monitor_status_loop(worker_ids):
     while not SHUTDOWN_EVENT.is_set():
-        if PAUSE_REQUESTED:
+        if PAUSE_REQUESTED or MONITOR_PAUSED.is_set():
              time.sleep(0.5); continue
         parts = []
         with PROGRESS_LOCK:
@@ -899,7 +900,7 @@ def run_worker(args):
         worker_id = f"{username}-{base_workername}-{i+1}"
         worker_ids.append(worker_id)
         temp_dir = f"./temp_encode_{base_workername}_{i+1}"
-        
+
         t = threading.Thread(target=worker_task, args=(worker_id, manager_url, temp_dir, quota_tracker, single_mode, args.series_id))
         t.daemon = True
         t.start()
@@ -921,6 +922,10 @@ def run_worker(args):
             time.sleep(0.5)
             continue
         
+        MONITOR_PAUSED.set()            # stop monitor from clobbering stdout
+        time.sleep(0.6)                 # give it a moment to stop writing
+        sys.stdout.write('\n')          # move to a clean line
+        sys.stdout.flush()
         toggle_processes(suspend=True)
         print("\n" + "="*40)
         print(" [!] WORKER PAUSED")
@@ -934,11 +939,13 @@ def run_worker(args):
                 choice = input("Select [c/f/s]: ").strip().lower()
                 if choice == 'c':
                     print("[*] Resuming...")
+                    MONITOR_PAUSED.clear()
                     PAUSE_REQUESTED = False
                     toggle_processes(suspend=False)
                 elif choice == 'f':
                     print("[*] Draining jobs...")
                     PAUSE_REQUESTED = False
+                    MONITOR_PAUSED.clear()
                     toggle_processes(suspend=False)
                     SHUTDOWN_EVENT.set()
                 elif choice == 's':
