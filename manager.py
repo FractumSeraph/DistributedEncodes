@@ -302,11 +302,27 @@ def scan_remote_http(url, prefix="", depth=0):
     if depth > 10: return [] # Prevent infinite recursion
     
     found = []
+    headers = {'User-Agent': 'FractumManager/1.0'}
+    
+    # --- [UPDATED] Retry Loop & Increased Timeout ---
+    r = None
+    for attempt in range(3):
+        try:
+            r = requests.get(url, headers=headers, timeout=30) # Increased to 30s
+            if r.status_code == 200:
+                break # Success, exit retry loop
+            else:
+                return [] # Bad status code, give up
+        except requests.exceptions.RequestException as e:
+            if attempt == 2:
+                print(f"[!] HTTP Scan Error on {url} after 3 attempts: {e}")
+                return []
+            time.sleep(3) # Wait 3 seconds before trying again
+
+    if not r or r.status_code != 200: return []
+    # ------------------------------------------------
+    
     try:
-        headers = {'User-Agent': 'FractumManager/1.0'}
-        r = requests.get(url, headers=headers, timeout=10)
-        if r.status_code != 200: return []
-        
         links = re.findall(r'href=["\']([^"\'<>]+)["\']', r.text)
         
         for link in links:
@@ -316,6 +332,7 @@ def scan_remote_http(url, prefix="", depth=0):
             full_url = urljoin(url, link)
             
             if link.endswith('/'):
+                time.sleep(0.2) # [ADDED] Tiny delay to prevent hammering the server
                 found.extend(scan_remote_http(full_url, prefix=f"{prefix}{link}", depth=depth+1))
             elif any(link.lower().endswith(ext) for ext in VIDEO_EXTENSIONS):
                 from urllib.parse import unquote
@@ -324,13 +341,16 @@ def scan_remote_http(url, prefix="", depth=0):
                 
                 size = 0
                 try:
-                    h = requests.head(full_url, headers=headers, timeout=5)
+                    # [UPDATED] Increased timeout for the HEAD request too
+                    h = requests.head(full_url, headers=headers, timeout=15)
                     size = int(h.headers.get('content-length', 0))
                 except: pass
                 
                 found.append((clean_id, clean_name, size))
+                
     except Exception as e:
-        print(f"[!] HTTP Scan Error on {url}: {e}")
+        print(f"[!] HTTP Parsing Error on {url}: {e}")
+        
     return found
 
 def scan_and_queue():
