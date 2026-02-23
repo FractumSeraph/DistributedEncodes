@@ -35,7 +35,7 @@ from flask_limiter.util import get_remote_address
 
 # [SECURITY] Minimum Worker Version to accept. 
 # Workers older than this will be denied jobs until they auto-update.
-MIN_CLIENT_VERSION = "2.5.0"
+MIN_CLIENT_VERSION = "2.8.0"
 
 try:
     from config import (
@@ -372,9 +372,12 @@ def scan_and_queue():
                     job_id, fname, fsize, src_type = item
                     src_url = None
 
-                # [ADDED] Profile tagging based on directory name
+                # [UPDATED] Remote sources are ALWAYS live action. 
+                # Local sources are live action ONLY if they are in a 'live_action' folder.
                 profile = 'standard'
-                if 'live_action' in str(job_id).lower():
+                if src_type == 'remote':
+                    profile = 'live_action'
+                elif 'live_action' in str(job_id).lower():
                     profile = 'live_action'
 
                 cursor.execute("SELECT id FROM jobs WHERE id=?", (job_id,))
