@@ -294,34 +294,35 @@ def verify_upload(filepath):
         return False, str(e)
 
 # ==============================================================================
-# HYBRID SCANNER
+# HYBRID SCANNER (STREAMING GENERATOR)
 # ==============================================================================
 
 def scan_remote_http(url, prefix="", depth=0):
-    """Recursively scans an HTTP directory listing for video files."""
-    if depth > 10: return [] # Prevent infinite recursion
+    """
+    Recursively scans an HTTP directory listing for video files.
+    YIELDS results as they are found (Generator) to allow real-time queuing.
+    """
+    if depth > 10: return # Prevent infinite recursion
     
-    found = []
     headers = {'User-Agent': 'FractumManager/1.0'}
     
-    # --- [UPDATED] Retry Loop & Increased Timeout ---
+    # Retry Loop & Increased Timeout
     r = None
     for attempt in range(3):
         try:
-            r = requests.get(url, headers=headers, timeout=30) # Increased to 30s
+            r = requests.get(url, headers=headers, timeout=30)
             if r.status_code == 200:
-                break # Success, exit retry loop
+                break 
             else:
-                return [] # Bad status code, give up
+                return # Stop if 404/403
         except requests.exceptions.RequestException as e:
             if attempt == 2:
                 print(f"[!] HTTP Scan Error on {url} after 3 attempts: {e}")
-                return []
-            time.sleep(3) # Wait 3 seconds before trying again
+                return
+            time.sleep(3)
 
-    if not r or r.status_code != 200: return []
-    # ------------------------------------------------
-    
+    if not r or r.status_code != 200: return
+
     try:
         links = re.findall(r'href=["\']([^"\'<>]+)["\']', r.text)
         
@@ -332,8 +333,9 @@ def scan_remote_http(url, prefix="", depth=0):
             full_url = urljoin(url, link)
             
             if link.endswith('/'):
-                time.sleep(0.2) # [ADDED] Tiny delay to prevent hammering the server
-                found.extend(scan_remote_http(full_url, prefix=f"{prefix}{link}", depth=depth+1))
+                time.sleep(0.2) # Tiny delay to prevent hammering
+                # Recursively yield results from subdirectories
+                yield from scan_remote_http(full_url, prefix=f"{prefix}{link}", depth=depth+1)
             elif any(link.lower().endswith(ext) for ext in VIDEO_EXTENSIONS):
                 from urllib.parse import unquote
                 clean_name = unquote(link)
@@ -341,108 +343,124 @@ def scan_remote_http(url, prefix="", depth=0):
                 
                 size = 0
                 try:
-                    # [UPDATED] Increased timeout for the HEAD request too
                     h = requests.head(full_url, headers=headers, timeout=15)
                     size = int(h.headers.get('content-length', 0))
                 except: pass
                 
-                found.append((clean_id, clean_name, size))
+                # Yield the found file immediately
+                yield (clean_id, clean_name, size)
                 
     except Exception as e:
         print(f"[!] HTTP Parsing Error on {url}: {e}")
-        
-    return found
 
 def scan_and_queue():
-    files_to_add = [] 
+    """
+    Scans local and remote sources and updates the database/queue in batches.
+    """
     
-    # 1. Scan Local
-    print(f"[*] Scanning LOCAL Source: {SOURCE_DIRECTORY} ...")
-    if not os.path.exists(SOURCE_DIRECTORY): os.makedirs(SOURCE_DIRECTORY)
-    try:
-        for root, dirs, files in os.walk(SOURCE_DIRECTORY, topdown=True):
-            dirs.sort(); files.sort()
-            for file in files:
-                if file.lower().endswith(VIDEO_EXTENSIONS):
-                    rel_path = os.path.relpath(os.path.join(root, file), SOURCE_DIRECTORY)
-                    fsize = os.path.getsize(os.path.join(root, file))
-                    files_to_add.append((rel_path, file, fsize, 'local'))
-    except Exception as e:
-        print(f"[!] Local Scanner error: {e}")
+    # --- Helper: Process a batch of files ---
+    def process_batch(file_batch):
+        if not file_batch: return
+        
+        count_new = 0
+        # 1. Update Database
+        with db_lock:
+            conn = db_handler.get_connection()
+            try:
+                cursor = conn.cursor()
+                for item in file_batch:
+                    # Unpack
+                    if len(item) == 5:
+                        job_id, fname, fsize, src_type, src_url = item
+                    else:
+                        job_id, fname, fsize, src_type = item
+                        src_url = None
 
-    # 2. Scan Remote
+                    # Profile Logic: Remote is ALWAYS live_action
+                    profile = 'standard'
+                    if src_type == 'remote':
+                        profile = 'live_action'
+                    elif 'live_action' in str(job_id).lower():
+                        profile = 'live_action'
+
+                    cursor.execute("SELECT id FROM jobs WHERE id=?", (job_id,))
+                    if not cursor.fetchone():
+                        cursor.execute(
+                            "INSERT INTO jobs (id, filename, status, last_updated, file_size, source_type, source_url, content_profile) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?)", 
+                            (job_id, fname, datetime.now(), fsize, src_type, src_url, profile)
+                        )
+                        count_new += 1
+                conn.commit()
+            finally:
+                conn.close()
+        
+        if count_new > 0:
+            print(f"[*] Added {count_new} new files to Database...")
+
+        # 2. Update Active Queue (Push to Workers)
+        with db_lock:
+            conn = db_handler.get_connection()
+            try:
+                cursor = conn.cursor()
+                cursor.execute("SELECT id, filename, file_size, source_type, source_url FROM jobs WHERE status = 'queued'")
+                for row in cursor.fetchall():
+                    jid, fname, fsize, stype, surl = row
+                    if jid not in queued_job_ids:
+                        dl_link = ""
+                        if stype == 'remote':
+                            base_url = surl if surl else REMOTE_SOURCE_URL
+                            if base_url:
+                                dl_link = urljoin(base_url, quote(jid))
+                        else:
+                            dl_link = f"{SERVER_URL_DISPLAY.rstrip('/')}/download_source/{quote(jid, safe='/')}"
+                        
+                        if dl_link:
+                            job_queue.put({ 
+                                "id": jid, 
+                                "filename": fname, 
+                                "file_size": fsize, 
+                                "download_url": dl_link 
+                            })
+                            queued_job_ids.add(jid)
+            finally:
+                conn.close()
+
+    # --- 1. Scan Local ---
+    print(f"[*] Scanning LOCAL Source: {SOURCE_DIRECTORY} ...")
+    local_batch = []
+    if os.path.exists(SOURCE_DIRECTORY):
+        try:
+            for root, dirs, files in os.walk(SOURCE_DIRECTORY, topdown=True):
+                dirs.sort(); files.sort()
+                for file in files:
+                    if file.lower().endswith(VIDEO_EXTENSIONS):
+                        rel_path = os.path.relpath(os.path.join(root, file), SOURCE_DIRECTORY)
+                        fsize = os.path.getsize(os.path.join(root, file))
+                        local_batch.append((rel_path, file, fsize, 'local'))
+        except Exception as e:
+            print(f"[!] Local Scanner error: {e}")
+    
+    if local_batch:
+        process_batch(local_batch)
+
+    # --- 2. Scan Remote (Streaming) ---
     if REMOTE_SOURCE_URL:
         print(f"[*] Scanning REMOTE Source: {REMOTE_SOURCE_URL} ...")
-        remote_files = scan_remote_http(REMOTE_SOURCE_URL)
-        # Pass the current REMOTE_SOURCE_URL as the source_url for these files
-        for r_id, r_name, r_size in remote_files:
-            files_to_add.append((r_id, r_name, r_size, 'remote', REMOTE_SOURCE_URL))
-
-    # 3. Update DB
-    count_new = 0
-    with db_lock:
-        conn = db_handler.get_connection()
-        try:
-            cursor = conn.cursor()
-            for item in files_to_add:
-                # Handle tuple unpacking for both local (4 items) and remote (5 items)
-                if len(item) == 5:
-                    job_id, fname, fsize, src_type, src_url = item
-                else:
-                    job_id, fname, fsize, src_type = item
-                    src_url = None
-
-                # [UPDATED] Remote sources are ALWAYS live action. 
-                # Local sources are live action ONLY if they are in a 'live_action' folder.
-                profile = 'standard'
-                if src_type == 'remote':
-                    profile = 'live_action'
-                elif 'live_action' in str(job_id).lower():
-                    profile = 'live_action'
-
-                cursor.execute("SELECT id FROM jobs WHERE id=?", (job_id,))
-                if not cursor.fetchone():
-                    cursor.execute(
-                        "INSERT INTO jobs (id, filename, status, last_updated, file_size, source_type, source_url, content_profile) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?)", 
-                        (job_id, fname, datetime.now(), fsize, src_type, src_url, profile)
-                    )
-                    count_new += 1
-            conn.commit()
-        finally:
-            conn.close()
-
-    if count_new > 0: log_event("INFO", f"Scanner found {count_new} new files.")
-
-    # 4. Refresh Queue
-    print("[*] Loading queue...")
-    with db_lock:
-        conn = db_handler.get_connection()
-        try:
-            # Fetch source_type and source_url as well
-            cursor = conn.cursor()
-            cursor.execute("SELECT id, filename, file_size, source_type, source_url FROM jobs WHERE status = 'queued'")
-            for row in cursor.fetchall():
-                jid, fname, fsize, stype, surl = row
-                if jid not in queued_job_ids:
-                    dl_link = ""
-                    if stype == 'remote':
-                        # Use stored URL if available, else fallback to global config
-                        base_url = surl if surl else REMOTE_SOURCE_URL
-                        if base_url:
-                            dl_link = urljoin(base_url, quote(jid))
-                    else:
-                        dl_link = f"{SERVER_URL_DISPLAY.rstrip('/')}/download_source/{quote(jid, safe='/')}"
-                    
-                    if dl_link:
-                        job_queue.put({ 
-                            "id": jid, 
-                            "filename": fname, 
-                            "file_size": fsize, 
-                            "download_url": dl_link 
-                        })
-                        queued_job_ids.add(jid)
-        finally:
-            conn.close()
+        remote_batch = []
+        # Iterate over the generator
+        for r_id, r_name, r_size in scan_remote_http(REMOTE_SOURCE_URL):
+            remote_batch.append((r_id, r_name, r_size, 'remote', REMOTE_SOURCE_URL))
+            
+            # Commit every 10 files so workers don't wait
+            if len(remote_batch) >= 10:
+                process_batch(remote_batch)
+                remote_batch = []
+        
+        # Commit any remaining files
+        if remote_batch:
+            process_batch(remote_batch)
+            
+    print("[*] Scan complete.")
 
 def get_series_list():
     try:
