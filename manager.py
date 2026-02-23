@@ -372,11 +372,16 @@ def scan_and_queue():
                     job_id, fname, fsize, src_type = item
                     src_url = None
 
+                # [ADDED] Profile tagging based on directory name
+                profile = 'standard'
+                if 'live_action' in str(job_id).lower():
+                    profile = 'live_action'
+
                 cursor.execute("SELECT id FROM jobs WHERE id=?", (job_id,))
                 if not cursor.fetchone():
                     cursor.execute(
-                        "INSERT INTO jobs (id, filename, status, last_updated, file_size, source_type, source_url) VALUES (?, ?, 'queued', ?, ?, ?, ?)", 
-                        (job_id, fname, datetime.now(), fsize, src_type, src_url)
+                        "INSERT INTO jobs (id, filename, status, last_updated, file_size, source_type, source_url, content_profile) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?)", 
+                        (job_id, fname, datetime.now(), fsize, src_type, src_url, profile)
                     )
                     count_new += 1
             conn.commit()
@@ -466,6 +471,9 @@ def init_db():
         try: cursor.execute("ALTER TABLE jobs ADD COLUMN source_url TEXT")
         except sqlite3.OperationalError: pass
         try: cursor.execute("ALTER TABLE jobs ADD COLUMN warnings TEXT")
+        except sqlite3.OperationalError: pass
+        # [ADDED] Live Action Profile Column
+        try: cursor.execute("ALTER TABLE jobs ADD COLUMN content_profile TEXT DEFAULT 'standard'")
         except sqlite3.OperationalError: pass
         
         conn.commit()
@@ -579,7 +587,8 @@ def get_job():
                             query_parts.append("id LIKE ?")
                             params.append(f"{folder_filter}%")
                         
-                        sql = f"SELECT id, filename, file_size, source_type, source_url FROM jobs WHERE {' AND '.join(query_parts)} ORDER BY id ASC LIMIT 1"
+                        # [ADDED] content_profile to SELECT query
+                        sql = f"SELECT id, filename, file_size, source_type, source_url, content_profile FROM jobs WHERE {' AND '.join(query_parts)} ORDER BY id ASC LIMIT 1"
                         c.execute(sql, tuple(params)); row = c.fetchone()
                         if row: job = dict(row); break
                 
