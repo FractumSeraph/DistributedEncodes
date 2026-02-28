@@ -35,7 +35,7 @@ from flask_limiter.util import get_remote_address
 
 # [SECURITY] Minimum Worker Version to accept. 
 # Workers older than this will be denied jobs until they auto-update.
-MIN_CLIENT_VERSION = "2.8.0"
+MIN_CLIENT_VERSION = "2.5.0"
 
 try:
     from config import (
@@ -537,6 +537,14 @@ def api_ping(): return jsonify({"status": "pong"})
 
 @app.route('/dl/worker')
 def download_worker_script(): return send_file(WORKER_TEMPLATE_FILE, as_attachment=True, download_name='worker.py')
+
+# [ADDED] Route to serve the watermark font to workers
+@app.route('/dl/font')
+def download_font():
+    font_path = os.path.abspath('arial.ttf')
+    if os.path.exists(font_path):
+        return send_file(font_path, as_attachment=True, download_name='arial.ttf')
+    return abort(404)
 
 @app.route('/api/series')
 def api_series_list(): return jsonify({"series": get_series_list()})
