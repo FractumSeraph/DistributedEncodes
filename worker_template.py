@@ -23,7 +23,7 @@ from datetime import datetime, timedelta
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "2.8.0" # Incremented for live action crf changing.
+WORKER_VERSION = "2.9.0" # Incremented for font fix
 
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
@@ -596,17 +596,33 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                 log(worker_id, f"Encoding ({total_min}m)...")
                 post_status("processing", 0, total_min)
 
+                # [ADDED] Ensure font exists, download from manager if missing
+                src_font = os.path.join(_script_dir, "arial.ttf")
+                if not os.path.exists(src_font):
+                    log(worker_id, "arial.ttf missing locally. Downloading from manager...")
+                    try:
+                        font_req = requests.get(f"{manager_url}/dl/font", headers=get_auth_headers(), timeout=30)
+                        if font_req.status_code == 200:
+                            with open(src_font, 'wb') as f:
+                                f.write(font_req.content)
+                            log(worker_id, "Font downloaded successfully.")
+                    except Exception as e:
+                        log(worker_id, f"Font download failed: {e}", "WARN")
+
                 # Copy font to temp dir for robust relative path usage (Avoids Windows path escaping issues)
                 local_font = os.path.join(temp_dir, "arial.ttf")
                 try:
-                    src_font = os.path.join(_script_dir, "arial.ttf")
                     if os.path.exists(src_font):
                         shutil.copy(src_font, local_font)
                 except: pass
                 
-                # Construct video filter with font
-                font_arg = local_font.replace("\\", "/")
-                video_filter = f"{ENCODING_CONFIG['VIDEO_SCALE']},drawtext=text='@FractumSeraph':fontfile='{font_arg}':fontcolor=white@0.2:fontsize=12:x=10:y=h-th-10"
+                # Construct video filter conditionally based on font availability
+                if os.path.exists(local_font):
+                    font_arg = local_font.replace("\\", "/")
+                    video_filter = f"{ENCODING_CONFIG['VIDEO_SCALE']},drawtext=text='@FractumSeraph':fontfile='{font_arg}':fontcolor=white@0.2:fontsize=12:x=10:y=h-th-10"
+                else:
+                    video_filter = ENCODING_CONFIG['VIDEO_SCALE']
+                    log(worker_id, "Warning: arial.ttf could not be sourced. Skipping watermark.", "WARN")
                 
                 # Robust Audio Downmixing (Prevents crashes on corrupt streams claiming 40+ channels)
                 audio_channels = 2 # Default assumption
