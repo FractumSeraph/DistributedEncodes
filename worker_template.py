@@ -34,7 +34,7 @@ except ImportError:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "2.9.0" # Incremented for font fix
+WORKER_VERSION = "3.0.0" # Incremented for big changes. Like Textual.
 
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
