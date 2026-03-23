@@ -36,6 +36,7 @@ Encoded output is intended for [https://vsv.fractumseraph.net/](https://vsv.frac
 | `--daily-quota GB` | `0` (unlimited) | Cap total data downloaded per day |
 | `--watermark` | off | Burn `@FractumSeraph` text into the video |
 | `--no-tui` | off | Plain terminal output instead of the TUI |
+| `--max-size-mb N` | `0` (no limit) | Skip source files larger than N MB |
 
 The `WORKER_SECRET` environment variable is the preferred way to pass the auth token.
 
@@ -146,6 +147,8 @@ When running with the Textual TUI (default when `textual` is installed):
 | Stop `[S]` | Kill all encodes and exit immediately |
 
 FFmpeg is frozen at the OS level during a pause (via `NtSuspendProcess` on Windows, `SIGSTOP` on Linux), so CPU usage drops to zero.
+
+The TUI shows a per-worker table with columns: Worker, Current File, Phase, Progress bar, Elapsed, Done count, and ETA (estimated time remaining, shown during encoding).
 
 ---
 
@@ -280,9 +283,9 @@ All encoding is done by the worker. Settings are baked into `worker_template.py`
 |---|---|
 | Video codec | `libsvtav1` (SVT-AV1) |
 | Preset | `2` (high quality, slow) |
-| CRF | `38` standard / `32` live-action |
+| CRF | `63` standard / `57` live-action |
 | Resolution | 480p (scale to width, keep aspect) |
-| Audio codec | Opus, mono, 48k, 32kbps |
+| Audio codec | Opus, mono, 24kbps |
 | Container | `.mp4` |
 
 The manager detects a `live_action` content profile and tells the worker to reduce CRF by 6 (allocating ~2x bitrate).
@@ -331,7 +334,8 @@ Pulls the latest code from git and restarts the service. Run on the manager host
    └─────────────┘   └─────────────┘   └─────────────┘
 ```
 
-- **Job lifecycle:** `queued` → `processing` → `completed` / `failed`
+- **Job lifecycle:** `queued` → `processing` → `completed` / `failed` / `permanently_failed`
+- **Permanent failures:** jobs that fail 5 times are marked `permanently_failed` and excluded from the queue. An admin can re-enable them via *Reset Failed* in the admin panel.
 - **Stale jobs** (no heartbeat for 4 hours) are automatically reset to `queued` by the maintenance loop.
 - **Upload verification:** The manager runs `ffprobe` on every uploaded file and rejects anything that isn't AV1 at 480p.
 - **Cheating detection:** The manager parses the uploaded FFmpeg log to verify the correct codec and preset were used.

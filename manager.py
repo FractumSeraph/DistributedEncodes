@@ -97,6 +97,11 @@ db_lock = threading.RLock()
 # Cache for outdated worker logs to prevent spamming DB
 OUTDATED_LOG_CACHE = {} 
 
+# In-memory cache for banned_workers.txt (refreshed every 60s)
+_BANNED_CACHE: set = set()
+_BANNED_CACHE_TIME: float = 0.0
+_BANNED_CACHE_LOCK = threading.Lock()
+
 # ==============================================================================
 # ADVANCED DATABASE HANDLER (RAM/DISK)
 # ==============================================================================
@@ -218,13 +223,18 @@ def is_version_sufficient(client_ver, min_ver):
         return False
 
 def is_worker_banned(worker_id):
+    global _BANNED_CACHE, _BANNED_CACHE_TIME
     if not worker_id: return False
-    try:
-        with open("banned_workers.txt", "r") as f:
-            banned_list = [line.strip().lower() for line in f.readlines() if line.strip()]
-            return worker_id.strip().lower() in banned_list
-    except FileNotFoundError:
-        return False
+    with _BANNED_CACHE_LOCK:
+        now = time.time()
+        if now - _BANNED_CACHE_TIME > 60:
+            try:
+                with open("banned_workers.txt", "r") as f:
+                    _BANNED_CACHE = {line.strip().lower() for line in f if line.strip()}
+            except FileNotFoundError:
+                _BANNED_CACHE = set()
+            _BANNED_CACHE_TIME = now
+        return worker_id.strip().lower() in _BANNED_CACHE
 
 @app.after_request
 def add_security_headers(response):
@@ -386,7 +396,7 @@ def scan_and_queue():
                     cursor.execute("SELECT id FROM jobs WHERE id=?", (job_id,))
                     if not cursor.fetchone():
                         cursor.execute(
-                            "INSERT INTO jobs (id, filename, status, last_updated, file_size, source_type, source_url, content_profile) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?)", 
+                            "INSERT INTO jobs (id, filename, status, last_updated, file_size, source_type, source_url, content_profile, fail_count) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, 0)", 
                             (job_id, fname, datetime.now(), fsize, src_type, src_url, profile)
                         )
                         count_new += 1
@@ -465,19 +475,24 @@ def scan_and_queue():
 def get_series_list():
     try:
         # [FIX] Allow series listing even in hybrid mode
-        if not os.path.exists(SOURCE_DIRECTORY): return []
+        if not os.path.exists(SOURCE_DIRECTORY): return [], []
         
         folders = sorted([d for d in os.listdir(SOURCE_DIRECTORY) if os.path.isdir(os.path.join(SOURCE_DIRECTORY, d))])
+        folder_set = set(folders)
         mapping = {}
+        stale_keys = []
         
         if os.path.exists('series_names.json'):
             try:
                 mapping = json.load(open('series_names.json', 'r'))
+                stale_keys = [k for k in mapping if k not in folder_set]
+                if stale_keys:
+                    print(f"[!] series_names.json has {len(stale_keys)} stale key(s): {', '.join(stale_keys[:5])}")
             except: pass
             
-        return [{"id": i+1, "folder": f, "name": mapping.get(f, f)} for i, f in enumerate(folders)]
+        return [{"id": i+1, "folder": f, "name": mapping.get(f, f)} for i, f in enumerate(folders)], stale_keys
     except:
-        return []
+        return [], []
 
 # ==============================================================================
 # DATABASE INIT
@@ -515,6 +530,9 @@ def init_db():
         except sqlite3.OperationalError: pass
         # [ADDED] Live Action Profile Column
         try: cursor.execute("ALTER TABLE jobs ADD COLUMN content_profile TEXT DEFAULT 'standard'")
+        except sqlite3.OperationalError: pass
+        # [ADDED] fail_count column for permanent failure tracking
+        try: cursor.execute("ALTER TABLE jobs ADD COLUMN fail_count INTEGER DEFAULT 0")
         except sqlite3.OperationalError: pass
 
         cursor.execute('''
@@ -559,7 +577,9 @@ def download_font():
     return abort(404)
 
 @app.route('/api/series')
-def api_series_list(): return jsonify({"series": get_series_list()})
+def api_series_list():
+    series, stale = get_series_list()
+    return jsonify({"series": series, "stale_series_keys": stale})
 
 @app.route('/install')
 def install_script():
@@ -634,12 +654,12 @@ def get_job():
                     for current_search_id in search_attempts:
                         folder_filter = None
                         if current_search_id:
-                            for s in get_series_list():
+                            for s in get_series_list()[0]:
                                 if s['id'] == int(current_search_id):
                                     folder_filter = s['folder']; break
                         
                         params = [source_type]
-                        query_parts = ["status='queued'", "source_type=?"]
+                        query_parts = ["status='queued'", "source_type=?", "COALESCE(fail_count,0) < 5"]
                         
                         if max_size_mb and max_size_mb.isdigit():
                             query_parts.append("file_size <= ?")
@@ -726,6 +746,10 @@ def upload_result():
 @app.route('/upload_log', methods=['POST'])
 @requires_worker_auth
 def receive_log():
+    MAX_LOG_BYTES = 50 * 1024 * 1024  # 50 MB hard cap
+    if request.content_length and request.content_length > MAX_LOG_BYTES:
+        return jsonify({"status": "error", "message": "Log file exceeds 50 MB limit"}), 413
+
     job_id = request.form.get('job_id')
     worker_id = sanitize_input(request.form.get('worker_id'))
     
@@ -864,7 +888,12 @@ def report_status():
             if d.get('duration', 0) > 0: 
                 sql = "UPDATE jobs SET status=?, worker_id=?, progress=?, last_updated=?, duration=? WHERE id=?"
                 params.insert(4, d.get('duration'))
-            conn.execute(sql, tuple(params)); conn.commit()
+            conn.execute(sql, tuple(params))
+            if status == 'failed':
+                job_id_val = d.get('job_id')
+                conn.execute("UPDATE jobs SET fail_count = COALESCE(fail_count, 0) + 1 WHERE id=?", (job_id_val,))
+                conn.execute("UPDATE jobs SET status='permanently_failed' WHERE id=? AND COALESCE(fail_count, 0) >= 5", (job_id_val,))
+            conn.commit()
         finally:
             conn.close()
     return jsonify({"status": "received"})
@@ -895,9 +924,12 @@ def api_stats():
 
             c.execute("SELECT COUNT(*) FROM jobs")
             total_count = c.fetchone()[0]
+
+            c.execute("SELECT COUNT(*) FROM jobs WHERE status='completed'")
+            total_completed = c.fetchone()[0]
         finally:
             conn.close()
-    return jsonify({"scoreboard": sb, "active": act, "history": hist, "queue_depth": queue_depth, "queue_items": queue_items, "total_jobs": total_count})
+    return jsonify({"scoreboard": sb, "active": act, "history": hist, "queue_depth": queue_depth, "queue_items": queue_items, "total_jobs": total_count, "total_completed": total_completed})
 
 @app.route('/api/all_jobs')
 @requires_auth
@@ -938,9 +970,9 @@ def admin_action():
             if action == 'delete':
                 c.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
             elif action == 'retry':
-                c.execute("UPDATE jobs SET status='queued', progress=0, worker_id=NULL, last_updated=? WHERE id=?", (datetime.now(), job_id))
+                c.execute("UPDATE jobs SET status='queued', progress=0, worker_id=NULL, fail_count=0, last_updated=? WHERE id=?", (datetime.now(), job_id))
             elif action == 'retry_all_failed':
-                c.execute("UPDATE jobs SET status='queued', progress=0, worker_id=NULL, last_updated=? WHERE status='failed'", (datetime.now(),))
+                c.execute("UPDATE jobs SET status='queued', progress=0, worker_id=NULL, fail_count=0, last_updated=? WHERE status IN ('failed', 'permanently_failed')", (datetime.now(),))
             elif action == 'clear_stale':
                 cutoff = datetime.now() - timedelta(minutes=10)
                 c.execute("UPDATE jobs SET status='queued', progress=0, worker_id=NULL, last_updated=?, started_at=NULL WHERE status IN ('processing', 'downloading', 'uploading') AND last_updated < ?", (datetime.now(), cutoff))
@@ -1002,6 +1034,22 @@ def handle_exception(e):
     log_event("CRITICAL", f"Unhandled Exception: {str(e)}\n{traceback.format_exc()}")
     return "Internal Server Error", 500
 
+def sweep_quarantine():
+    """Remove stale files from the quarantine upload directory."""
+    quarantine_dir = os.path.join("temp_uploads", "quarantine")
+    if not os.path.exists(quarantine_dir): return
+    cutoff = time.time() - 3600  # 1 hour
+    count = 0
+    for fname in os.listdir(quarantine_dir):
+        fpath = os.path.join(quarantine_dir, fname)
+        try:
+            if os.path.isfile(fpath) and os.path.getmtime(fpath) < cutoff:
+                os.remove(fpath)
+                count += 1
+        except Exception: pass
+    if count > 0:
+        print(f"[*] Quarantine sweep: removed {count} stale file(s).")
+
 def maintenance_loop():
     while True:
         try:
@@ -1016,7 +1064,7 @@ def maintenance_loop():
                         if last_up:
                             try:
                                 l_time = datetime.strptime(str(last_up).split('.')[0], "%Y-%m-%d %H:%M:%S")
-                                if (now - l_time).total_seconds() > 14400: # 4 Hours Timeout (Increased from 2hr)
+                                if (now - l_time).total_seconds() > 14400: # 4 Hours Timeout
                                     logs_to_write.append(("WARN", f"Worker {worker_id} timed out. Resetting.", jid))
                                     cursor.execute("UPDATE jobs SET status='queued', progress=0, worker_id=NULL, last_updated=?, started_at=NULL WHERE id=?", (now, jid))
                             except: pass 
@@ -1024,12 +1072,29 @@ def maintenance_loop():
                 finally:
                     conn.close()
             for level, msg, jid in logs_to_write: log_event(level, msg, jid)
+
+            # Prune quarantine (files older than 1 hour)
+            sweep_quarantine()
+
+            # Prune encode_logs (files older than 30 days)
+            log_dir = os.path.join(os.getcwd(), "encode_logs")
+            if os.path.exists(log_dir):
+                cutoff_30d = time.time() - 30 * 86400
+                for fname in os.listdir(log_dir):
+                    fpath = os.path.join(log_dir, fname)
+                    try:
+                        if os.path.isfile(fpath) and os.path.getmtime(fpath) < cutoff_30d:
+                            os.remove(fpath)
+                    except Exception: pass
+
         except Exception as e:
             print(f"[!] Maintenance error: {e}")
         time.sleep(60)
 
 print("[*] Initializing Database...")
 init_db()
+# Sweep stale quarantine files from any previous crash
+sweep_quarantine()
 # FIXED: Run startup scan in thread to allow Gunicorn to bind immediately
 threading.Thread(target=scan_and_queue, daemon=True).start() 
 threading.Thread(target=maintenance_loop, daemon=True).start()

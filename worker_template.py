@@ -297,7 +297,7 @@ if HAS_TEXTUAL:
             self._manager_url = manager_url
             # Column keys assigned in on_mount
             self._col_file = self._col_phase = self._col_bar = None
-            self._col_elapsed = self._col_done = None
+            self._col_elapsed = self._col_done = self._col_eta = None
 
         def compose(self) -> ComposeResult:
             yield Header()
@@ -308,10 +308,10 @@ if HAS_TEXTUAL:
 
         def on_mount(self) -> None:
             table = self.query_one("#workers-table", DataTable)
-            cols = table.add_columns("Worker", "Current File", "Phase", "Progress", "Elapsed", "Done")
-            _cw, self._col_file, self._col_phase, self._col_bar, self._col_elapsed, self._col_done = cols
+            cols = table.add_columns("Worker", "Current File", "Phase", "Progress", "Elapsed", "Done", "ETA")
+            _cw, self._col_file, self._col_phase, self._col_bar, self._col_elapsed, self._col_done, self._col_eta = cols
             for wid in self._worker_ids:
-                table.add_row(wid, "-", "Starting", _make_bar(0), "-", "0", key=wid)
+                table.add_row(wid, "-", "Starting", _make_bar(0), "-", "0", "-", key=wid)
             self.title = "Fractum Distributed Worker"
             url_display = self._manager_url or "no manager"
             self.sub_title = f"v{WORKER_VERSION}  \u2502  {len(self._worker_ids)} worker(s)  \u2502  {url_display}"
@@ -338,6 +338,12 @@ if HAS_TEXTUAL:
                 idle_phases = {"Idle", "Starting", "Quota", "Done", "Failed"}
                 elapsed = (now - job_start) if job_start > 0 and phase not in idle_phases else 0.0
 
+                # ETA: estimate remaining time from elapsed and progress
+                if pct > 5 and elapsed > 0 and phase == "Encoding":
+                    eta_sec = elapsed * (100 - pct) / pct
+                else:
+                    eta_sec = 0.0
+
                 style = _phase_style(phase)
                 phase_text = Text(phase, style=style)
                 bar_text   = Text(_make_bar(pct) if phase not in {"Idle", "Starting"} else " " * 20, style=style)
@@ -351,6 +357,7 @@ if HAS_TEXTUAL:
                     table.update_cell(wid, self._col_bar,     bar_text,                update_width=False)
                     table.update_cell(wid, self._col_elapsed, _fmt_elapsed(elapsed),   update_width=False)
                     table.update_cell(wid, self._col_done,    str(jobs_done),          update_width=False)
+                    table.update_cell(wid, self._col_eta,     _fmt_elapsed(eta_sec),   update_width=False)
                 except Exception:
                     pass
 
@@ -553,16 +560,24 @@ def check_version(manager_url):
 
 def apply_update(manager_url):
     safe_print("[*] Downloading and applying update...")
+    tmp_path = None
     try:
         url = f"{manager_url}/dl/worker"
         r = requests.get(url, headers=get_auth_headers(), timeout=30)
         if r.status_code == 200:
-            with open(os.path.abspath(sys.argv[0]), 'w', encoding='utf-8') as f:
+            target_path = os.path.abspath(sys.argv[0])
+            tmp_path = target_path + '.tmp'
+            with open(tmp_path, 'w', encoding='utf-8') as f:
                 f.write(r.text)
+            os.replace(tmp_path, target_path)
             safe_print("[*] Restarting worker...")
             os.execv(sys.executable, [sys.executable] + sys.argv)
     except Exception as e:
         safe_print(f"[!] Failed to apply update: {e}")
+        if tmp_path:
+            try:
+                if os.path.exists(tmp_path): os.remove(tmp_path)
+            except: pass
 
 def print_progress(worker_id, current, total, prefix='', suffix=''):
     if total <= 0: return
@@ -817,7 +832,7 @@ def verify_connection(manager_url):
     print(f"[!] Could not connect to {manager_url}"); return False
 
 
-def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=False, series_id=None, watermark=False):
+def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=False, series_id=None, watermark=False, max_size_mb=0):
     global UPDATE_AVAILABLE
     log(worker_id, "Thread active.")
     os.makedirs(temp_dir, exist_ok=True)
@@ -901,6 +916,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
             try: 
                 params = {'worker_id': worker_id, 'version': WORKER_VERSION}
                 if series_id: params['series_id'] = series_id
+                if max_size_mb and max_size_mb > 0: params['max_size_mb'] = max_size_mb
                 r = requests.get(f"{manager_url}/get_job", params=params, headers=get_auth_headers(), timeout=10)
             except: time.sleep(5); continue
 
@@ -975,6 +991,17 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
 
                 log(worker_id, f"Encoding ({total_min}m)...")
                 post_status("processing", 0, total_min)
+
+                # Disk space pre-flight: need at least 500 MB free for the encoded output
+                try:
+                    _disk_free = shutil.disk_usage(temp_dir).free
+                    if _disk_free < 500 * 1024 * 1024:
+                        log(worker_id, f"Low disk space: {_disk_free/1024**2:.0f} MB free, need 500 MB. Skipping.", "ERROR")
+                        post_status("failed", error_msg="Insufficient disk space")
+                        report_error(job_id, "disk_space", f"Only {_disk_free/1024**2:.0f} MB free, need 500 MB")
+                        continue
+                except Exception as _disk_e:
+                    log(worker_id, f"Disk space check error: {_disk_e}", "WARN")
 
                 # Font is only needed for the watermark
                 local_font = os.path.join(temp_dir, "arial.ttf")
@@ -1346,7 +1373,8 @@ def run_worker(args):
     
     threads = []
     worker_ids = []
-    single_mode = (num_jobs == 1)
+    use_tui = HAS_TEXTUAL and not getattr(args, 'no_tui', False)
+    single_mode = (num_jobs == 1) and not use_tui
 
     # Initialize per-worker detail state and session stats
     global WORKER_DETAILS, SESSION_STATS
@@ -1365,12 +1393,10 @@ def run_worker(args):
         WORKER_DETAILS[worker_id] = {"file": "-", "phase": "Starting", "pct": 0, "job_start": 0.0, "jobs_done": 0}
         temp_dir = f"./temp_encode_{base_workername}_{i+1}"
 
-        t = threading.Thread(target=worker_task, args=(worker_id, manager_url, temp_dir, quota_tracker, single_mode, args.series_id, args.watermark))
+        t = threading.Thread(target=worker_task, args=(worker_id, manager_url, temp_dir, quota_tracker, single_mode, args.series_id, args.watermark, args.max_size_mb))
         t.daemon = True
         t.start()
         threads.append(t)
-
-    use_tui = HAS_TEXTUAL and not getattr(args, 'no_tui', False)
 
     if not single_mode and not use_tui:
         monitor_t = threading.Thread(target=monitor_status_loop, args=(worker_ids,))
@@ -1451,5 +1477,6 @@ if __name__ == "__main__":
     parser.add_argument("--daily-quota", type=float, default=0, help="Daily download limit in GB (0 = unlimited)")
     parser.add_argument("--watermark", action="store_true", default=False, help="Burn the @FractumSeraph watermark into encoded video")
     parser.add_argument("--no-tui", action="store_true", default=False, help="Disable Textual TUI and use plain terminal output")
+    parser.add_argument("--max-size-mb", type=int, default=0, help="Skip source files larger than this size in MB (0 = no limit)")
     args = parser.parse_args()
     run_worker(args)

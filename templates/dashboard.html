@@ -217,6 +217,7 @@
             <div class="kpi"><div class="val" id="pending">--</div><div class="label">Queue Depth</div></div>
             <div class="kpi"><div class="val" id="processing">--</div><div class="label">Active Workers</div></div>
             <div class="kpi"><div class="val" id="done">--</div><div class="label">Completed</div></div>
+            <div class="kpi"><div class="val" id="completion-pct">--%</div><div class="label">% Complete</div></div>
         </div>
         
         <div class="grid">
@@ -369,6 +370,11 @@
                 document.getElementById('pending').innerText = data.queue.pending;
                 document.getElementById('processing').innerText = data.queue.processing;
                 document.getElementById('done').innerText = data.queue.done;
+
+                const totalAll = rawData.total_jobs || 0;
+                const totalCompleted = rawData.total_completed || 0;
+                const completionPct = totalAll > 0 ? Math.round(100 * totalCompleted / totalAll) : 0;
+                document.getElementById('completion-pct').innerText = completionPct + '%';
                 
                 const lb = document.getElementById('lb-table');
                 lb.innerHTML = data.users.length ? data.users.map((u,i) => 
