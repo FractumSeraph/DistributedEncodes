@@ -163,14 +163,15 @@ if HAS_TEXTUAL:
         return {
             "Idle":      "dim",
             "Starting":  "dim",
-            "DL":        "bold cyan",
             "Probe":     "cyan",
+            "DL":        "bold cyan",
             "Encoding":  "bold yellow",
             "Uploading": "bold green",
             "Done":      "bright_green",
             "Failed":    "bold red",
             "Paused":    "bold orange3",
             "Quota":     "orange_red1",
+            "Retrying":  "bold orange3",
         }.get(phase, "white")
 
     def _make_bar(pct: int, width: int = 16) -> str:
@@ -872,78 +873,63 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                 log(worker_id, f"Job: {job['filename']}")
                 d = WORKER_DETAILS.get(worker_id)
                 if d is not None:
-                    d.update({"file": job['filename'], "phase": "DL", "pct": 0, "job_start": time.time()})
-                
-                local_src = os.path.join(temp_dir, "source.tmp")
+                    d.update({"file": job['filename'], "phase": "Probe", "pct": 0, "job_start": time.time()})
+
                 local_dst = os.path.join(temp_dir, f"encoded{ENCODING_CONFIG['OUTPUT_EXT']}")
-                
-                post_status("downloading", 0)
-                
-                download_success = False
-                for attempt in range(3):
+
+                # FFmpeg auth header string (format required by libavformat HTTP demuxer)
+                ffmpeg_http_headers = f"X-Worker-Token: {WORKER_SECRET}\r\n"
+
+                # Quota accounting: a single HEAD request gives us the source size instantly,
+                # letting encoding start immediately rather than waiting for a full download.
+                if quota_tracker:
                     try:
-                        with requests.get(dl_url, stream=True, timeout=60) as r:
-                            r.raise_for_status()
-                            total_size = int(r.headers.get('content-length', 0))
-                            downloaded = 0; last_rep = 0; pct = 0
-                            with open(local_src, 'wb') as f:
-                                for chunk in r.iter_content(chunk_size=65536):
-                                    if PAUSE_REQUESTED:
-                                        _dl_hb = time.time()
-                                        while PAUSE_REQUESTED and not SHUTDOWN_EVENT.is_set():
-                                            if time.time() - _dl_hb > 30:
-                                                post_status("paused", pct)
-                                                _dl_hb = time.time()
-                                            time.sleep(1)
-                                        if SHUTDOWN_EVENT.is_set(): raise Exception("Shutdown")
-                                    
-                                    if chunk:
-                                        if quota_tracker: quota_tracker.add_usage(len(chunk))
-                                        f.write(chunk)
-                                        downloaded += len(chunk)
-                                        pct = int((downloaded/total_size)*100) if total_size > 0 else 0
-                                        
-                                        if single_mode: print_progress(worker_id, downloaded, total_size, prefix='DL')
-                                        else: update_status(f"DL {pct}%")
-
-                                        if time.time() - last_rep > 30:
-                                            post_status("downloading", pct)
-                                            last_rep = time.time()
-                        
-                        if quota_tracker: quota_tracker.force_save()
-                        if single_mode: print_progress(worker_id, total_size, total_size, prefix='DL', suffix='OK')
-                        download_success = True
-                        break
+                        head_r = requests.head(dl_url, headers=get_auth_headers(), timeout=10)
+                        src_size = int(head_r.headers.get('content-length', 0))
+                        if quota_tracker.check_cap():
+                            wait_sec = quota_tracker.get_wait_time()
+                            update_status("Quota Limit")
+                            log(worker_id, f"Daily Quota Reached. Reset in {wait_sec/3600:.1f} hours.")
+                            while wait_sec > 0 and not SHUTDOWN_EVENT.is_set():
+                                time.sleep(min(60, wait_sec))
+                                wait_sec -= 60
+                                if not quota_tracker.check_cap(): break
+                            continue
+                        if src_size > 0:
+                            quota_tracker.add_usage(src_size)
+                            quota_tracker.force_save()
                     except Exception as e:
-                        log(worker_id, f"Download attempt {attempt+1}/3 failed: {e}", "WARNING")
-                        time.sleep(5)
+                        log(worker_id, f"HEAD request for quota failed: {e}", "WARN")
 
-                if not download_success:
-                    err_msg = "Download failed after 3 attempts"
-                    log(worker_id, err_msg, "ERROR")
-                    post_status("failed", error_msg=err_msg)
-                    time.sleep(5); continue
+                post_status("downloading", 0)
 
                 update_status("Probing")
                 total_sec = 0; total_min = 0; audio_index = 0; subtitle_indices = []
-                try:
-                    cmd_probe = [FFPROBE_CMD, '-v', 'quiet', '-print_format', 'json', '-show_streams', '-show_format', local_src]
-                    res = subprocess.run(cmd_probe, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf-8', errors='replace')
-                    probe_data = json.loads(res.stdout)
-                    dur = probe_data.get('format', {}).get('duration')
-                    if dur: total_sec = float(dur); total_min = int(total_sec / 60)
-                    
-                    audio_streams = [s for s in probe_data.get('streams', []) if s['codec_type'] == 'audio']
-                    if audio_streams:
-                        audio_index = audio_streams[0]['index']
-                        for s in audio_streams:
-                            if s.get('tags', {}).get('language', '').lower() in ['eng', 'en', 'english']:
-                                audio_index = s['index']; break
-                    for s in probe_data.get('streams', []):
-                        if s['codec_type'] == 'subtitle':
-                            if s.get('codec_name', '').lower() in ['subrip', 'ass', 'webvtt', 'mov_text', 'text', 'srt', 'ssa']:
-                                subtitle_indices.append(s['index'])
-                except: pass
+                for _probe_attempt in range(3):
+                    try:
+                        cmd_probe = [FFPROBE_CMD,
+                            '-headers', ffmpeg_http_headers,
+                            '-v', 'quiet', '-print_format', 'json', '-show_streams', '-show_format', dl_url]
+                        res = subprocess.run(cmd_probe, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf-8', errors='replace', timeout=60)
+                        probe_data = json.loads(res.stdout)
+                        dur = probe_data.get('format', {}).get('duration')
+                        if dur: total_sec = float(dur); total_min = int(total_sec / 60)
+
+                        audio_streams = [s for s in probe_data.get('streams', []) if s['codec_type'] == 'audio']
+                        if audio_streams:
+                            audio_index = audio_streams[0]['index']
+                            for s in audio_streams:
+                                if s.get('tags', {}).get('language', '').lower() in ['eng', 'en', 'english']:
+                                    audio_index = s['index']; break
+                        for s in probe_data.get('streams', []):
+                            if s['codec_type'] == 'subtitle':
+                                if s.get('codec_name', '').lower() in ['subrip', 'ass', 'webvtt', 'mov_text', 'text', 'srt', 'ssa']:
+                                    subtitle_indices.append(s['index'])
+                        break  # probe succeeded
+                    except Exception as _probe_err:
+                        if _probe_attempt < 2:
+                            log(worker_id, f"Probe failed (attempt {_probe_attempt+1}/3): {_probe_err}. Retrying in {5*(_probe_attempt+1)}s...", "WARN")
+                            time.sleep(5 * (_probe_attempt + 1))
 
                 log(worker_id, f"Encoding ({total_min}m)...")
                 post_status("processing", 0, total_min)
@@ -1009,7 +995,11 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                 else:
                     target_crf = base_crf
 
-                cmd = [FFMPEG_CMD, '-y', '-i', local_src, '-map', '0:v:0', '-map', f'0:{audio_index}']
+                cmd = [FFMPEG_CMD,
+                       '-headers', ffmpeg_http_headers,
+                       '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '60',
+                       '-reconnect_on_network_error', '1',
+                       '-y', '-i', dl_url, '-map', '0:v:0', '-map', f'0:{audio_index}']
                 for idx in subtitle_indices: cmd.extend(['-map', f'0:{idx}'])
                 
                 cmd.extend([
@@ -1029,58 +1019,73 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                     local_dst
                 ])
                 
-                start_enc = time.time(); last_rep = 0; last_enc_pct = 0; last_hb = 0
-                log_buffer = []
-                
-                popen_kwargs = {}
-                if platform.system() == 'Windows':
-                    popen_kwargs['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP
-                else:
-                    popen_kwargs['start_new_session'] = True
+                proc = None; enc_time = 0
+                for _enc_attempt in range(3):
+                    if SHUTDOWN_EVENT.is_set(): break
+                    if _enc_attempt > 0:
+                        _retry_delay = 30
+                        log(worker_id, f"Encode failed (attempt {_enc_attempt}/3, rc={proc.returncode}). Retrying in {_retry_delay}s...", "WARN")
+                        update_status("Retrying")
+                        for _ in range(_retry_delay):
+                            if SHUTDOWN_EVENT.is_set(): break
+                            time.sleep(1)
+                        if SHUTDOWN_EVENT.is_set(): break
+                        log(worker_id, f"Re-encoding ({total_min}m)...")
+                        post_status("processing", 0, total_min)
 
-                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, encoding='utf-8', errors='replace', **popen_kwargs)
-                
-                with PROC_LOCK: ACTIVE_PROCS[worker_id] = proc
-                
-                raw_log_path = os.path.join(temp_dir, "encode.log")
-                with open(raw_log_path, 'w', encoding='utf-8') as raw_log:
-                    while True:
-                        if PAUSE_REQUESTED:
-                            _now = time.time()
-                            if _now - last_hb > 30:
-                                post_status("paused", last_enc_pct)
-                                last_hb = _now
-                            time.sleep(0.2)
-                            continue
+                    start_enc = time.time(); last_rep = 0; last_enc_pct = 0; last_hb = 0
+                    log_buffer = []
 
-                        line = proc.stdout.readline()
-                        if line: 
-                            log_buffer.append(line); log_buffer = log_buffer[-50:]
-                            raw_log.write(line)
-                            raw_log.flush()
-                            
-                        if not line and proc.poll() is not None: break
-                        
-                        if "out_time=" in line and "N/A" not in line and total_sec > 0:
-                            try:
-                                time_str = line.split('=')[1].strip()
-                                curr_sec = get_seconds(time_str)
-                                pct = min(100, int((curr_sec/total_sec)*100))
-                                last_enc_pct = pct
-                                
-                                if single_mode: print_progress(worker_id, curr_sec, total_sec, prefix='Enc')
-                                else: update_status(f"Enc {pct}%")
-                                
-                                if time.time() - last_rep > 10:
-                                    post_status("processing", pct)
-                                    last_rep = time.time()
-                                    last_hb = last_rep
-                            except: pass
-                
-                with PROC_LOCK:
-                    if worker_id in ACTIVE_PROCS: del ACTIVE_PROCS[worker_id]
+                    popen_kwargs = {}
+                    if platform.system() == 'Windows':
+                        popen_kwargs['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP
+                    else:
+                        popen_kwargs['start_new_session'] = True
 
-                enc_time = time.time() - start_enc
+                    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, encoding='utf-8', errors='replace', **popen_kwargs)
+
+                    with PROC_LOCK: ACTIVE_PROCS[worker_id] = proc
+
+                    raw_log_path = os.path.join(temp_dir, "encode.log")
+                    with open(raw_log_path, 'w', encoding='utf-8') as raw_log:
+                        while True:
+                            if PAUSE_REQUESTED:
+                                _now = time.time()
+                                if _now - last_hb > 30:
+                                    post_status("paused", last_enc_pct)
+                                    last_hb = _now
+                                time.sleep(0.2)
+                                continue
+
+                            line = proc.stdout.readline()
+                            if line:
+                                log_buffer.append(line); log_buffer = log_buffer[-50:]
+                                raw_log.write(line)
+                                raw_log.flush()
+
+                            if not line and proc.poll() is not None: break
+
+                            if "out_time=" in line and "N/A" not in line and total_sec > 0:
+                                try:
+                                    time_str = line.split('=')[1].strip()
+                                    curr_sec = get_seconds(time_str)
+                                    pct = min(100, int((curr_sec/total_sec)*100))
+                                    last_enc_pct = pct
+
+                                    if single_mode: print_progress(worker_id, curr_sec, total_sec, prefix='Enc')
+                                    else: update_status(f"Enc {pct}%")
+
+                                    if time.time() - last_rep > 10:
+                                        post_status("processing", pct)
+                                        last_rep = time.time()
+                                        last_hb = last_rep
+                                except: pass
+
+                    with PROC_LOCK:
+                        if worker_id in ACTIVE_PROCS: del ACTIVE_PROCS[worker_id]
+
+                    enc_time = time.time() - start_enc
+                    if proc.returncode == 0 or SHUTDOWN_EVENT.is_set(): break
                 
                 gz_log_path = os.path.join(temp_dir, "encode.log.gz")
                 try:
@@ -1102,7 +1107,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
 
                 if single_mode: print_progress(worker_id, total_sec, total_sec, prefix='Enc', suffix='OK')
 
-                if proc.returncode == 0 and os.path.exists(local_dst):
+                if proc and proc.returncode == 0 and os.path.exists(local_dst):
                     final_size_bytes = os.path.getsize(local_dst)
                     final_size = final_size_bytes / 1024 / 1024
                     log(worker_id, f"Encode done ({enc_time:.0f}s, {final_size:.2f}MB). Uploading...")
@@ -1185,7 +1190,6 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                     post_status("failed", error_msg=err_msg)
                     upload_encode_log()
 
-                if os.path.exists(local_src): os.remove(local_src)
                 if os.path.exists(local_dst): os.remove(local_dst)
                 if os.path.exists(raw_log_path): os.remove(raw_log_path)
                 if os.path.exists(gz_log_path): os.remove(gz_log_path)
