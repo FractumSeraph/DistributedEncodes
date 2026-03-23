@@ -14,6 +14,7 @@ import zipfile
 import tarfile
 import gzip
 import traceback
+import ctypes
 from datetime import datetime, timedelta
 
 # Textual TUI (optional — install with: pip install textual)
@@ -203,9 +204,11 @@ if HAS_TEXTUAL:
         ]
 
         def compose(self) -> ComposeResult:
+            on_windows = platform.system() == 'Windows'
+            subtitle = "FFmpeg has been suspended." if not on_windows else "FFmpeg has been suspended (Windows)."
             with Vertical(id="pause-dialog"):
                 yield Label("\u23f8  WORKER PAUSED", id="pause-title")
-                yield Label("FFmpeg has been suspended.", id="pause-subtitle")
+                yield Label(subtitle, id="pause-subtitle")
                 with Horizontal(id="pause-buttons"):
                     yield Button("Continue  [C]", id="btn-continue", variant="success")
                     yield Button("Finish  [F]", id="btn-finish", variant="warning")
@@ -493,8 +496,29 @@ def signal_handler(sig, frame):
 
 def toggle_processes(suspend=True):
     if platform.system() == 'Windows':
-        if suspend:
-            safe_print("[!] WARNING: Process suspension is not supported on Windows. FFmpeg will continue running until the current job finishes.")
+        # Windows has no SIGSTOP/SIGCONT, but NtSuspendProcess / NtResumeProcess
+        # (ntdll.dll) achieve the identical effect: all threads in the target
+        # process are frozen atomically.  ctypes is stdlib — no extra deps.
+        try:
+            ntdll    = ctypes.windll.ntdll
+            kernel32 = ctypes.windll.kernel32
+            PROCESS_ALL_ACCESS = 0x1F0FFF
+            with PROC_LOCK:
+                for wid, proc in ACTIVE_PROCS.items():
+                    if proc.poll() is None:
+                        try:
+                            h = kernel32.OpenProcess(PROCESS_ALL_ACCESS, False, proc.pid)
+                            if h:
+                                if suspend:
+                                    ntdll.NtSuspendProcess(h)
+                                else:
+                                    ntdll.NtResumeProcess(h)
+                                kernel32.CloseHandle(h)
+                        except Exception as _e:
+                            safe_print(f"[!] Could not {'suspend' if suspend else 'resume'} PID {proc.pid}: {_e}")
+        except Exception as _e:
+            if suspend:
+                safe_print(f"[!] WARNING: Windows process suspension unavailable: {_e}")
         return
     with PROC_LOCK:
         for wid, proc in ACTIVE_PROCS.items():
