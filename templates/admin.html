@@ -62,6 +62,16 @@
         
         .worker-tag { background: #222; padding: 2px 6px; border-radius: 4px; font-size: 0.9em; cursor: pointer; }
         .worker-tag:hover { background: #444; color: #fff; }
+
+        /* Error report styles */
+        .et-badge { display: inline-block; padding: 1px 7px; border-radius: 3px; font-size: 0.8em; font-weight: bold; text-transform: uppercase; }
+        .et-encode_failure { border: 1px solid var(--neon-red); color: var(--neon-red); }
+        .et-exception { border: 1px solid #ff6600; color: #ff6600; }
+        .et-network_error { border: 1px solid var(--neon-orange); color: var(--neon-orange); }
+        .et-other { border: 1px solid var(--text-dim); color: var(--text-dim); }
+
+        .detail-row td { background: #0d0d0d; padding: 10px 15px !important; border-bottom: 1px solid #333; }
+        .detail-pre { white-space: pre-wrap; word-break: break-all; font-size: 0.78em; color: #aaa; max-height: 250px; overflow-y: auto; margin: 0; background: rgba(0,0,0,0.4); padding: 8px; border: 1px solid #333; }
     </style>
 </head>
 <body>
@@ -76,6 +86,7 @@
                 <button onclick="act('all','retry_all_failed')" style="border-color: var(--neon-red); color: var(--neon-red);">[ RESET FAILED ]</button>
                 <button onclick="act('all','archive_history')" style="border-color: var(--neon-pink); color: var(--neon-pink);">[ ARCHIVE HISTORY ]</button>
                 <button onclick="act('all','purge_queue')" style="border-color: var(--neon-red); color: var(--neon-red);">[ PURGE QUEUE ]</button>
+                <button onclick="act('all','clear_error_reports')" style="border-color: var(--neon-orange); color: var(--neon-orange);">[ CLEAR ERRORS ]</button>
                 <button onclick="rescanDB()" style="border-color: var(--neon-green); color: var(--neon-green);">[ SCAN FILES ]</button>
                 <button onclick="refreshAll()" style="border-color: var(--neon-purple); color: var(--neon-purple);">[ REFRESH DATA ]</button>
             </div>
@@ -102,10 +113,10 @@
                 <table>
                     <thead>
                         <tr>
-                            <th width="40%">FILE</th>
-                            <th width="15%">STATUS</th>
-                            <th width="25%">WORKER</th>
-                            <th width="20%">ACTIONS</th>
+                            <th width="36%">FILE</th>
+                            <th width="14%">STATUS</th>
+                            <th width="24%">WORKER</th>
+                            <th width="26%">ACTIONS</th>
                         </tr>
                     </thead>
                     <tbody id="job-list"></tbody>
@@ -118,6 +129,30 @@
             <div class="toolbar-group">
                 <input type="text" id="config-remote-url" placeholder="Remote Source URL..." style="width: 350px;">
                 <button onclick="saveConfig()" style="border-color: var(--neon-purple); color: var(--neon-purple);">SAVE</button>
+            </div>
+        </div>
+
+        <div class="card" style="border-color: var(--neon-red); margin-top: 20px;">
+            <div class="card-header" style="border-color: var(--neon-red);">
+                <h3 style="color:var(--neon-red)">>> ERROR_REPORTS</h3>
+                <div style="display:flex; gap:8px; align-items:center;">
+                    <span id="err-count-badge" style="color:var(--neon-red); font-size:0.8em;"></span>
+                    <button id="err-expand-toggle" onclick="toggleAllDetails()" style="font-size:0.75em;">EXPAND ALL</button>
+                </div>
+            </div>
+            <div class="scroll-box">
+                <table>
+                    <thead>
+                        <tr>
+                            <th width="14%">TIME</th>
+                            <th width="14%">WORKER</th>
+                            <th width="24%">JOB</th>
+                            <th width="14%">TYPE</th>
+                            <th width="34%">MESSAGE</th>
+                        </tr>
+                    </thead>
+                    <tbody id="error-report-list"></tbody>
+                </table>
             </div>
         </div>
 
@@ -151,6 +186,8 @@
     <script>
         let jobsData = [];
         let logsData = [];
+        let errReportsData = [];
+        let expandAllDetails = false;
         
         let jobFilters = { failed: true, processing: true, queued: false, completed: false };
         let logFilters = { ERROR: true, CRITICAL: true, WARN: true, INFO: false };
@@ -161,8 +198,9 @@
         }
 
         async function refreshAll() {
-            await Promise.all([loadJobs(), loadLogs(), loadConfig()]);
+            await Promise.all([loadJobs(), loadLogs(), loadErrorReports(), loadConfig()]);
             applyFilters();
+            renderErrorReports();
         }
 
         async function loadConfig() {
@@ -192,10 +230,70 @@
             jobsData = d.jobs;
         }
 
+        async function loadErrorReports() {
+            try {
+                const r = await fetch('/api/error_reports?limit=200');
+                const d = await r.json();
+                errReportsData = d.reports || [];
+            } catch(e) { errReportsData = []; }
+        }
+
         async function loadLogs() {
             const r = await fetch('/api/logs?limit=500');
             const d = await r.json();
             logsData = d.logs;
+        }
+
+        function fmtTs(ts) {
+            if (!ts) return '';
+            // "2026-03-23 14:32:15.123" -> "03-23 14:32:15"
+            const base = ts.split('.')[0];
+            return base.length > 10 ? base.slice(5) : base;
+        }
+
+        function renderErrorReports() {
+            const badge = document.getElementById('err-count-badge');
+            if (badge) badge.textContent = errReportsData.length ? `(${errReportsData.length})` : '';
+
+            const tbody = document.getElementById('error-report-list');
+            if (!tbody) return;
+
+            if (errReportsData.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="5" style="text-align:center; color:#555;">// NO ERROR REPORTS //</td></tr>';
+                return;
+            }
+
+            tbody.innerHTML = errReportsData.map((r, idx) => {
+                const etClass = `et-${(r.error_type||'other').toLowerCase().replace(/[^a-z0-9_]/g,'_')}`;
+                const hasDetails = r.details && r.details.trim().length > 0;
+                const jobShort = (r.job_id||'').split('/').pop();
+                const detailId = `err-detail-${idx}`;
+                const detailRow = hasDetails
+                    ? `<tr id="${detailId}" style="display:${expandAllDetails?'table-row':'none'}" class="detail-row"><td colspan="5"><div style="margin-bottom:4px; font-size:0.8em; color:var(--neon-red);">DETAILS:</div><pre class="detail-pre">${escapeHTML(r.details)}</pre></td></tr>`
+                    : '';
+                return `
+                <tr style="cursor:${hasDetails?'pointer':'default'}" onclick="${hasDetails?`toggleDetail('${detailId}')`:''}" title="${hasDetails?'Click to expand details':''}">
+                    <td style="color:#666; font-size:0.85em;">${fmtTs(r.timestamp)}</td>
+                    <td><span class="worker-tag">${escapeHTML(r.worker_id||'-')}</span></td>
+                    <td style="font-size:0.82em; color:#aaa;" title="${escapeHTML(r.job_id||'')}">${escapeHTML(jobShort||r.job_id||'-')}</td>
+                    <td><span class="et-badge ${etClass}">${escapeHTML(r.error_type||'?')}</span></td>
+                    <td style="word-break:break-all; font-size:0.85em;">${escapeHTML((r.message||'').slice(0,180))}${(r.message||'').length>180?'…':''}</td>
+                </tr>${detailRow}`;
+            }).join('');
+        }
+
+        function toggleDetail(id) {
+            const el = document.getElementById(id);
+            if (el) el.style.display = el.style.display === 'none' ? 'table-row' : 'none';
+        }
+
+        function toggleAllDetails() {
+            expandAllDetails = !expandAllDetails;
+            const btn = document.getElementById('err-expand-toggle');
+            if (btn) btn.textContent = expandAllDetails ? 'COLLAPSE ALL' : 'EXPAND ALL';
+            document.querySelectorAll('.detail-row').forEach(el => {
+                el.style.display = expandAllDetails ? 'table-row' : 'none';
+            });
         }
 
         function toggleJobFilter(key) {
@@ -240,6 +338,7 @@
                     if (j.status === 'failed' || j.status === 'completed') {
                         actions = `<button onclick="act('${escapeHTML(j.id)}','retry')" style="border-color:var(--neon-green); color:var(--neon-green)">RETRY</button> ` + actions;
                     }
+                    actions += ` <button onclick="downloadLog('${escapeHTML(j.id)}')" style="border-color:#555; color:#888; font-size:0.75em;">LOG</button>`;
 
                     // NEW: Build warning badge
                     let warningBadge = "";
@@ -276,7 +375,7 @@
                     else cssClass = "log-info";
 
                     return `<tr>
-                        <td style="color:#666">${l.timestamp.split(' ')[1]}</td>
+                        <td style="color:#666; font-size:0.85em;">${fmtTs(l.timestamp)}</td>
                         <td class="${cssClass}">${l.level}</td>
                         <td style="word-break: break-all;">${escapeHTML(l.message)}</td>
                         <td style="font-size:0.8em; color:#888;">${escapeHTML(l.related_id || '')}</td>
@@ -296,12 +395,21 @@
             if (action === 'clear_stale') msg = "Clear workers silent for >10 mins?";
             if (action === 'archive_history') msg = "ARCHIVE ALL HISTORY? This will force a re-encode of ALL files.";
             if (action === 'purge_queue') msg = "DELETE ALL QUEUED JOBS? (They will come back if files exist on disk)";
-            
+            if (action === 'clear_error_reports') msg = "Clear ALL error reports?";
+
             if(!confirm(msg)) return;
             fetch('/api/admin_action', {
                 method:'POST', headers:{'Content-Type':'application/json'},
                 body:JSON.stringify({job_id:id, action:action})
             }).then(() => { refreshAll(); });
+        }
+
+        function downloadLog(jobId) {
+            const url = '/api/download_log?job_id=' + encodeURIComponent(jobId);
+            fetch(url, {method:'HEAD'}).then(r => {
+                if (r.ok) { window.location.href = url; }
+                else { alert('No log file found for this job.'); }
+            }).catch(() => alert('Failed to check for log file.'));
         }
 
         function rescanDB() {

@@ -376,8 +376,9 @@
                         <td style="width: 40px; color:var(--text-dim)">#${i+1}</td>
                         <td style="font-weight:bold; color:var(--text-light)">${escapeHTML(u.name)}</td>
                         <td style="text-align:right; color:var(--neon-purple)">${fmtTime(u.time)}</td>
+                        <td style="text-align:right; color:var(--text-dim); font-size:0.85em;">${u.count} file${u.count !== 1 ? 's' : ''}</td>
                     </tr>`
-                ).join('') : '<tr><td colspan="3" style="text-align:center; color:var(--text-dim); padding:20px;">// NO DATA //</td></tr>';
+                ).join('') : '<tr><td colspan="4" style="text-align:center; color:var(--text-dim); padding:20px;">// NO DATA //</td></tr>';
                 
                 const act = document.getElementById('active-list');
                 act.innerHTML = data.active.length ? data.active.map(j => {
@@ -397,10 +398,14 @@
                 const qList = document.getElementById('queue-list');
                 if (qList) {
                     qList.innerHTML = data.queue_items.length ? data.queue_items.map(j => {
-                        const cleanName = j.filename.split('/').pop(); 
+                        const cleanName = j.filename.split('/').pop();
+                        const sizeMB = j.file_size > 0 ? (j.file_size / 1024 / 1024).toFixed(0) + ' MB' : '';
                         return `
                         <div class="job-item" style="border-color: rgba(204,0,255,0.1); padding: 8px;">
-                            <div class="job-file" style="color:var(--text-dim); margin:0;" title="${escapeHTML(cleanName)}">${escapeHTML(cleanName)}</div>
+                            <div style="display:flex; justify-content:space-between; align-items:center;">
+                                <div class="job-file" style="color:var(--text-dim); margin:0; flex:1;" title="${escapeHTML(cleanName)}">${escapeHTML(cleanName)}</div>
+                                ${sizeMB ? `<div style="color:#555; font-size:0.78em; flex-shrink:0; padding-left:8px;">${sizeMB}</div>` : ''}
+                            </div>
                         </div>`;
                     }).join('') : '<div style="color:var(--text-dim); padding:10px;">// QUEUE EMPTY</div>';
                 }

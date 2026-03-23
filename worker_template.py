@@ -13,6 +13,7 @@ import signal
 import zipfile
 import tarfile
 import gzip
+import traceback
 from datetime import datetime, timedelta
 
 # Textual TUI (optional — install with: pip install textual)
@@ -837,6 +838,23 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
             requests.post(f"{manager_url}/report_status", json=payload, headers=get_auth_headers(), timeout=10)
         except: pass
 
+    def report_error(rpt_job_id, error_type, message, details=""):
+        """Send a structured error report to the manager for admin visibility."""
+        try:
+            requests.post(
+                f"{manager_url}/report_error",
+                json={
+                    "job_id": rpt_job_id,
+                    "worker_id": worker_id,
+                    "error_type": error_type,
+                    "message": str(message)[:2048],
+                    "details": str(details)[:32768],
+                },
+                headers=get_auth_headers(),
+                timeout=10
+            )
+        except: pass
+
     while not SHUTDOWN_EVENT.is_set():
         if PAUSE_REQUESTED:
              time.sleep(1); continue
@@ -1180,14 +1198,18 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                         upload_encode_log()
 
                 else:
-                    err_msg = f"FFmpeg exited with code {proc.returncode}"
+                    rc = proc.returncode if proc else -1
+                    err_msg = f"FFmpeg exited with code {rc}"
                     if SHUTDOWN_EVENT.is_set(): err_msg = "Aborted by user/update"
-                    
+
                     log(worker_id, err_msg, "ERROR")
                     log(worker_id, "--- FFmpeg Output Dump ---", "ERROR")
                     for l in log_buffer: safe_print(f"    {l.strip()}")
                     log(worker_id, "--------------------------", "ERROR")
                     post_status("failed", error_msg=err_msg)
+                    if not SHUTDOWN_EVENT.is_set():
+                        report_error(job_id, "encode_failure", err_msg,
+                                     "\n".join(l.rstrip() for l in log_buffer))
                     upload_encode_log()
 
                 if os.path.exists(local_dst): os.remove(local_dst)
@@ -1201,9 +1223,12 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                 time.sleep(10)
         except Exception as e:
             err_str = str(e)
+            err_tb = traceback.format_exc()
             log(worker_id, f"Error: {err_str}", "CRITICAL")
-            try: 
-                if 'job_id' in locals(): post_status("failed", error_msg=err_str)
+            try:
+                if 'job_id' in locals():
+                    post_status("failed", error_msg=err_str)
+                    report_error(job_id, "exception", err_str, err_tb)
             except: pass
             time.sleep(10)
 

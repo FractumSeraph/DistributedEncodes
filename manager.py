@@ -516,7 +516,19 @@ def init_db():
         # [ADDED] Live Action Profile Column
         try: cursor.execute("ALTER TABLE jobs ADD COLUMN content_profile TEXT DEFAULT 'standard'")
         except sqlite3.OperationalError: pass
-        
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS error_reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TIMESTAMP,
+                job_id TEXT,
+                worker_id TEXT,
+                error_type TEXT,
+                message TEXT,
+                details TEXT
+            )
+        ''')
+
         conn.commit()
         conn.close()
 
@@ -767,6 +779,71 @@ def receive_log():
         return jsonify({"status": "success"})
     return jsonify({"status": "error"}), 400
 
+@app.route('/report_error', methods=['POST'])
+@requires_worker_auth
+def receive_error_report():
+    d = request.json
+    if not d:
+        return jsonify({"status": "error"}), 400
+
+    job_id   = sanitize_input(d.get('job_id', ''))   or 'unknown'
+    worker_id = sanitize_input(d.get('worker_id', '')) or 'unknown'
+    error_type = sanitize_input(d.get('error_type', 'unknown')) or 'unknown'
+    message  = str(d.get('message', ''))[:2048]
+    details  = str(d.get('details', ''))[:32768]
+
+    with db_lock:
+        conn = db_handler.get_connection()
+        try:
+            conn.execute(
+                "INSERT INTO error_reports (timestamp, job_id, worker_id, error_type, message, details) VALUES (?, ?, ?, ?, ?, ?)",
+                (datetime.now(), job_id, worker_id, error_type, message, details)
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    log_event("ERROR", f"Error report from {worker_id} [{error_type}]: {message}", job_id)
+    return jsonify({"status": "received"})
+
+
+@app.route('/api/error_reports')
+@requires_auth
+def api_error_reports():
+    try:
+        limit = min(int(request.args.get('limit', 200)), 1000)
+    except (ValueError, TypeError):
+        limit = 200
+
+    with db_lock:
+        conn = db_handler.get_connection()
+        conn.row_factory = sqlite3.Row
+        try:
+            c = conn.cursor()
+            c.execute("SELECT id, timestamp, job_id, worker_id, error_type, message, details FROM error_reports ORDER BY timestamp DESC LIMIT ?", (limit,))
+            reports = [dict(r) for r in c.fetchall()]
+        finally:
+            conn.close()
+    return jsonify({"reports": reports})
+
+
+@app.route('/api/download_log')
+@requires_auth
+def download_encode_log():
+    job_id = request.args.get('job_id', '')
+    if not job_id:
+        return abort(400)
+    safe_name = re.sub(r'[^a-zA-Z0-9_.-]', '_', job_id)
+    log_dir = os.path.abspath("encode_logs")
+    log_path = os.path.abspath(os.path.join(log_dir, f"{safe_name}.log.gz"))
+    # Path traversal guard
+    if not log_path.startswith(log_dir + os.sep):
+        return abort(403)
+    if os.path.exists(log_path):
+        return send_file(log_path, as_attachment=True, download_name=f"{safe_name}.log.gz")
+    return jsonify({"status": "error", "message": "Log file not found"}), 404
+
+
 @app.route('/report_status', methods=['POST'])
 @requires_worker_auth
 def report_status():
@@ -878,7 +955,10 @@ def admin_action():
             elif action == 'purge_queue':
                 c.execute("DELETE FROM jobs WHERE status='queued'")
                 log_event("WARN", "Admin PURGED the queue. Rescan triggered (background).")
-                
+            elif action == 'clear_error_reports':
+                c.execute("DELETE FROM error_reports")
+                log_event("WARN", "Admin cleared all error reports.")
+
             conn.commit()
         finally:
             conn.close()
