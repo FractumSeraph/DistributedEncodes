@@ -7,15 +7,24 @@ import re
 import shutil
 import threading
 import sys
-import traceback
 import platform
 import json
 import signal
 import zipfile
 import tarfile
-import io
 import gzip
 from datetime import datetime, timedelta
+
+# Textual TUI (optional — install with: pip install textual)
+try:
+    from textual.app import App, ComposeResult
+    from textual.widgets import Header, Footer, RichLog, DataTable, Button, Label
+    from textual.screen import ModalScreen
+    from textual.containers import Horizontal, Vertical
+    from textual.binding import Binding
+    HAS_TEXTUAL = True
+except ImportError:
+    HAS_TEXTUAL = False
 
 # ==============================================================================
 # CONFIGURATION
@@ -38,6 +47,13 @@ WORKER_PROGRESS = {}
 PAUSE_REQUESTED = False
 ACTIVE_PROCS = {}
 PROC_LOCK = threading.Lock()
+TUI_APP = None  # Set to WorkerApp instance when running in TUI mode
+
+# Per-worker rich state, polled by the TUI every 0.5s
+# {"file": str, "phase": str, "pct": int, "job_start": float, "jobs_done": int}
+WORKER_DETAILS = {}
+SESSION_STATS = {"jobs_done": 0, "bytes_uploaded": 0, "start": 0.0}
+STATS_LOCK = threading.Lock()
 
 # Global paths for executables
 FFMPEG_CMD = "ffmpeg"
@@ -105,7 +121,8 @@ class QuotaTracker:
                             self._save()
                         return False
             except: pass
-        return self.current_usage >= self.limit_bytes
+        with self.lock:
+            return self.current_usage >= self.limit_bytes
 
     def add_usage(self, num_bytes):
         if self.limit_bytes <= 0: return
@@ -131,6 +148,283 @@ class QuotaTracker:
         return (midnight - now).total_seconds()
 
 
+# ==============================================================================
+# TEXTUAL TUI
+# ==============================================================================
+
+if HAS_TEXTUAL:
+    from rich.text import Text
+
+    # ---------------------------------------------------------------------------
+    # Helpers
+    # ---------------------------------------------------------------------------
+
+    def _phase_style(phase: str) -> str:
+        return {
+            "Idle":      "dim",
+            "Starting":  "dim",
+            "DL":        "bold cyan",
+            "Probe":     "cyan",
+            "Encoding":  "bold yellow",
+            "Uploading": "bold green",
+            "Done":      "bright_green",
+            "Failed":    "bold red",
+            "Paused":    "bold orange3",
+            "Quota":     "orange_red1",
+        }.get(phase, "white")
+
+    def _make_bar(pct: int, width: int = 16) -> str:
+        pct = max(0, min(100, pct))
+        filled = int(width * pct / 100)
+        return "▓" * filled + "░" * (width - filled) + f" {pct:3d}%"
+
+    def _fmt_elapsed(seconds: float) -> str:
+        if seconds <= 0:
+            return "-"
+        s = int(seconds)
+        h, r = divmod(s, 3600)
+        m, sec = divmod(r, 60)
+        return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
+
+    # ---------------------------------------------------------------------------
+    # Pause modal
+    # ---------------------------------------------------------------------------
+
+    class PauseModal(ModalScreen):
+        """Modal dialog shown when the worker is paused."""
+
+        BINDINGS = [
+            Binding("c", "choose_continue", show=False),
+            Binding("f", "choose_finish", show=False),
+            Binding("s", "choose_stop", show=False),
+            Binding("escape", "choose_continue", show=False),
+        ]
+
+        def compose(self) -> ComposeResult:
+            with Vertical(id="pause-dialog"):
+                yield Label("\u23f8  WORKER PAUSED", id="pause-title")
+                yield Label("FFmpeg has been suspended.", id="pause-subtitle")
+                with Horizontal(id="pause-buttons"):
+                    yield Button("Continue  [C]", id="btn-continue", variant="success")
+                    yield Button("Finish  [F]", id="btn-finish", variant="warning")
+                    yield Button("Stop  [S]", id="btn-stop", variant="error")
+
+        def action_choose_continue(self) -> None: self.dismiss("continue")
+        def action_choose_finish(self) -> None: self.dismiss("finish")
+        def action_choose_stop(self) -> None: self.dismiss("stop")
+
+        def on_button_pressed(self, event: Button.Pressed) -> None:
+            choices = {"btn-continue": "continue", "btn-finish": "finish", "btn-stop": "stop"}
+            if event.button.id in choices:
+                self.dismiss(choices[event.button.id])
+
+    # ---------------------------------------------------------------------------
+    # Main application
+    # ---------------------------------------------------------------------------
+
+    class WorkerApp(App):
+        """Fractum Distributed Worker \u2014 Textual TUI."""
+
+        CSS = """
+        Screen {
+            background: $background;
+        }
+        #workers-table {
+            height: auto;
+            max-height: 16;
+            margin: 1 1 0 1;
+            border: solid $primary;
+        }
+        #stats-bar {
+            height: 1;
+            margin: 0 2;
+            background: $surface-darken-1;
+            color: $text-muted;
+            padding: 0 1;
+        }
+        #log-panel {
+            height: 1fr;
+            margin: 0 1 1 1;
+            border: solid $primary-darken-2;
+        }
+        PauseModal {
+            align: center middle;
+        }
+        #pause-dialog {
+            background: $surface;
+            border: thick $warning;
+            padding: 1 4;
+            width: 56;
+            height: auto;
+        }
+        #pause-title {
+            text-align: center;
+            color: $warning;
+            text-style: bold;
+            padding-bottom: 1;
+        }
+        #pause-subtitle {
+            text-align: center;
+            color: $text-disabled;
+            padding-bottom: 1;
+        }
+        #pause-buttons {
+            height: auto;
+            align: center middle;
+            padding-top: 1;
+        }
+        #btn-continue { margin: 0 1; }
+        #btn-finish   { margin: 0 1; }
+        #btn-stop     { margin: 0 1; }
+        """
+
+        BINDINGS = [
+            Binding("p", "request_pause", "Pause"),
+            Binding("q", "request_quit", "Quit"),
+        ]
+
+        def __init__(self, worker_ids: list, threads: list,
+                     quota_tracker=None, manager_url: str = "", **kwargs):
+            super().__init__(**kwargs)
+            self._worker_ids = worker_ids
+            self._threads = threads
+            self._quota_tracker = quota_tracker
+            self._manager_url = manager_url
+            # Column keys assigned in on_mount
+            self._col_file = self._col_phase = self._col_bar = None
+            self._col_elapsed = self._col_done = None
+
+        def compose(self) -> ComposeResult:
+            yield Header()
+            yield DataTable(id="workers-table", show_cursor=False)
+            yield Label("", id="stats-bar")
+            yield RichLog(id="log-panel", highlight=True, markup=False, max_lines=1000)
+            yield Footer()
+
+        def on_mount(self) -> None:
+            table = self.query_one("#workers-table", DataTable)
+            cols = table.add_columns("Worker", "Current File", "Phase", "Progress", "Elapsed", "Done")
+            _cw, self._col_file, self._col_phase, self._col_bar, self._col_elapsed, self._col_done = cols
+            for wid in self._worker_ids:
+                table.add_row(wid, "-", "Starting", _make_bar(0), "-", "0", key=wid)
+            self.title = "Fractum Distributed Worker"
+            url_display = self._manager_url or "no manager"
+            self.sub_title = f"v{WORKER_VERSION}  \u2502  {len(self._worker_ids)} worker(s)  \u2502  {url_display}"
+            self.set_interval(0.5, self._tick)
+            self.set_interval(1.5, self._check_all_done)
+
+        # ------------------------------------------------------------------
+        # Periodic refresh
+        # ------------------------------------------------------------------
+
+        def _tick(self) -> None:
+            """Refresh the workers table and stats bar from shared state."""
+            table = self.query_one("#workers-table", DataTable)
+            now = time.time()
+
+            for wid in self._worker_ids:
+                d = WORKER_DETAILS.get(wid, {})
+                phase     = d.get("phase", "Starting")
+                pct       = d.get("pct", 0)
+                filename  = d.get("file", "-")
+                job_start = d.get("job_start", 0.0)
+                jobs_done = d.get("jobs_done", 0)
+
+                idle_phases = {"Idle", "Starting", "Quota", "Done", "Failed"}
+                elapsed = (now - job_start) if job_start > 0 and phase not in idle_phases else 0.0
+
+                style = _phase_style(phase)
+                phase_text = Text(phase, style=style)
+                bar_text   = Text(_make_bar(pct) if phase not in {"Idle", "Starting"} else " " * 20, style=style)
+
+                max_fn = 32
+                fn_display = filename if len(filename) <= max_fn else "\u2026" + filename[-(max_fn - 1):]
+
+                try:
+                    table.update_cell(wid, self._col_file,    fn_display,              update_width=False)
+                    table.update_cell(wid, self._col_phase,   phase_text,              update_width=False)
+                    table.update_cell(wid, self._col_bar,     bar_text,                update_width=False)
+                    table.update_cell(wid, self._col_elapsed, _fmt_elapsed(elapsed),   update_width=False)
+                    table.update_cell(wid, self._col_done,    str(jobs_done),          update_width=False)
+                except Exception:
+                    pass
+
+            # Stats bar
+            with STATS_LOCK:
+                jd = SESSION_STATS.get("jobs_done", 0)
+                bu = SESSION_STATS.get("bytes_uploaded", 0)
+                st = SESSION_STATS.get("start", now)
+            uptime_str = _fmt_elapsed(now - st)
+            gb_str = f"{bu / 1024 ** 3:.2f} GB"
+            quota_str = ""
+            if self._quota_tracker:
+                quota_str = f"  \u2502  Quota Remaining: {self._quota_tracker.get_remaining_str()}"
+            stats = (
+                f"  Jobs Completed: {jd}"
+                f"  \u2502  Uploaded: {gb_str}"
+                f"  \u2502  Uptime: {uptime_str}"
+                f"{quota_str}"
+            )
+            try:
+                self.query_one("#stats-bar", Label).update(stats)
+            except Exception:
+                pass
+
+        def _check_all_done(self) -> None:
+            if SHUTDOWN_EVENT.is_set() and all(not t.is_alive() for t in self._threads):
+                self.exit()
+
+        # ------------------------------------------------------------------
+        # Thread-safe log write (called via call_from_thread)
+        # ------------------------------------------------------------------
+
+        def write_log(self, message: str) -> None:
+            try:
+                self.query_one("#log-panel", RichLog).write(message)
+            except Exception:
+                pass
+
+        def update_worker_status(self, worker_id: str, status: str) -> None:
+            # Status is now driven by WORKER_DETAILS polling in _tick; this is a no-op.
+            pass
+
+        # ------------------------------------------------------------------
+        # Pause / quit actions
+        # ------------------------------------------------------------------
+
+        def action_request_pause(self) -> None:
+            global PAUSE_REQUESTED
+            if PAUSE_REQUESTED:
+                return
+            PAUSE_REQUESTED = True
+            toggle_processes(suspend=True)
+            self.push_screen(PauseModal(), self._handle_pause_result)
+
+        def _handle_pause_result(self, choice: str) -> None:
+            global PAUSE_REQUESTED
+            if choice == "continue":
+                PAUSE_REQUESTED = False
+                toggle_processes(suspend=False)
+                self.write_log("[*] Encoding resumed.")
+            elif choice == "finish":
+                PAUSE_REQUESTED = False
+                toggle_processes(suspend=False)
+                SHUTDOWN_EVENT.set()
+                self.write_log("[*] Finishing active jobs, then stopping...")
+            elif choice == "stop":
+                toggle_processes(suspend=False)
+                kill_processes()
+                SHUTDOWN_EVENT.set()
+                PAUSE_REQUESTED = False
+                self.write_log("[*] Stopping immediately...")
+                self.set_timer(1.5, self.exit)
+
+        def action_request_quit(self) -> None:
+            SHUTDOWN_EVENT.set()
+            kill_processes()
+            self.exit()
+
+
 def get_auth_headers():
     headers = {'User-Agent': f'FractumWorker/{WORKER_VERSION}'}
     if WORKER_SECRET:
@@ -142,6 +436,12 @@ def get_term_width():
     except: return 80
 
 def safe_print(message):
+    if TUI_APP is not None:
+        try:
+            TUI_APP.call_from_thread(TUI_APP.write_log, message)
+            return
+        except Exception:
+            pass
     with CONSOLE_LOCK:
         try:
             width = get_term_width()
@@ -165,14 +465,24 @@ def log(worker_id, message, level="INFO"):
 def signal_handler(sig, frame):
     global PAUSE_REQUESTED
     if platform.system() == 'Windows':
-        sys.stdout.write('\n[!] Windows Shutdown Initiated...\n')
         SHUTDOWN_EVENT.set()
-        try:
-            kill_processes()
+        try: kill_processes()
         except: pass
+        if TUI_APP is not None:
+            try: TUI_APP.call_from_thread(TUI_APP.exit)
+            except: pass
+        else:
+            sys.stdout.write('\n[!] Windows Shutdown Initiated...\n')
         sys.exit(0)
     else:
-        if not PAUSE_REQUESTED:
+        if TUI_APP is not None:
+            # In TUI mode, Ctrl+C triggers a clean shutdown
+            SHUTDOWN_EVENT.set()
+            try: kill_processes()
+            except: pass
+            try: TUI_APP.call_from_thread(TUI_APP.exit)
+            except: pass
+        elif not PAUSE_REQUESTED:
             PAUSE_REQUESTED = True
             try:
                 sys.stdout.write('\n\n[!] PAUSE REQUESTED (Stopping gracefully...)\n')
@@ -180,14 +490,16 @@ def signal_handler(sig, frame):
             except: pass
 
 def toggle_processes(suspend=True):
+    if platform.system() == 'Windows':
+        if suspend:
+            safe_print("[!] WARNING: Process suspension is not supported on Windows. FFmpeg will continue running until the current job finishes.")
+        return
     with PROC_LOCK:
         for wid, proc in ACTIVE_PROCS.items():
             if proc.poll() is None:
                 try:
-                    if platform.system() == 'Windows': pass 
-                    else:
-                        sig = signal.SIGSTOP if suspend else signal.SIGCONT
-                        os.kill(proc.pid, sig)
+                    sig = signal.SIGSTOP if suspend else signal.SIGCONT
+                    os.kill(proc.pid, sig)
                 except: pass
 
 def kill_processes():
@@ -228,8 +540,15 @@ def apply_update(manager_url):
 
 def print_progress(worker_id, current, total, prefix='', suffix=''):
     if total <= 0: return
-    percent = 100 * (current / float(total))
-    if percent > 100: percent = 100
+    percent = min(100, int(100 * current / float(total)))
+    if TUI_APP is not None:
+        # Update WORKER_DETAILS so the polling _tick() picks it up
+        d = WORKER_DETAILS.get(worker_id)
+        if d is not None:
+            phase_map = {'DL': 'DL', 'Enc': 'Encoding', 'Up': 'Uploading'}
+            d["phase"] = phase_map.get(prefix, prefix)
+            d["pct"]   = percent
+        return
     width = get_term_width()
     overhead = 12 + len(worker_id) + len(prefix) + 10 + len(suffix)
     bar_length = width - overhead - 5
@@ -270,6 +589,8 @@ def print_progress(worker_id, current, total, prefix='', suffix=''):
 
 def monitor_status_loop(worker_ids):
     while not SHUTDOWN_EVENT.is_set():
+        if TUI_APP is not None:
+            time.sleep(1); continue  # TUI handles all status display
         if PAUSE_REQUESTED or MONITOR_PAUSED.is_set():
              time.sleep(0.5); continue
         parts = []
@@ -470,13 +791,36 @@ def verify_connection(manager_url):
     print(f"[!] Could not connect to {manager_url}"); return False
 
 
-def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=False, series_id=None):
+def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=False, series_id=None, watermark=False):
     global UPDATE_AVAILABLE
     log(worker_id, "Thread active.")
     os.makedirs(temp_dir, exist_ok=True)
     
     def update_status(msg):
-        with PROGRESS_LOCK: WORKER_PROGRESS[worker_id] = msg
+        with PROGRESS_LOCK:
+            WORKER_PROGRESS[worker_id] = msg
+        d = WORKER_DETAILS.get(worker_id)
+        if d is not None:
+            if msg.startswith("DL "):
+                d["phase"] = "DL"
+                try: d["pct"] = int(msg[3:].rstrip('%'))
+                except: pass
+            elif msg.startswith("Enc "):
+                d["phase"] = "Encoding"
+                try: d["pct"] = int(msg[4:].rstrip('%'))
+                except: pass
+            elif msg.startswith("Up "):
+                d["phase"] = "Uploading"
+                try: d["pct"] = int(msg[3:].rstrip('%'))
+                except: pass
+            elif msg == "Idle":
+                d.update({"phase": "Idle", "pct": 0, "file": "-", "job_start": 0.0})
+            elif msg == "Probing":
+                d["phase"] = "Probe"
+            elif msg == "Quota Limit":
+                d.update({"phase": "Quota", "pct": 0, "file": "-", "job_start": 0.0})
+            else:
+                d["phase"] = msg
         
     def post_status(status, progress=0, duration=0, error_msg=None):
         try:
@@ -526,6 +870,9 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
             if data and data.get("status") == "ok":
                 job = data["job"]; job_id = job['id']; dl_url = job['download_url']
                 log(worker_id, f"Job: {job['filename']}")
+                d = WORKER_DETAILS.get(worker_id)
+                if d is not None:
+                    d.update({"file": job['filename'], "phase": "DL", "pct": 0, "job_start": time.time()})
                 
                 local_src = os.path.join(temp_dir, "source.tmp")
                 local_dst = os.path.join(temp_dir, f"encoded{ENCODING_CONFIG['OUTPUT_EXT']}")
@@ -538,11 +885,16 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                         with requests.get(dl_url, stream=True, timeout=60) as r:
                             r.raise_for_status()
                             total_size = int(r.headers.get('content-length', 0))
-                            downloaded = 0; last_rep = 0
+                            downloaded = 0; last_rep = 0; pct = 0
                             with open(local_src, 'wb') as f:
                                 for chunk in r.iter_content(chunk_size=65536):
-                                    if PAUSE_REQUESTED: 
-                                        while PAUSE_REQUESTED: time.sleep(1)
+                                    if PAUSE_REQUESTED:
+                                        _dl_hb = time.time()
+                                        while PAUSE_REQUESTED and not SHUTDOWN_EVENT.is_set():
+                                            if time.time() - _dl_hb > 30:
+                                                post_status("paused", pct)
+                                                _dl_hb = time.time()
+                                            time.sleep(1)
                                         if SHUTDOWN_EVENT.is_set(): raise Exception("Shutdown")
                                     
                                     if chunk:
@@ -596,33 +948,33 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                 log(worker_id, f"Encoding ({total_min}m)...")
                 post_status("processing", 0, total_min)
 
-                # [ADDED] Ensure font exists, download from manager if missing
-                src_font = os.path.join(_script_dir, "arial.ttf")
-                if not os.path.exists(src_font):
-                    log(worker_id, "arial.ttf missing locally. Downloading from manager...")
-                    try:
-                        font_req = requests.get(f"{manager_url}/dl/font", headers=get_auth_headers(), timeout=30)
-                        if font_req.status_code == 200:
-                            with open(src_font, 'wb') as f:
-                                f.write(font_req.content)
-                            log(worker_id, "Font downloaded successfully.")
-                    except Exception as e:
-                        log(worker_id, f"Font download failed: {e}", "WARN")
-
-                # Copy font to temp dir for robust relative path usage (Avoids Windows path escaping issues)
+                # Font is only needed for the watermark
                 local_font = os.path.join(temp_dir, "arial.ttf")
-                try:
-                    if os.path.exists(src_font):
-                        shutil.copy(src_font, local_font)
-                except: pass
-                
-                # Construct video filter conditionally based on font availability
-                if os.path.exists(local_font):
+                if watermark:
+                    src_font = os.path.join(_script_dir, "arial.ttf")
+                    if not os.path.exists(src_font):
+                        log(worker_id, "arial.ttf missing locally. Downloading from manager...")
+                        try:
+                            font_req = requests.get(f"{manager_url}/dl/font", headers=get_auth_headers(), timeout=30)
+                            if font_req.status_code == 200:
+                                with open(src_font, 'wb') as f:
+                                    f.write(font_req.content)
+                                log(worker_id, "Font downloaded successfully.")
+                        except Exception as e:
+                            log(worker_id, f"Font download failed: {e}", "WARN")
+                    try:
+                        if os.path.exists(src_font):
+                            shutil.copy(src_font, local_font)
+                    except: pass
+
+                # Construct video filter conditionally based on watermark flag and font availability
+                if watermark and os.path.exists(local_font):
                     font_arg = local_font.replace("\\", "/")
                     video_filter = f"{ENCODING_CONFIG['VIDEO_SCALE']},drawtext=text='@FractumSeraph':fontfile='{font_arg}':fontcolor=white@0.2:fontsize=12:x=10:y=h-th-10"
                 else:
                     video_filter = ENCODING_CONFIG['VIDEO_SCALE']
-                    log(worker_id, "Warning: arial.ttf could not be sourced. Skipping watermark.", "WARN")
+                    if watermark:
+                        log(worker_id, "Warning: arial.ttf could not be sourced. Skipping watermark.", "WARN")
                 
                 # Robust Audio Downmixing (Prevents crashes on corrupt streams claiming 40+ channels)
                 audio_channels = 2 # Default assumption
@@ -677,7 +1029,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                     local_dst
                 ])
                 
-                start_enc = time.time(); last_rep = 0
+                start_enc = time.time(); last_rep = 0; last_enc_pct = 0; last_hb = 0
                 log_buffer = []
                 
                 popen_kwargs = {}
@@ -694,7 +1046,12 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                 with open(raw_log_path, 'w', encoding='utf-8') as raw_log:
                     while True:
                         if PAUSE_REQUESTED:
-                            time.sleep(0.2); continue
+                            _now = time.time()
+                            if _now - last_hb > 30:
+                                post_status("paused", last_enc_pct)
+                                last_hb = _now
+                            time.sleep(0.2)
+                            continue
 
                         line = proc.stdout.readline()
                         if line: 
@@ -708,7 +1065,8 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                             try:
                                 time_str = line.split('=')[1].strip()
                                 curr_sec = get_seconds(time_str)
-                                pct = int((curr_sec/total_sec)*100)
+                                pct = min(100, int((curr_sec/total_sec)*100))
+                                last_enc_pct = pct
                                 
                                 if single_mode: print_progress(worker_id, curr_sec, total_sec, prefix='Enc')
                                 else: update_status(f"Enc {pct}%")
@@ -716,6 +1074,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                                 if time.time() - last_rep > 10:
                                     post_status("processing", pct)
                                     last_rep = time.time()
+                                    last_hb = last_rep
                             except: pass
                 
                 with PROC_LOCK:
@@ -744,7 +1103,8 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                 if single_mode: print_progress(worker_id, total_sec, total_sec, prefix='Enc', suffix='OK')
 
                 if proc.returncode == 0 and os.path.exists(local_dst):
-                    final_size = os.path.getsize(local_dst) / 1024 / 1024
+                    final_size_bytes = os.path.getsize(local_dst)
+                    final_size = final_size_bytes / 1024 / 1024
                     log(worker_id, f"Encode done ({enc_time:.0f}s, {final_size:.2f}MB). Uploading...")
                     post_status("uploading", 0)
                     
@@ -752,13 +1112,20 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                         def __init__(self, filename, callback):
                             self._f = open(filename, 'rb'); self._total = os.path.getsize(filename)
                             self._read = 0; self._callback = callback; self._last_time = 0
+                            self._last_pct = 0
                         def __enter__(self): return self
                         def __exit__(self, exc_type, exc_val, exc_tb): self._f.close()
                         def read(self, size=-1):
                             if PAUSE_REQUESTED:
-                                while PAUSE_REQUESTED: time.sleep(1)
+                                _up_hb = time.time()
+                                while PAUSE_REQUESTED and not SHUTDOWN_EVENT.is_set():
+                                    if time.time() - _up_hb > 30:
+                                        self._callback(self._last_pct)
+                                        _up_hb = time.time()
+                                    time.sleep(1)
                             data = self._f.read(size); self._read += len(data)
                             pct = int((self._read / self._total) * 100)
+                            self._last_pct = pct
                             if single_mode: print_progress(worker_id, self._read, self._total, prefix='Up')
                             else: update_status(f"Up {pct}%")
                             if time.time() - self._last_time > 30:
@@ -791,8 +1158,17 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                     if upload_success:
                         if single_mode: print_progress(worker_id, 100, 100, prefix='Up', suffix='OK')
                         log(worker_id, "Job complete.")
+                        d = WORKER_DETAILS.get(worker_id)
+                        if d is not None:
+                            d.update({"phase": "Done", "pct": 100})
+                            d["jobs_done"] += 1
+                        with STATS_LOCK:
+                            SESSION_STATS["jobs_done"] += 1
+                            SESSION_STATS["bytes_uploaded"] += final_size_bytes
                         upload_encode_log()
                     else:
+                        d = WORKER_DETAILS.get(worker_id)
+                        if d is not None: d["phase"] = "Failed"
                         err_msg = "Upload failed after 3 attempts"
                         log(worker_id, err_msg, "ERROR")
                         post_status("failed", error_msg=err_msg)
@@ -918,75 +1294,97 @@ def run_worker(args):
     threads = []
     worker_ids = []
     single_mode = (num_jobs == 1)
-    
+
+    # Initialize per-worker detail state and session stats
+    global WORKER_DETAILS, SESSION_STATS
+    WORKER_DETAILS = {}
+    with STATS_LOCK:
+        SESSION_STATS["jobs_done"] = 0
+        SESSION_STATS["bytes_uploaded"] = 0
+        SESSION_STATS["start"] = time.time()
+
     if args.series_id:
         print(f"[*] SERIES ID ACTIVE: Processing Series #{args.series_id}")
-    
+
     for i in range(num_jobs):
         worker_id = f"{username}-{base_workername}-{i+1}"
         worker_ids.append(worker_id)
+        WORKER_DETAILS[worker_id] = {"file": "-", "phase": "Starting", "pct": 0, "job_start": 0.0, "jobs_done": 0}
         temp_dir = f"./temp_encode_{base_workername}_{i+1}"
 
-        t = threading.Thread(target=worker_task, args=(worker_id, manager_url, temp_dir, quota_tracker, single_mode, args.series_id))
+        t = threading.Thread(target=worker_task, args=(worker_id, manager_url, temp_dir, quota_tracker, single_mode, args.series_id, args.watermark))
         t.daemon = True
         t.start()
         threads.append(t)
 
-    if not single_mode:
+    use_tui = HAS_TEXTUAL and not getattr(args, 'no_tui', False)
+
+    if not single_mode and not use_tui:
         monitor_t = threading.Thread(target=monitor_status_loop, args=(worker_ids,))
         monitor_t.daemon = True
         monitor_t.start()
-        
-    global PAUSE_REQUESTED
-    while True:
-        if not PAUSE_REQUESTED:
-            all_dead = True
-            for t in threads:
-                if t.is_alive(): all_dead = False; break
-            if all_dead: break
-            if SHUTDOWN_EVENT.is_set() and not PAUSE_REQUESTED: break 
-            time.sleep(0.5)
-            continue
-        
-        MONITOR_PAUSED.set()            # stop monitor from clobbering stdout
-        time.sleep(0.6)                 # give it a moment to stop writing
-        sys.stdout.write('\n')          # move to a clean line
-        sys.stdout.flush()
-        toggle_processes(suspend=True)
-        print("\n" + "="*40)
-        print(" [!] WORKER PAUSED")
-        print("="*40)
-        print(" [C]ontinue  - Resume encoding")
-        print(" [F]inish    - Finish active, then stop")
-        print(" [S]top      - Abort immediately")
-        
-        while PAUSE_REQUESTED:
-            try:
-                choice = input("Select [c/f/s]: ").strip().lower()
-                if choice == 'c':
-                    print("[*] Resuming...")
-                    MONITOR_PAUSED.clear()
-                    PAUSE_REQUESTED = False
-                    toggle_processes(suspend=False)
-                elif choice == 'f':
-                    print("[*] Draining jobs...")
-                    PAUSE_REQUESTED = False
-                    MONITOR_PAUSED.clear()
-                    toggle_processes(suspend=False)
-                    SHUTDOWN_EVENT.set()
-                elif choice == 's':
-                    print("[*] Aborting...")
-                    toggle_processes(suspend=False)
-                    kill_processes()
-                    SHUTDOWN_EVENT.set()
-                    PAUSE_REQUESTED = False
-                    sys.exit(0)
-            except (EOFError, KeyboardInterrupt):
-                sys.stdout.write("\n")
+
+    global PAUSE_REQUESTED, TUI_APP
+    if use_tui:
+        app = WorkerApp(
+            worker_ids=worker_ids,
+            threads=threads,
+            quota_tracker=quota_tracker,
+            manager_url=manager_url,
+        )
+        TUI_APP = app
+        app.run()
+        TUI_APP = None
+    else:
+        while True:
+            if not PAUSE_REQUESTED:
+                all_dead = True
+                for t in threads:
+                    if t.is_alive(): all_dead = False; break
+                if all_dead: break
+                if SHUTDOWN_EVENT.is_set() and not PAUSE_REQUESTED: break
                 time.sleep(0.5)
                 continue
-            except Exception: time.sleep(0.5)
-            
+
+            MONITOR_PAUSED.set()            # stop monitor from clobbering stdout
+            time.sleep(0.6)                 # give it a moment to stop writing
+            sys.stdout.write('\n')          # move to a clean line
+            sys.stdout.flush()
+            toggle_processes(suspend=True)
+            print("\n" + "="*40)
+            print(" [!] WORKER PAUSED")
+            print("="*40)
+            print(" [C]ontinue  - Resume encoding")
+            print(" [F]inish    - Finish active, then stop")
+            print(" [S]top      - Abort immediately")
+
+            while PAUSE_REQUESTED:
+                try:
+                    choice = input("Select [c/f/s]: ").strip().lower()
+                    if choice == 'c':
+                        print("[*] Resuming...")
+                        MONITOR_PAUSED.clear()
+                        PAUSE_REQUESTED = False
+                        toggle_processes(suspend=False)
+                    elif choice == 'f':
+                        print("[*] Draining jobs...")
+                        PAUSE_REQUESTED = False
+                        MONITOR_PAUSED.clear()
+                        toggle_processes(suspend=False)
+                        SHUTDOWN_EVENT.set()
+                    elif choice == 's':
+                        print("[*] Aborting...")
+                        toggle_processes(suspend=False)
+                        kill_processes()
+                        SHUTDOWN_EVENT.set()
+                        PAUSE_REQUESTED = False
+                        sys.exit(0)
+                except (EOFError, KeyboardInterrupt):
+                    sys.stdout.write("\n")
+                    time.sleep(0.5)
+                    continue
+                except Exception: time.sleep(0.5)
+
     if UPDATE_AVAILABLE: apply_update(manager_url)
 
 if __name__ == "__main__":
@@ -998,5 +1396,7 @@ if __name__ == "__main__":
     parser.add_argument("--series-id", default=None, help="Process only specific Series ID")
     parser.add_argument("--secret", default=None, help="Manually set worker secret token")
     parser.add_argument("--daily-quota", type=float, default=0, help="Daily download limit in GB (0 = unlimited)")
+    parser.add_argument("--watermark", action="store_true", default=False, help="Burn the @FractumSeraph watermark into encoded video")
+    parser.add_argument("--no-tui", action="store_true", default=False, help="Disable Textual TUI and use plain terminal output")
     args = parser.parse_args()
     run_worker(args)
