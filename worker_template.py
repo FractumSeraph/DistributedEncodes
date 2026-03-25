@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.0.12" # Incremented for TUI over ssh and tmux.
+WORKER_VERSION = "3.0.13" # Incremented for TUI over ssh and tmux.
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -475,7 +475,7 @@ if HAS_TEXTUAL:
             except Exception:
                 pass
 
-        def _check_signals(self) -> None:
+        async def _check_signals(self) -> None:
             """Poll the signal flag set by the OS signal handler.
 
             call_from_thread() cannot safely be called from a signal handler
@@ -490,11 +490,11 @@ if HAS_TEXTUAL:
             _TUI_SIGNAL = None
             if sig == 'pause':
                 if PAUSE_REQUESTED and self._pause_modal is not None:
-                    # Second Ctrl+C while modal is open = force stop
+                    # Second Ctrl+C while legacy modal is open = force stop
                     try: self._pause_modal.dismiss("stop")
                     except Exception: pass
                 else:
-                    self.action_request_pause()
+                    await self.action_request_pause()
             elif sig == 'quit':
                 self.action_request_quit()
 
@@ -520,16 +520,34 @@ if HAS_TEXTUAL:
         # Pause / quit actions
         # ------------------------------------------------------------------
 
-        def action_request_pause(self) -> None:
+        async def action_request_pause(self) -> None:
             global PAUSE_REQUESTED
             if PAUSE_REQUESTED:
                 return
             PAUSE_REQUESTED = True
-            modal = PauseModal()
-            self._pause_modal = modal
-            self.push_screen(modal, self._handle_pause_result)
-            threading.Thread(target=lambda: toggle_processes(suspend=True),
-                             daemon=True).start()
+
+            if hasattr(self, 'suspend'):
+                # suspend() restores the terminal to normal mode, so plain text
+                # input works reliably — no dependency on Textual key routing.
+                import asyncio
+                def _do_pause():
+                    toggle_processes(suspend=True)
+                    return _run_text_pause_menu()
+                try:
+                    async with self.suspend():
+                        choice = await asyncio.get_running_loop().run_in_executor(
+                            None, _do_pause
+                        )
+                except Exception:
+                    choice = 'stop'
+                await self._handle_pause_result(choice)
+            else:
+                # Older Textual without suspend(): fall back to modal
+                modal = PauseModal()
+                self._pause_modal = modal
+                self.push_screen(modal, self._handle_pause_result)
+                threading.Thread(target=lambda: toggle_processes(suspend=True),
+                                 daemon=True).start()
 
         async def _handle_pause_result(self, choice: str | None) -> None:
             global PAUSE_REQUESTED
@@ -558,6 +576,56 @@ if HAS_TEXTUAL:
             SHUTDOWN_EVENT.set()
             kill_processes()
             self.exit()
+
+
+def _run_text_pause_menu() -> str:
+    """Synchronous text pause menu shown when the TUI is suspended.
+
+    Reads directly from /dev/tty so it works even when stdin is piped.
+    Returns 'continue', 'finish', or 'stop'.
+    """
+    src = None
+    if not sys.stdin.isatty():
+        try:
+            src = open('/dev/tty', 'r')
+        except Exception:
+            pass
+    try:
+        sys.stdout.write("\n" + "="*40 + "\n")
+        sys.stdout.write(" [!] WORKER PAUSED\n")
+        sys.stdout.write("="*40 + "\n")
+        sys.stdout.write(" [C]ontinue  - Resume encoding\n")
+        sys.stdout.write(" [F]inish    - Finish active, then stop\n")
+        sys.stdout.write(" [S]top      - Abort immediately\n")
+        sys.stdout.write(" Ctrl+C      - Force abort\n")
+        sys.stdout.flush()
+        while True:
+            try:
+                prompt_src = src if src else sys.stdin
+                sys.stdout.write("Select [c/f/s]: ")
+                sys.stdout.flush()
+                line = prompt_src.readline()
+                if not line:
+                    return 'stop'
+                ch = line.strip().lower()
+                if ch in ('c', ''):
+                    return 'continue'
+                if ch == 'f':
+                    return 'finish'
+                if ch == 's':
+                    return 'stop'
+            except KeyboardInterrupt:
+                sys.stdout.write("\n[*] Force abort.\n")
+                sys.stdout.flush()
+                return 'stop'
+            except EOFError:
+                return 'stop'
+    finally:
+        if src:
+            try:
+                src.close()
+            except Exception:
+                pass
 
 
 def get_auth_headers():
