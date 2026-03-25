@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.0.15" # Incremented for TUI over ssh and tmux.
+WORKER_VERSION = "3.0.16" # Incremented
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -420,9 +420,19 @@ if HAS_TEXTUAL:
             for environments where Textual's input driver is broken (SSH/tmux)."""
             global _TUI_SIGNAL
             try:
-                import tty, termios
+                import tty, termios, atexit
                 tty_fd = open('/dev/tty', 'rb', buffering=0)
                 old = termios.tcgetattr(tty_fd)
+                # Register atexit BEFORE entering cbreak mode so the terminal is
+                # always restored even if the daemon thread is killed mid-read on
+                # program exit (blocking read(1) won't unblock for the finally).
+                def _restore_tty():
+                    try:
+                        termios.tcsetattr(tty_fd, termios.TCSADRAIN, old)
+                        tty_fd.close()
+                    except Exception:
+                        pass
+                atexit.register(_restore_tty)
                 tty.setcbreak(tty_fd)
                 try:
                     while not SHUTDOWN_EVENT.is_set():
@@ -444,8 +454,10 @@ if HAS_TEXTUAL:
                             elif c == 'q' and _TUI_SIGNAL is None:
                                 _TUI_SIGNAL = 'quit'
                 finally:
-                    termios.tcsetattr(tty_fd, termios.TCSADRAIN, old)
-                    tty_fd.close()
+                    # Normal clean exit — unregister the atexit handler and
+                    # restore immediately so it doesn't run a second time.
+                    atexit.unregister(_restore_tty)
+                    _restore_tty()
             except Exception:
                 pass  # Not available on Windows or if /dev/tty is inaccessible
 
@@ -1629,7 +1641,6 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                         else:
                             head_r = requests.head(dl_url, headers=get_auth_headers(), timeout=10)
                             src_size = int(head_r.headers.get('content-length', 0))
-                        src_size = int(head_r.headers.get('content-length', 0))
                         if quota_tracker.check_cap():
                             wait_sec = quota_tracker.get_wait_time()
                             update_status("Quota Limit")
@@ -1649,40 +1660,45 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
 
                 # -------------------------------------------------------
                 # SOURCE INTEGRITY CHECK
-                # Compute a hash of the source file and submit it to the
-                # server for verification.  The server compares it against
-                # its own stored hash.  The expected hash is never sent to
-                # the worker, so a cheating worker cannot simply echo it back.
+                # Only meaningful for local-source workers: the worker reads
+                # the first 4 MB of the local file and submits its hash so the
+                # server can detect file corruption/replacement on disk.
+                # For remote HTTP sources the server hosts the file itself, so
+                # there is nothing to verify from the worker side — and naively
+                # streaming 4 MB (or the full file when Range isn't supported)
+                # before every encode wastes bandwidth and causes the worker to
+                # appear stuck.
                 # -------------------------------------------------------
-                log(worker_id, "Verifying source file integrity...")
-                update_status("Verifying")
-                _our_hash = _compute_source_hash(dl_url, _is_local)
-                if _our_hash is None:
-                    log(worker_id, "Could not compute source hash. Skipping integrity check.", "WARN")
-                else:
-                    try:
-                        _vr = requests.post(
-                            f"{manager_url}/verify_source_hash",
-                            json={"job_id": job_id, "worker_id": worker_id,
-                                  "source_hash": _our_hash},
-                            headers=get_auth_headers(), timeout=10)
-                        _vstatus = _vr.json().get("status") if _vr.status_code == 200 else "error"
-                    except Exception as _ve:
-                        log(worker_id, f"Hash verify request failed: {_ve}. Skipping check.", "WARN")
-                        _vstatus = "error"
+                if _is_local:
+                    log(worker_id, "Verifying source file integrity...")
+                    update_status("Verifying")
+                    _our_hash = _compute_source_hash(dl_url, _is_local)
+                    if _our_hash is None:
+                        log(worker_id, "Could not compute source hash. Skipping integrity check.", "WARN")
+                    else:
+                        try:
+                            _vr = requests.post(
+                                f"{manager_url}/verify_source_hash",
+                                json={"job_id": job_id, "worker_id": worker_id,
+                                      "source_hash": _our_hash},
+                                headers=get_auth_headers(), timeout=10)
+                            _vstatus = _vr.json().get("status") if _vr.status_code == 200 else "error"
+                        except Exception as _ve:
+                            log(worker_id, f"Hash verify request failed: {_ve}. Skipping check.", "WARN")
+                            _vstatus = "error"
 
-                    if _vstatus == "mismatch":
-                        log(worker_id,
-                            f"SOURCE HASH MISMATCH for {job_id}! "
-                            "The file on this worker does not match the server's source. "
-                            "Aborting encode.", "ERROR")
-                        post_status("failed", error_msg="Source hash mismatch")
-                        report_error(job_id, "hash_mismatch",
-                                     f"Worker hash: {_our_hash}")
-                        continue
-                    elif _vstatus == "ok":
-                        log(worker_id, "Source integrity verified.")
-                    # "pending" or "error" → server has no hash yet, proceed normally
+                        if _vstatus == "mismatch":
+                            log(worker_id,
+                                f"SOURCE HASH MISMATCH for {job_id}! "
+                                "The file on this worker does not match the server's source. "
+                                "Aborting encode.", "ERROR")
+                            post_status("failed", error_msg="Source hash mismatch")
+                            report_error(job_id, "hash_mismatch",
+                                         f"Worker hash: {_our_hash}")
+                            continue
+                        elif _vstatus == "ok":
+                            log(worker_id, "Source integrity verified.")
+                        # "pending" or "error" → server has no hash yet, proceed normally
                 # -------------------------------------------------------
 
                 update_status("Probing")
