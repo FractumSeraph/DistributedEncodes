@@ -15,6 +15,7 @@ import tarfile
 import gzip
 import traceback
 import ctypes
+import hashlib
 from datetime import datetime, timedelta
 
 # Textual TUI (optional — install with: pip install textual)
@@ -34,7 +35,7 @@ except ImportError:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.0.2" # Incremented for Resuming encodes and pause fix.
+WORKER_VERSION = "3.0.3" # Incremented for source file hashing.
 
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
@@ -718,6 +719,44 @@ def _load_resume_checkpoints(temp_dir):
         pass
     return results
 
+# Number of bytes hashed for source-integrity check (must match server constant)
+_HASH_BYTES = 4 * 1024 * 1024
+
+def _compute_source_hash(dl_url, is_local):
+    """Return MD5 hex digest of the first _HASH_BYTES of the source file.
+    For local files the path is read directly; for remote URLs an HTTP Range
+    request is used so we never need to download the whole file first.
+    Returns None on any error so callers can skip the check gracefully."""
+    h = hashlib.md5()
+    try:
+        if is_local:
+            with open(dl_url, 'rb') as f:
+                remaining = _HASH_BYTES
+                while remaining > 0:
+                    chunk = f.read(min(65536, remaining))
+                    if not chunk:
+                        break
+                    h.update(chunk)
+                    remaining -= len(chunk)
+        else:
+            headers = dict(get_auth_headers())
+            headers['Range'] = f'bytes=0-{_HASH_BYTES - 1}'
+            r = requests.get(dl_url, headers=headers, stream=True, timeout=30)
+            # Accept both 206 Partial Content and 200 OK (some servers ignore Range)
+            if r.status_code not in (200, 206):
+                return None
+            read = 0
+            for chunk in r.iter_content(65536):
+                if read >= _HASH_BYTES:
+                    break
+                if read + len(chunk) > _HASH_BYTES:
+                    chunk = chunk[:_HASH_BYTES - read]
+                h.update(chunk)
+                read += len(chunk)
+    except Exception:
+        return None
+    return h.hexdigest()
+
 # ==============================================================================
 # FFMPEG MANAGEMENT
 # ==============================================================================
@@ -1309,6 +1348,44 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                         log(worker_id, f"Quota size check failed: {e}", "WARN")
 
                 post_status("downloading", 0)
+
+                # -------------------------------------------------------
+                # SOURCE INTEGRITY CHECK
+                # Compute a hash of the source file and submit it to the
+                # server for verification.  The server compares it against
+                # its own stored hash.  The expected hash is never sent to
+                # the worker, so a cheating worker cannot simply echo it back.
+                # -------------------------------------------------------
+                log(worker_id, "Verifying source file integrity...")
+                update_status("Verifying")
+                _our_hash = _compute_source_hash(dl_url, _is_local)
+                if _our_hash is None:
+                    log(worker_id, "Could not compute source hash. Skipping integrity check.", "WARN")
+                else:
+                    try:
+                        _vr = requests.post(
+                            f"{manager_url}/verify_source_hash",
+                            json={"job_id": job_id, "worker_id": worker_id,
+                                  "source_hash": _our_hash},
+                            headers=get_auth_headers(), timeout=10)
+                        _vstatus = _vr.json().get("status") if _vr.status_code == 200 else "error"
+                    except Exception as _ve:
+                        log(worker_id, f"Hash verify request failed: {_ve}. Skipping check.", "WARN")
+                        _vstatus = "error"
+
+                    if _vstatus == "mismatch":
+                        log(worker_id,
+                            f"SOURCE HASH MISMATCH for {job_id}! "
+                            "The file on this worker does not match the server's source. "
+                            "Aborting encode.", "ERROR")
+                        post_status("failed", error_msg="Source hash mismatch")
+                        report_error(job_id, "hash_mismatch",
+                                     f"Worker hash: {_our_hash}")
+                        continue
+                    elif _vstatus == "ok":
+                        log(worker_id, "Source integrity verified.")
+                    # "pending" or "error" → server has no hash yet, proceed normally
+                # -------------------------------------------------------
 
                 update_status("Probing")
                 total_sec = 0; total_min = 0; audio_index = 0; subtitle_indices = []

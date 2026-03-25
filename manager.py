@@ -12,6 +12,7 @@ import uuid
 import secrets
 import platform
 import gzip
+import hashlib
 from functools import wraps
 from datetime import datetime, timedelta
 from urllib.parse import quote, urljoin
@@ -534,6 +535,9 @@ def init_db():
         # [ADDED] fail_count column for permanent failure tracking
         try: cursor.execute("ALTER TABLE jobs ADD COLUMN fail_count INTEGER DEFAULT 0")
         except sqlite3.OperationalError: pass
+        # [ADDED] source_hash: MD5 of first 4 MB of source file for integrity verification
+        try: cursor.execute("ALTER TABLE jobs ADD COLUMN source_hash TEXT")
+        except sqlite3.OperationalError: pass
 
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS error_reports (
@@ -553,6 +557,25 @@ def init_db():
 # ==============================================================================
 # ROUTES
 # ==============================================================================
+
+# Number of bytes used for the fast source-file hash (4 MB)
+_HASH_BYTES = 4 * 1024 * 1024
+
+def _fast_hash_file(path, nbytes=_HASH_BYTES):
+    """Return MD5 hex digest of the first `nbytes` of a local file."""
+    h = hashlib.md5()
+    try:
+        with open(path, 'rb') as f:
+            remaining = nbytes
+            while remaining > 0:
+                chunk = f.read(min(65536, remaining))
+                if not chunk:
+                    break
+                h.update(chunk)
+                remaining -= len(chunk)
+    except Exception:
+        return None
+    return h.hexdigest()
 
 @app.route('/')
 def dashboard(): return render_template('dashboard.html')
@@ -669,7 +692,7 @@ def get_job():
                             params.append(f"{folder_filter}%")
                         
                         # [ADDED] content_profile to SELECT query
-                        sql = f"SELECT id, filename, file_size, source_type, source_url, content_profile FROM jobs WHERE {' AND '.join(query_parts)} ORDER BY id ASC LIMIT 1"
+                        sql = f"SELECT id, filename, file_size, source_type, source_url, content_profile, source_hash FROM jobs WHERE {' AND '.join(query_parts)} ORDER BY id ASC LIMIT 1"
                         c.execute(sql, tuple(params)); row = c.fetchone()
                         if row: job = dict(row); break
                 
@@ -684,6 +707,18 @@ def get_job():
                              job['download_url'] = "" 
                     else:
                          job['download_url'] = f"{SERVER_URL_DISPLAY.rstrip('/')}/download_source/{quote(job['id'], safe='/')}"
+                         # Lazily compute source hash for local files on first pickup
+                         if not job.get('source_hash'):
+                             _src_path = os.path.join(SOURCE_DIRECTORY, job['id'].replace('/', os.sep))
+                             _computed = _fast_hash_file(_src_path)
+                             if _computed:
+                                 conn.execute("UPDATE jobs SET source_hash=? WHERE id=?",
+                                              (_computed, job['id']))
+                                 job['source_hash'] = _computed
+
+                    # Never reveal the hash to the worker — workers must submit their own
+                    # computed hash blind so they cannot cheat by echoing the known value.
+                    job.pop('source_hash', None)
 
                     conn.execute("UPDATE jobs SET status='processing', worker_id=?, worker_version=?, last_updated=?, started_at=? WHERE id=?", 
                         (worker_id, worker_version, datetime.now(), datetime.now(), job['id']))
@@ -924,6 +959,50 @@ def reclaim_job():
             conn.close()
     log_event("INFO", f"Job reclaimed by {worker_id} (resume path)", job_id)
     return jsonify({"status": "ok"})
+
+
+@app.route('/verify_source_hash', methods=['POST'])
+@requires_worker_auth
+def verify_source_hash():
+    """Worker submits the MD5 hash it computed from the source file before encoding.
+    Server compares against the stored hash to detect wrong-file or cheating scenarios.
+    Returns {"status": "ok"} on match, {"status": "mismatch"} on mismatch,
+    or {"status": "pending"} when the server has not yet computed its hash."""
+    d = request.json or {}
+    job_id    = sanitize_input(d.get('job_id', ''))
+    worker_id = sanitize_input(d.get('worker_id', ''))
+    worker_hash = str(d.get('source_hash', '')).strip().lower()
+
+    if not job_id or not worker_id or not worker_hash:
+        return jsonify({"status": "error", "message": "job_id, worker_id and source_hash required"}), 400
+
+    with db_lock:
+        conn = db_handler.get_connection()
+        conn.row_factory = sqlite3.Row
+        try:
+            c = conn.cursor()
+            c.execute("SELECT source_hash FROM jobs WHERE id=?", (job_id,))
+            row = c.fetchone()
+            if row is None:
+                return jsonify({"status": "error", "message": "not_found"}), 404
+            stored_hash = (row["source_hash"] or "").strip().lower()
+            if not stored_hash:
+                # Hash not computed yet (remote job or hash still pending)
+                return jsonify({"status": "pending"})
+            if worker_hash == stored_hash:
+                return jsonify({"status": "ok"})
+            # Mismatch: flag in warnings, increment fail_count so admin can see it
+            warn_msg = f"HASH_MISMATCH (worker={worker_hash[:8]}… expected={stored_hash[:8]}…)"
+            conn.execute(
+                "UPDATE jobs SET warnings = COALESCE(warnings || ' | ', '') || ?, "
+                "fail_count = COALESCE(fail_count, 0) + 1 WHERE id=?",
+                (warn_msg, job_id))
+            conn.commit()
+        finally:
+            conn.close()
+
+    log_event("WARN", f"Source hash mismatch from {worker_id}: {warn_msg}", job_id)
+    return jsonify({"status": "mismatch"})
 
 
 @app.route('/report_status', methods=['POST'])
