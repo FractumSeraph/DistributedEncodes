@@ -36,7 +36,9 @@ Encoded output is intended for [https://vsv.fractumseraph.net/](https://vsv.frac
 | `--daily-quota GB` | `0` (unlimited) | Cap total data downloaded per day |
 | `--watermark` | off | Burn `@FractumSeraph` text into the video |
 | `--no-tui` | off | Plain terminal output instead of the TUI |
+| `--force-tui` | off | Force the TUI on even when auto-detection disables it |
 | `--max-size-mb N` | `0` (no limit) | Skip source files larger than N MB |
+| `--local-source DIR` | *(none)* | Read source files directly from disk instead of HTTP — useful when the worker runs on the same machine as the manager |
 
 The `WORKER_SECRET` environment variable is the preferred way to pass the auth token.
 
@@ -99,8 +101,9 @@ Append `&series_id=X` to focus on a specific series.
 
 2. **Install dependencies:**
    ```powershell
-   pip install requests textual
+   pip install requests
    ```
+   > `textual` (the TUI library) is installed automatically on first run if it is not already present. You can pre-install it with `pip install textual` if you prefer.
 
 3. **Download the worker:**  
    [https://encode.fractumseraph.net/dl/worker](https://encode.fractumseraph.net/dl/worker)
@@ -131,24 +134,30 @@ Use `fractum-worker.service` to run the worker as a persistent background servic
 
 ### TUI Controls
 
-When running with the Textual TUI (default when `textual` is installed):
+When running with the Textual TUI (default — installed automatically on first run if not already present):
 
 | Key | Action |
 |---|---|
-| `P` | Pause — suspends FFmpeg, shows dialog |
+| `P` or `Ctrl+C` | Pause — suspends all FFmpeg processes and shows a menu in the log |
 | `Q` | Quit immediately (kills active encodes) |
 
-**Pause dialog options:**
+> The TUI works over SSH and inside tmux. Key input is read directly from `/dev/tty` as a fallback when the terminal environment does not pass key events through normally.
 
-| Choice | Behaviour |
+**While paused**, the log panel shows the available choices:
+
+| Key | Behaviour |
 |---|---|
-| Continue `[C]` / Escape | Resume encoding from where it was paused |
-| Finish `[F]` | Complete the current job then stop |
-| Stop `[S]` | Kill all encodes and exit immediately |
+| `C` | Resume encoding from where it was paused |
+| `F` | Finish the current job, then stop |
+| `S` | Kill all encodes and exit immediately |
 
-FFmpeg is frozen at the OS level during a pause (via `NtSuspendProcess` on Windows, `SIGSTOP` on Linux), so CPU usage drops to zero.
+Pressing `P` or `Ctrl+C` a second time while already paused acts as an immediate force-stop.
 
-The TUI shows a per-worker table with columns: Worker, Current File, Phase, Progress bar, Elapsed, Done count, and ETA (estimated time remaining, shown during encoding).
+FFmpeg is frozen at the OS level during a pause (`NtSuspendProcess` on Windows, `SIGSTOP` on Linux), so CPU usage drops to zero.
+
+**Table columns:** Worker · Current File · Phase · Progress · Elapsed · Done · ETA
+
+**Stats bar** (below the table): shows session totals — jobs completed, gigabytes uploaded, uptime, and quota remaining (if `--daily-quota` is set).
 
 ---
 
