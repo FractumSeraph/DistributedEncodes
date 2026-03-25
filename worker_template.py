@@ -34,9 +34,14 @@ def _bootstrap_textual():
     """
     try:
         import textual as _t
-        if tuple(int(x) for x in _t.__version__.split('.')[:2]) >= _TEXTUAL_MIN_VERSION:
+        try:
+            from importlib.metadata import version as _pkg_version
+            _tv_str = _pkg_version('textual')
+        except Exception:
+            _tv_str = getattr(_t, '__version__', '0.0')
+        if tuple(int(x) for x in _tv_str.split('.')[:2]) >= _TEXTUAL_MIN_VERSION:
             return  # already fine
-        reason = f"textual {_t.__version__} is too old (>= {'.'.join(str(x) for x in _TEXTUAL_MIN_VERSION)} required)"
+        reason = f"textual {_tv_str} is too old (>= {'.'.join(str(x) for x in _TEXTUAL_MIN_VERSION)} required)"
     except ImportError:
         reason = "textual not found"
     print(f"[*] {reason} — attempting automatic install...")
@@ -80,10 +85,15 @@ _bootstrap_textual()
 
 try:
     import textual as _textual_mod
-    _tv = tuple(int(x) for x in _textual_mod.__version__.split('.')[:2])
+    try:
+        from importlib.metadata import version as _pkg_version
+        _tv_str = _pkg_version('textual')
+    except Exception:
+        _tv_str = getattr(_textual_mod, '__version__', '0.0')
+    _tv = tuple(int(x) for x in _tv_str.split('.')[:2])
     if _tv < _TEXTUAL_MIN_VERSION:
         raise ImportError(
-            f"textual {_textual_mod.__version__} is too old; "
+            f"textual {_tv_str} is too old; "
             f">= {'.'.join(str(x) for x in _TEXTUAL_MIN_VERSION)} required"
         )
     from textual.app import App, ComposeResult
