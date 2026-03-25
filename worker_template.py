@@ -890,7 +890,7 @@ def verify_connection(manager_url):
     print(f"[!] Could not connect to {manager_url}"); return False
 
 
-def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=False, series_id=None, watermark=False, max_size_mb=0):
+def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=False, series_id=None, watermark=False, max_size_mb=0, local_source_dir=None):
     global UPDATE_AVAILABLE
     log(worker_id, "Thread active.")
     os.makedirs(temp_dir, exist_ok=True)
@@ -1258,7 +1258,19 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
 
             if data and data.get("status") == "ok":
                 job = data["job"]; job_id = job['id']; dl_url = job['download_url']
-                log(worker_id, f"Job: {job['filename']}")
+                # If this worker has direct access to the source directory, prefer the
+                # local file path — avoids streaming the file through the HTTP server.
+                _local_src = None
+                if local_source_dir:
+                    _candidate = os.path.join(local_source_dir, job['id'].replace('/', os.sep))
+                    if os.path.isfile(_candidate):
+                        _local_src = os.path.abspath(_candidate)
+                        dl_url = _local_src
+                        log(worker_id, f"Job (local): {job['filename']}")
+                    else:
+                        log(worker_id, f"Job (local path not found, falling back to HTTP): {job['filename']}", "WARN")
+                if _local_src is None:
+                    log(worker_id, f"Job: {job['filename']}")
                 d = WORKER_DETAILS.get(worker_id)
                 if d is not None:
                     d.update({"file": job['filename'], "phase": "Probe", "pct": 0, "job_start": time.time()})
@@ -1267,12 +1279,19 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
 
                 # FFmpeg auth header string (format required by libavformat HTTP demuxer)
                 ffmpeg_http_headers = f"X-Worker-Token: {WORKER_SECRET}\r\n"
+                # When the source is a local file the auth header and reconnect flags
+                # are unnecessary; flag this so the probe/encode commands omit them.
+                _is_local = (_local_src is not None)
 
                 # Quota accounting: a single HEAD request gives us the source size instantly,
                 # letting encoding start immediately rather than waiting for a full download.
                 if quota_tracker:
                     try:
-                        head_r = requests.head(dl_url, headers=get_auth_headers(), timeout=10)
+                        if _is_local:
+                            src_size = os.path.getsize(dl_url)
+                        else:
+                            head_r = requests.head(dl_url, headers=get_auth_headers(), timeout=10)
+                            src_size = int(head_r.headers.get('content-length', 0))
                         src_size = int(head_r.headers.get('content-length', 0))
                         if quota_tracker.check_cap():
                             wait_sec = quota_tracker.get_wait_time()
@@ -1287,7 +1306,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                             quota_tracker.add_usage(src_size)
                             quota_tracker.force_save()
                     except Exception as e:
-                        log(worker_id, f"HEAD request for quota failed: {e}", "WARN")
+                        log(worker_id, f"Quota size check failed: {e}", "WARN")
 
                 post_status("downloading", 0)
 
@@ -1295,9 +1314,13 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                 total_sec = 0; total_min = 0; audio_index = 0; subtitle_indices = []
                 for _probe_attempt in range(3):
                     try:
-                        cmd_probe = [FFPROBE_CMD,
-                            '-headers', ffmpeg_http_headers,
-                            '-v', 'quiet', '-print_format', 'json', '-show_streams', '-show_format', dl_url]
+                        if _is_local:
+                            cmd_probe = [FFPROBE_CMD,
+                                '-v', 'quiet', '-print_format', 'json', '-show_streams', '-show_format', dl_url]
+                        else:
+                            cmd_probe = [FFPROBE_CMD,
+                                '-headers', ffmpeg_http_headers,
+                                '-v', 'quiet', '-print_format', 'json', '-show_streams', '-show_format', dl_url]
                         res = subprocess.run(cmd_probe, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf-8', errors='replace', timeout=60)
                         probe_data = json.loads(res.stdout)
                         dur = probe_data.get('format', {}).get('duration')
@@ -1394,11 +1417,15 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                 else:
                     target_crf = base_crf
 
-                cmd = [FFMPEG_CMD,
-                       '-headers', ffmpeg_http_headers,
-                       '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '60',
-                       '-reconnect_on_network_error', '1',
-                       '-y', '-i', dl_url, '-map', '0:v:0', '-map', f'0:{audio_index}']
+                if _is_local:
+                    cmd = [FFMPEG_CMD, '-y', '-i', dl_url,
+                           '-map', '0:v:0', '-map', f'0:{audio_index}']
+                else:
+                    cmd = [FFMPEG_CMD,
+                           '-headers', ffmpeg_http_headers,
+                           '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '60',
+                           '-reconnect_on_network_error', '1',
+                           '-y', '-i', dl_url, '-map', '0:v:0', '-map', f'0:{audio_index}']
                 for idx in subtitle_indices: cmd.extend(['-map', f'0:{idx}'])
                 
                 cmd.extend([
@@ -1748,7 +1775,7 @@ def run_worker(args):
         WORKER_DETAILS[worker_id] = {"file": "-", "phase": "Starting", "pct": 0, "job_start": 0.0, "jobs_done": 0}
         temp_dir = f"./temp_encode_{base_workername}_{i+1}"
 
-        t = threading.Thread(target=worker_task, args=(worker_id, manager_url, temp_dir, quota_tracker, single_mode, args.series_id, args.watermark, args.max_size_mb))
+        t = threading.Thread(target=worker_task, args=(worker_id, manager_url, temp_dir, quota_tracker, single_mode, args.series_id, args.watermark, args.max_size_mb, getattr(args, 'local_source', None)))
         t.daemon = True
         t.start()
         threads.append(t)
@@ -1833,5 +1860,9 @@ if __name__ == "__main__":
     parser.add_argument("--watermark", action="store_true", default=False, help="Burn the @FractumSeraph watermark into encoded video")
     parser.add_argument("--no-tui", action="store_true", default=False, help="Disable Textual TUI and use plain terminal output")
     parser.add_argument("--max-size-mb", type=int, default=0, help="Skip source files larger than this size in MB (0 = no limit)")
+    parser.add_argument("--local-source", default=None, metavar="DIR",
+                        help="Path to the source media directory on this machine. When set and the "
+                             "source file exists locally, it is read directly instead of streaming "
+                             "over HTTP (useful when this worker runs on the server itself).")
     args = parser.parse_args()
     run_worker(args)
