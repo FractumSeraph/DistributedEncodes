@@ -197,7 +197,7 @@ if HAS_TEXTUAL:
     class PauseModal(ModalScreen):
         """Modal dialog shown when the worker is paused."""
 
-        BINDINGS = [
+        BINDINGS = [  # type: ignore[assignment]
             Binding("c", "choose_continue", show=False),
             Binding("f", "choose_finish", show=False),
             Binding("s", "choose_stop", show=False),
@@ -284,7 +284,7 @@ if HAS_TEXTUAL:
         #btn-stop     { margin: 0 1; }
         """
 
-        BINDINGS = [
+        BINDINGS = [  # type: ignore[assignment]
             Binding("p", "request_pause", "Pause"),
             Binding("q", "request_quit", "Quit"),
         ]
@@ -420,7 +420,7 @@ if HAS_TEXTUAL:
             threading.Thread(target=lambda: toggle_processes(suspend=True),
                              daemon=True).start()
 
-        def _handle_pause_result(self, choice: str) -> None:
+        async def _handle_pause_result(self, choice: str | None) -> None:
             global PAUSE_REQUESTED
             if choice == "continue":
                 PAUSE_REQUESTED = False
@@ -542,7 +542,7 @@ def toggle_processes(suspend=True):
         for wid, proc in ACTIVE_PROCS.items():
             if proc.poll() is None:
                 try:
-                    sig = signal.SIGSTOP if suspend else signal.SIGCONT
+                    sig = signal.SIGSTOP if suspend else signal.SIGCONT  # type: ignore[attr-defined]
                     os.kill(proc.pid, sig)
                 except: pass
 
@@ -1182,6 +1182,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                     _r_rem = subprocess.Popen(
                         _r_rem_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                         stdin=subprocess.DEVNULL, encoding='utf-8', errors='replace', **_r_popen_kw)
+                    assert _r_rem.stdout is not None
                     with PROC_LOCK: ACTIVE_PROCS[worker_id] = _r_rem
                     _r_last_rep = 0
                     while True:
@@ -1547,7 +1548,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                     if SHUTDOWN_EVENT.is_set(): break
                     if _enc_attempt > 0:
                         _retry_delay = 30
-                        log(worker_id, f"Encode failed (attempt {_enc_attempt}/3, rc={proc.returncode}). Retrying in {_retry_delay}s...", "WARN")
+                        log(worker_id, f"Encode failed (attempt {_enc_attempt}/3, rc={proc.returncode if proc else '?'}). Retrying in {_retry_delay}s...", "WARN")
                         update_status("Retrying")
                         for _ in range(_retry_delay):
                             if SHUTDOWN_EVENT.is_set(): break
@@ -1566,6 +1567,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                         popen_kwargs['start_new_session'] = True
 
                     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, encoding='utf-8', errors='replace', **popen_kwargs)
+                    assert proc.stdout is not None
 
                     with PROC_LOCK: ACTIVE_PROCS[worker_id] = proc
 
