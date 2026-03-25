@@ -1876,6 +1876,8 @@ def run_worker(args):
         app.run()
         TUI_APP = None
     else:
+        _tui_reason = "--no-tui flag passed" if HAS_TEXTUAL and getattr(args, 'no_tui', False) else "textual not installed (pip install textual)"
+        print(f"Fractum Worker v{WORKER_VERSION} — TUI disabled ({_tui_reason})")
         while True:
             if not PAUSE_REQUESTED:
                 all_dead = True
