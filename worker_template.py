@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.0.20"
+WORKER_VERSION = "3.0.21"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -409,21 +409,12 @@ if HAS_TEXTUAL:
             # Prevent these widgets from stealing focus and swallowing key events
             self.query_one("#workers-table").can_focus = False
             self.query_one("#log-panel").can_focus = False
-            # Explicitly disable all mouse-tracking ANSI modes.  app.run(mouse=False)
-            # should handle this, but older Textual versions may ignore that
-            # parameter.  Sending the escape sequences directly is version-agnostic
-            # and ensures the [<35;67;2M SGR events never appear in the console.
-            try:
-                sys.stdout.write(
-                    '\033[?1000l'   # disable basic click tracking
-                    '\033[?1002l'   # disable button-event tracking
-                    '\033[?1003l'   # disable any-event (all motion) tracking
-                    '\033[?1006l'   # disable SGR extended mouse mode
-                    '\033[?1015l'   # disable URXVT extended mouse mode
-                )
-                sys.stdout.flush()
-            except Exception:
-                pass
+            # NOTE: do NOT write raw escape sequences to sys.stdout here.
+            # Textual owns the terminal once on_mount fires; writing outside its
+            # rendering pipeline corrupts its cursor-position tracking and causes
+            # subsequent renders to land at wrong positions (e.g. on the stats bar).
+            # Mouse-tracking cleanup is handled exclusively by the atexit handler
+            # and the reset block that runs after app.run() returns.
             # Start a fallback key reader on /dev/tty.  On some SSH/tmux setups
             # Textual's own input driver receives no key events; reading /dev/tty
             # directly bypasses that entirely.  We only read p/q here so we
@@ -2266,10 +2257,11 @@ def run_worker(args):
                 _atexit.register(_restore_win_console)
             except Exception:
                 pass
-        # mouse=False tells Textual not to enable any mouse-tracking ANSI
-        # sequences in the first place — the cleanest way to prevent the
-        # [<35;67;2M SGR events from bleeding into PowerShell on exit.
-        app.run(mouse=False)
+        # Run the TUI.  Mouse support is left enabled so RichLog and DataTable
+        # remain scrollable with the mouse wheel.  The atexit handler and the
+        # reset block below send the disable sequences after Textual exits,
+        # which is the only safe time to write raw escapes to the terminal.
+        app.run()
         TUI_APP = None
         # Explicit terminal reset after a clean exit — Textual should have
         # done this itself, but belt-and-suspenders for any missed sequences.
