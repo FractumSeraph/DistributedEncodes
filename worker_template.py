@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.0.10" # Incremented for TUI over ssh and tmux.
+WORKER_VERSION = "3.0.11" # Incremented for TUI over ssh and tmux.
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -587,7 +587,7 @@ def log(worker_id, message, level="INFO"):
     safe_print(f"[{timestamp}] [{worker_id}] [{level}] {message}")
 
 def signal_handler(sig, frame):
-    global PAUSE_REQUESTED
+    global PAUSE_REQUESTED, _TUI_SIGNAL
     if platform.system() == 'Windows':
         SHUTDOWN_EVENT.set()
         try: kill_processes()
@@ -606,13 +606,11 @@ def signal_handler(sig, frame):
                 SHUTDOWN_EVENT.set()
                 try: kill_processes()
                 except: pass
-                global _TUI_SIGNAL
                 _TUI_SIGNAL = 'quit'
             else:
                 # SIGINT (Ctrl+C) → request pause via flag; the app's polling
                 # timer picks this up on the event loop thread (call_from_thread
                 # cannot be used from a signal handler — same thread as the loop).
-                global _TUI_SIGNAL
                 _TUI_SIGNAL = 'pause'
         elif not PAUSE_REQUESTED:
             PAUSE_REQUESTED = True
