@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.0.16" # Incremented
+WORKER_VERSION = "3.0.17" # Incremented
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -672,27 +672,35 @@ def get_term_width():
     except: return 80
 
 def safe_print(message):
+    # During interpreter shutdown daemon threads can't safely acquire the
+    # internal C-level lock on BufferedWriter, causing a Fatal Python error.
+    # Bail out early — nobody is reading stdout at that point anyway.
+    if sys.is_finalizing():
+        return
     if TUI_APP is not None:
         try:
             TUI_APP.call_from_thread(TUI_APP.write_log, message)
             return
         except Exception:
             pass
-    with CONSOLE_LOCK:
-        try:
-            width = get_term_width()
-            # Truncate to avoid wrapping
-            if len(message) > width - 1:
-                message = message[:width-1]
-            
-            # Use spaces to clear the line instead of ANSI \033[2K which breaks some cmd.exe
-            padded = message.ljust(width - 1)
-            sys.stdout.write(f'\r{padded}\n')
-            sys.stdout.flush()
-        except:
-            # Absolute fallback
-            try: print(message)
-            except: pass
+    if not CONSOLE_LOCK.acquire(timeout=2):
+        return
+    try:
+        width = get_term_width()
+        # Truncate to avoid wrapping
+        if len(message) > width - 1:
+            message = message[:width-1]
+
+        # Use spaces to clear the line instead of ANSI \033[2K which breaks some cmd.exe
+        padded = message.ljust(width - 1)
+        sys.stdout.write(f'\r{padded}\n')
+        sys.stdout.flush()
+    except Exception:
+        # Absolute fallback
+        try: print(message)
+        except Exception: pass
+    finally:
+        CONSOLE_LOCK.release()
 
 def log(worker_id, message, level="INFO"):
     timestamp = datetime.now().strftime("%H:%M:%S")
