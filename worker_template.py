@@ -103,7 +103,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.0.4" # Incremented for fixing regex
+WORKER_VERSION = "3.0.5" # Incremented for textual and ffmpeg version check.
 
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
@@ -129,6 +129,7 @@ STATS_LOCK = threading.Lock()
 # Global paths for executables
 FFMPEG_CMD = "ffmpeg"
 FFPROBE_CMD = "ffprobe"
+_FFMPEG_META_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.ffmpeg_meta.json')
 
 # Detect OS to handle Fonts
 _script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -829,6 +830,94 @@ def _compute_source_hash(dl_url, is_local):
 # FFMPEG MANAGEMENT
 # ==============================================================================
 
+def _ffmpeg_primary_url():
+    """Return the primary upstream URL for the current platform/arch."""
+    if platform.system() == "Windows":
+        return "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
+    arch = platform.machine().lower()
+    if arch in ['x86_64', 'amd64']:
+        return "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz"
+    elif arch in ['aarch64', 'arm64']:
+        return "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-arm64-static.tar.xz"
+    return None
+
+def _save_ffmpeg_meta(url):
+    """Store the ETag/Last-Modified of url so we can detect upstream updates."""
+    try:
+        r = requests.head(url, allow_redirects=True, timeout=15)
+        meta = {
+            "url":           url,
+            "etag":          r.headers.get('ETag', ''),
+            "last_modified": r.headers.get('Last-Modified', ''),
+        }
+        with open(_FFMPEG_META_FILE, 'w') as f:
+            json.dump(meta, f)
+    except Exception:
+        pass
+
+def update_ffmpeg_if_stale():
+    """Re-download the local ffmpeg binary if the upstream build is newer.
+
+    Uses a HEAD request to compare the ETag/Last-Modified stored after the
+    last download.  A full download (~100-200 MB) only happens when the
+    upstream file has actually changed.
+    """
+    local_bin = os.path.abspath("ffmpeg.exe" if platform.system() == "Windows" else "./ffmpeg")
+    if not os.path.exists(local_bin):
+        return  # nothing local to update; check_ffmpeg() handles first install
+
+    url = _ffmpeg_primary_url()
+    if url is None:
+        return
+
+    # Load stored meta
+    stored_etag = stored_lm = ""
+    if os.path.exists(_FFMPEG_META_FILE):
+        try:
+            with open(_FFMPEG_META_FILE) as f:
+                m = json.load(f)
+            if m.get('url') == url:
+                stored_etag = m.get('etag', '')
+                stored_lm   = m.get('last_modified', '')
+        except Exception:
+            pass
+
+    # HEAD request to check remote freshness
+    try:
+        r = requests.head(url, allow_redirects=True, timeout=15)
+        remote_etag = r.headers.get('ETag', '')
+        remote_lm   = r.headers.get('Last-Modified', '')
+    except Exception:
+        return  # network unavailable — skip silently
+
+    # If we have nothing stored yet, just save and return (no spurious download)
+    if not stored_etag and not stored_lm:
+        _save_ffmpeg_meta(url)
+        return
+
+    changed = False
+    if remote_etag  and remote_etag  != stored_etag:  changed = True
+    if remote_lm    and remote_lm    != stored_lm:    changed = True
+
+    if not changed:
+        return
+
+    print("[*] Newer FFmpeg build detected upstream — updating...")
+    if platform.system() == "Windows":
+        ok = download_ffmpeg_windows()
+    else:
+        ok = download_ffmpeg_linux()
+
+    if ok:
+        _save_ffmpeg_meta(url)
+        # Re-point FFMPEG_CMD to the freshly extracted binary
+        global FFMPEG_CMD, FFPROBE_CMD
+        local_ffprobe = os.path.abspath("ffprobe.exe" if platform.system() == "Windows" else "./ffprobe")
+        FFMPEG_CMD = local_bin
+        if os.path.exists(local_ffprobe):
+            FFPROBE_CMD = local_ffprobe
+        print("[*] FFmpeg updated successfully.")
+
 def download_ffmpeg_windows():
     print("[*] FFmpeg not found. Attempting download (FULL Version ~128MB)...")
     
@@ -876,6 +965,7 @@ def download_ffmpeg_windows():
                 
             os.remove(temp_zip)
             print("[*] FFmpeg installed locally!")
+            _save_ffmpeg_meta(_ffmpeg_primary_url() or url)
             return True
             
         except Exception as e:
@@ -939,6 +1029,7 @@ def download_ffmpeg_linux():
             os.chmod("ffmpeg", 0o755)
             if os.path.exists("ffprobe"): os.chmod("ffprobe", 0o755)
             print("[*] FFmpeg installed locally!")
+            _save_ffmpeg_meta(url)
             return True
         else:
             print("[!] Could not find 'ffmpeg' binary in extracted archive.")
@@ -1873,7 +1964,8 @@ def run_worker(args):
                 print("[!] Failed to save configuration file.")
 
     check_ffmpeg()
-    
+    update_ffmpeg_if_stale()
+
     manager_url = (args.manager or DEFAULT_MANAGER_URL).rstrip('/')
     username = args.username or DEFAULT_USERNAME
     base_workername = args.workername or DEFAULT_WORKERNAME
