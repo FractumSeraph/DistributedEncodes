@@ -35,7 +35,7 @@ except ImportError:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.0.3" # Incremented for source file hashing.
+WORKER_VERSION = "3.0.4" # Incremented for fixing regex
 
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
@@ -1527,7 +1527,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                 ])
 
                 # Save a resume checkpoint so we can recover this encode if interrupted.
-                _chk_safe_id = re.sub(r'[^a-zA-Z0-9_\-]', '_', str(job_id))
+                _chk_safe_id = re.sub(r'[^a-zA-Z0-9_-]', '_', str(job_id))
                 _chk_path = os.path.join(temp_dir, f"{_RESUME_CHK_PREFIX}{_chk_safe_id}.json")
                 _save_resume_checkpoint(_chk_path, {
                     "job_id":           job_id,
@@ -1697,7 +1697,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                             SESSION_STATS["bytes_uploaded"] += final_size_bytes
                         # Remove the resume checkpoint now that the job is finished
                         try:
-                            _done_chk = os.path.join(temp_dir, f"{_RESUME_CHK_PREFIX}{re.sub(r'[^a-zA-Z0-9_\\-]', '_', str(job_id))}.json")
+                            _done_chk = os.path.join(temp_dir, f"{_RESUME_CHK_PREFIX}{re.sub(r'[^a-zA-Z0-9_-]', '_', str(job_id))}.json")
                             if os.path.exists(_done_chk): os.remove(_done_chk)
                         except: pass
                         upload_encode_log()
