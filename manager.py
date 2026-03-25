@@ -345,8 +345,14 @@ def scan_remote_http(url, prefix="", depth=0):
             
             if link.endswith('/'):
                 time.sleep(0.2) # Tiny delay to prevent hammering
-                # Recursively yield results from subdirectories
-                yield from scan_remote_http(full_url, prefix=f"{prefix}{link}", depth=depth+1)
+                # Recursively yield results from subdirectories.
+                # Always unquote the link before appending to prefix so that
+                # clean_id is consistently decoded text — quote() in the
+                # download URL builder will then encode it exactly once.
+                # Without this, a percent-encoded subdir name (e.g. %C2%B7 for ·)
+                # gets double-encoded to %25C2%25B7, producing a 404.
+                from urllib.parse import unquote as _unquote
+                yield from scan_remote_http(full_url, prefix=f"{prefix}{_unquote(link)}", depth=depth+1)
             elif any(link.lower().endswith(ext) for ext in VIDEO_EXTENSIONS):
                 from urllib.parse import unquote
                 clean_name = unquote(link)
@@ -396,6 +402,25 @@ def scan_and_queue():
 
                     cursor.execute("SELECT id FROM jobs WHERE id=?", (job_id,))
                     if not cursor.fetchone():
+                        # Also check the legacy partially-encoded ID format produced
+                        # before the double-encoding bug fix.  The old scanner left
+                        # subdir components percent-encoded (e.g. BURN%C2%B7E.../)
+                        # while decoding only the filename.  After the fix, all path
+                        # components are decoded, so the IDs differ even for the same
+                        # file.  We normalise before inserting to avoid re-queuing
+                        # files that are already done or in-progress.
+                        _id_parts = job_id.split('/')
+                        if len(_id_parts) > 1:
+                            _legacy_id = (
+                                '/'.join(quote(p, safe='') for p in _id_parts[:-1])
+                                + '/' + _id_parts[-1]
+                            )
+                        else:
+                            _legacy_id = job_id
+                        if _legacy_id != job_id:
+                            cursor.execute("SELECT id FROM jobs WHERE id=?", (_legacy_id,))
+                            if cursor.fetchone():
+                                continue  # already exists under the old encoded ID
                         cursor.execute(
                             "INSERT INTO jobs (id, filename, status, last_updated, file_size, source_type, source_url, content_profile, fail_count) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, 0)", 
                             (job_id, fname, datetime.now(), fsize, src_type, src_url, profile)
