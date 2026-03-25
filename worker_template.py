@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.0.23"
+WORKER_VERSION = "3.0.24"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -128,6 +128,7 @@ PAUSE_REQUESTED = False
 ACTIVE_PROCS = {}
 PROC_LOCK = threading.Lock()
 TUI_APP = None  # Set to WorkerApp instance when running in TUI mode
+_TUI_WAS_RUNNING = False  # Set True before app.run(), never cleared; guards safe_print post-TUI
 _TUI_SIGNAL = None  # Set to 'pause' or 'quit' by signal handler, polled by app timer
 
 # Per-worker rich state, polled by the TUI every 0.5s
@@ -718,6 +719,13 @@ def safe_print(message):
         # terminal — writing raw bytes into Textual's alternate screen places
         # stray characters wherever the cursor happens to be (often top-left
         # during a render cycle).
+        return
+    # After the TUI exits (TUI_APP set back to None) but before Python fully
+    # finalizes, daemon threads can briefly reach sys.stdout.write().  The
+    # C-level BufferedWriter lock may already be destroyed by then, causing
+    # "Fatal Python error: _enter_buffered_busy" which cannot be caught.
+    # sys.is_finalizing() has a race window — SHUTDOWN_EVENT closes it.
+    if _TUI_WAS_RUNNING and SHUTDOWN_EVENT.is_set():
         return
     if not CONSOLE_LOCK.acquire(timeout=2):
         return
@@ -2301,6 +2309,8 @@ def run_worker(args):
         # remain scrollable with the mouse wheel.  The atexit handler and the
         # reset block below send the disable sequences after Textual exits,
         # which is the only safe time to write raw escapes to the terminal.
+        global _TUI_WAS_RUNNING
+        _TUI_WAS_RUNNING = True
         app.run()
         TUI_APP = None
         # Explicit terminal reset after a clean exit — Textual should have
