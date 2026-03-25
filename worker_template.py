@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.0.8" # Incremented for TUI over ssh and tmux.
+WORKER_VERSION = "3.0.9" # Incremented for TUI over ssh and tmux.
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -363,9 +363,8 @@ if HAS_TEXTUAL:
         """
 
         BINDINGS = [  # type: ignore[assignment]
-            Binding("ctrl+c", "request_pause", "Pause/Quit", show=True),
-            Binding("p", "request_pause", "Pause", show=False),
-            Binding("q", "request_quit", "Quit", show=False),
+            Binding("p", "request_pause", "Pause  [P]", show=True),
+            Binding("q", "request_quit",  "Quit   [Q]", show=True),
         ]
 
         def __init__(self, worker_ids: list, threads: list,
