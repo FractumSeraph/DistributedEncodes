@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.0.17" # Incremented
+WORKER_VERSION = "3.0.18" # Incremented
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -687,13 +687,13 @@ def safe_print(message):
         return
     try:
         width = get_term_width()
-        # Truncate to avoid wrapping
+        # Truncate long messages to avoid wrapping onto a second line
         if len(message) > width - 1:
             message = message[:width-1]
-
-        # Use spaces to clear the line instead of ANSI \033[2K which breaks some cmd.exe
-        padded = message.ljust(width - 1)
-        sys.stdout.write(f'\r{padded}\n')
+        # \033[K (Erase to End of Line) clears any leftover chars from a
+        # previously longer line drawn at the same position — avoids the
+        # padding-width-mismatch flicker that occurred on terminal resize.
+        sys.stdout.write(f'\r{message}\033[K\n')
         sys.stdout.flush()
     except Exception:
         # Absolute fallback
@@ -713,11 +713,17 @@ def signal_handler(sig, frame):
         try: kill_processes()
         except: pass
         if TUI_APP is not None:
-            try: TUI_APP.call_from_thread(TUI_APP.exit)
-            except: pass
+            # Route through the TUI's quit action so Textual can restore the
+            # Windows console mode (echo, VT processing, cursor visibility)
+            # before the process exits.  sys.exit() here skips that cleanup.
+            _TUI_SIGNAL = 'quit'
         else:
-            sys.stdout.write('\n[!] Windows Shutdown Initiated...\n')
-        sys.exit(0)
+            try:
+                sys.stdout.write('\n[!] Shutdown initiated...\n')
+                sys.stdout.flush()
+            except Exception:
+                pass
+        return  # Let app.run() / join loop exit naturally
     else:
         if TUI_APP is not None:
             # In TUI mode, Ctrl+C opens the pause menu so the user can choose
@@ -828,6 +834,8 @@ def print_progress(worker_id, current, total, prefix='', suffix=''):
             d["phase"] = phase_map.get(prefix, prefix)
             d["pct"]   = percent
         return
+    if sys.is_finalizing():
+        return
     width = get_term_width()
     overhead = 12 + len(worker_id) + len(prefix) + 10 + len(suffix)
     bar_length = width - overhead - 5
@@ -840,13 +848,10 @@ def print_progress(worker_id, current, total, prefix='', suffix=''):
     try:
         bar = block_char * filled_length + fill_char * (bar_length - filled_length)
         line = f'[{datetime.now().strftime("%H:%M:%S")}] [{worker_id}] {prefix} |{bar}| {percent:.1f}% {suffix}'
-        
+        if len(line) > width - 1:
+            line = line[:width - 1]
         with CONSOLE_LOCK:
-            if len(line) > width - 1:
-                line = line[:width - 1]
-            
-            padded = line.ljust(width - 1)
-            sys.stdout.write(f'\r{padded}')
+            sys.stdout.write(f'\r{line}\033[K')
             sys.stdout.flush()
             
     except UnicodeEncodeError:
@@ -855,10 +860,9 @@ def print_progress(worker_id, current, total, prefix='', suffix=''):
         try:
             bar = block_char * filled_length + fill_char * (bar_length - filled_length)
             line = f'[{datetime.now().strftime("%H:%M:%S")}] [{worker_id}] {prefix} |{bar}| {percent:.1f}% {suffix}'
+            if len(line) > width - 1: line = line[:width - 1]
             with CONSOLE_LOCK:
-                if len(line) > width - 1: line = line[:width - 1]
-                padded = line.ljust(width - 1)
-                sys.stdout.write(f'\r{padded}')
+                sys.stdout.write(f'\r{line}\033[K')
                 sys.stdout.flush()
         except: pass 
 
@@ -868,6 +872,10 @@ def print_progress(worker_id, current, total, prefix='', suffix=''):
 
 def monitor_status_loop(worker_ids):
     while not SHUTDOWN_EVENT.is_set():
+        # Daemon threads writing to stdout after interpreter shutdown started
+        # will crash Python at the C level — bail out early.
+        if sys.is_finalizing():
+            return
         if TUI_APP is not None:
             time.sleep(1); continue  # TUI handles all status display
         if PAUSE_REQUESTED or MONITOR_PAUSED.is_set():
@@ -882,11 +890,10 @@ def monitor_status_loop(worker_ids):
         if parts:
             line = " ".join(parts)
             width = get_term_width()
-            if len(line) > width - 1: line = line[:width-4] + "..."
+            if len(line) > width - 4: line = line[:width-4] + "..."
             with CONSOLE_LOCK:
                 try:
-                    padded = line.ljust(width - 1)
-                    sys.stdout.write(f'\r{padded}')
+                    sys.stdout.write(f'\r{line}\033[K')
                     sys.stdout.flush()
                 except: pass
         time.sleep(0.5)
@@ -2197,6 +2204,30 @@ def run_worker(args):
             manager_url=manager_url,
         )
         TUI_APP = app
+        # Save Windows console modes now (before Textual modifies them) so
+        # we can unconditionally restore them on any exit path — including
+        # crashes and abnormal shutdowns that skip Textual's own cleanup.
+        # Without this, echo is left disabled, causing the "can't see typing"
+        # symptom and ANSI mouse-tracking sequences leaking into the shell.
+        if platform.system() == 'Windows':
+            try:
+                import ctypes, ctypes.wintypes, atexit as _atexit
+                _k32   = ctypes.windll.kernel32
+                _hIn   = _k32.GetStdHandle(-10)   # STD_INPUT_HANDLE
+                _hOut  = _k32.GetStdHandle(-11)   # STD_OUTPUT_HANDLE
+                _m_in  = ctypes.wintypes.DWORD()
+                _m_out = ctypes.wintypes.DWORD()
+                _k32.GetConsoleMode(_hIn,  ctypes.byref(_m_in))
+                _k32.GetConsoleMode(_hOut, ctypes.byref(_m_out))
+                def _restore_win_console():
+                    try:
+                        _k32.SetConsoleMode(_hIn,  _m_in)
+                        _k32.SetConsoleMode(_hOut, _m_out)
+                    except Exception:
+                        pass
+                _atexit.register(_restore_win_console)
+            except Exception:
+                pass
         app.run()
         TUI_APP = None
     else:
