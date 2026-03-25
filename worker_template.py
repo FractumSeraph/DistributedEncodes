@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.0.13" # Incremented for TUI over ssh and tmux.
+WORKER_VERSION = "3.0.14" # Incremented for TUI over ssh and tmux.
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -387,6 +387,7 @@ if HAS_TEXTUAL:
             self._col_file = self._col_phase = self._col_bar = None
             self._col_elapsed = self._col_done = self._col_eta = None
             self._pause_modal: 'PauseModal | None' = None
+            self._tty_paused = threading.Event()  # set while suspend() is active
 
         def compose(self) -> ComposeResult:
             yield Header()
@@ -410,6 +411,38 @@ if HAS_TEXTUAL:
             # Prevent these widgets from stealing focus and swallowing key events
             self.query_one("#workers-table").can_focus = False
             self.query_one("#log-panel").can_focus = False
+            # Start a fallback key reader on /dev/tty.  On some SSH/tmux setups
+            # Textual's own input driver receives no key events; reading /dev/tty
+            # directly bypasses that entirely.  We only read p/q here so we
+            # don't conflict with Textual's normal key handling in healthy envs.
+            threading.Thread(target=self._tty_key_reader, daemon=True).start()
+
+        def _tty_key_reader(self) -> None:
+            """Read single chars from /dev/tty to set _TUI_SIGNAL as a fallback
+            for environments where Textual's input driver is broken (SSH/tmux)."""
+            global _TUI_SIGNAL
+            try:
+                import tty, termios
+                tty_fd = open('/dev/tty', 'rb', buffering=0)
+                old = termios.tcgetattr(tty_fd)
+                tty.setcbreak(tty_fd)
+                try:
+                    while not SHUTDOWN_EVENT.is_set():
+                        ch = tty_fd.read(1)
+                        if not ch:
+                            break
+                        c = ch.decode('utf-8', errors='ignore').lower()
+                        if self._tty_paused.is_set():
+                            continue  # suspend() owns the tty right now
+                        if c == 'p' and _TUI_SIGNAL is None:
+                            _TUI_SIGNAL = 'pause'
+                        elif c == 'q' and _TUI_SIGNAL is None:
+                            _TUI_SIGNAL = 'quit'
+                finally:
+                    termios.tcsetattr(tty_fd, termios.TCSADRAIN, old)
+                    tty_fd.close()
+            except Exception:
+                pass  # Not available on Windows or if /dev/tty is inaccessible
 
         # ------------------------------------------------------------------
         # Periodic refresh
@@ -527,19 +560,21 @@ if HAS_TEXTUAL:
             PAUSE_REQUESTED = True
 
             if hasattr(self, 'suspend'):
-                # suspend() restores the terminal to normal mode, so plain text
-                # input works reliably — no dependency on Textual key routing.
-                import asyncio
-                def _do_pause():
-                    toggle_processes(suspend=True)
-                    return _run_text_pause_menu()
+                # Start suspending FFmpeg in background (non-blocking) then
+                # suspend the TUI so the terminal is restored to normal mode.
+                # _run_text_pause_menu() is called synchronously — that's fine
+                # because the TUI renderer is already paused.
+                threading.Thread(target=lambda: toggle_processes(suspend=True),
+                                 daemon=True).start()
+                choice = 'stop'
                 try:
+                    self._tty_paused.set()
                     async with self.suspend():
-                        choice = await asyncio.get_running_loop().run_in_executor(
-                            None, _do_pause
-                        )
+                        choice = _run_text_pause_menu()
                 except Exception:
-                    choice = 'stop'
+                    pass
+                finally:
+                    self._tty_paused.clear()
                 await self._handle_pause_result(choice)
             else:
                 # Older Textual without suspend(): fall back to modal
