@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.0.11" # Incremented for TUI over ssh and tmux.
+WORKER_VERSION = "3.0.12" # Incremented for TUI over ssh and tmux.
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -298,6 +298,14 @@ if HAS_TEXTUAL:
         def action_choose_finish(self) -> None: self.dismiss("finish")
         def action_choose_stop(self) -> None: self.dismiss("stop")
 
+        def on_key(self, event) -> None:
+            """Explicit key handler — belt-and-suspenders in case BINDINGS
+            don't fire (known issue in some Textual versions over SSH/tmux)."""
+            key = event.key
+            if key in ('c', 'escape'): self.dismiss("continue")
+            elif key == 'f':           self.dismiss("finish")
+            elif key == 's':           self.dismiss("stop")
+
         def on_button_pressed(self, event: Button.Pressed) -> None:
             choices = {"btn-continue": "continue", "btn-finish": "finish", "btn-stop": "stop"}
             if event.button.id in choices:
@@ -378,6 +386,7 @@ if HAS_TEXTUAL:
             # Column keys assigned in on_mount
             self._col_file = self._col_phase = self._col_bar = None
             self._col_elapsed = self._col_done = self._col_eta = None
+            self._pause_modal: 'PauseModal | None' = None
 
         def compose(self) -> ComposeResult:
             yield Header()
@@ -480,7 +489,12 @@ if HAS_TEXTUAL:
                 return
             _TUI_SIGNAL = None
             if sig == 'pause':
-                self.action_request_pause()
+                if PAUSE_REQUESTED and self._pause_modal is not None:
+                    # Second Ctrl+C while modal is open = force stop
+                    try: self._pause_modal.dismiss("stop")
+                    except Exception: pass
+                else:
+                    self.action_request_pause()
             elif sig == 'quit':
                 self.action_request_quit()
 
@@ -511,18 +525,15 @@ if HAS_TEXTUAL:
             if PAUSE_REQUESTED:
                 return
             PAUSE_REQUESTED = True
-            # Push the modal immediately so it always appears, regardless of how long
-            # OS-level process suspension takes.  toggle_processes acquires PROC_LOCK
-            # and makes blocking kernel calls — running it on the Textual event loop
-            # (main thread) can block long enough that push_screen never executes, or
-            # call_from_thread inside safe_print can raise when called from the main
-            # thread.  Offloading to a daemon thread fixes both issues.
-            self.push_screen(PauseModal(), self._handle_pause_result)
+            modal = PauseModal()
+            self._pause_modal = modal
+            self.push_screen(modal, self._handle_pause_result)
             threading.Thread(target=lambda: toggle_processes(suspend=True),
                              daemon=True).start()
 
         async def _handle_pause_result(self, choice: str | None) -> None:
             global PAUSE_REQUESTED
+            self._pause_modal = None
             if choice == "continue":
                 PAUSE_REQUESTED = False
                 threading.Thread(target=lambda: toggle_processes(suspend=False),
