@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.0.9" # Incremented for TUI over ssh and tmux.
+WORKER_VERSION = "3.0.10" # Incremented for TUI over ssh and tmux.
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -128,6 +128,7 @@ PAUSE_REQUESTED = False
 ACTIVE_PROCS = {}
 PROC_LOCK = threading.Lock()
 TUI_APP = None  # Set to WorkerApp instance when running in TUI mode
+_TUI_SIGNAL = None  # Set to 'pause' or 'quit' by signal handler, polled by app timer
 
 # Per-worker rich state, polled by the TUI every 0.5s
 # {"file": str, "phase": str, "pct": int, "job_start": float, "jobs_done": int}
@@ -395,7 +396,11 @@ if HAS_TEXTUAL:
             url_display = self._manager_url or "no manager"
             self.sub_title = f"v{WORKER_VERSION}  \u2502  {len(self._worker_ids)} worker(s)  \u2502  {url_display}"
             self.set_interval(0.5, self._tick)
+            self.set_interval(0.25, self._check_signals)
             self.set_interval(1.5, self._check_all_done)
+            # Prevent these widgets from stealing focus and swallowing key events
+            self.query_one("#workers-table").can_focus = False
+            self.query_one("#log-panel").can_focus = False
 
         # ------------------------------------------------------------------
         # Periodic refresh
@@ -460,6 +465,24 @@ if HAS_TEXTUAL:
                 self.query_one("#stats-bar", Label).update(stats)
             except Exception:
                 pass
+
+        def _check_signals(self) -> None:
+            """Poll the signal flag set by the OS signal handler.
+
+            call_from_thread() cannot safely be called from a signal handler
+            because signal handlers run on the main thread, which is the same
+            thread as Textual's asyncio event loop.  Using a flag + timer avoids
+            the deadlock / silent-fail that results from that mistake.
+            """
+            global _TUI_SIGNAL
+            sig = _TUI_SIGNAL
+            if sig is None:
+                return
+            _TUI_SIGNAL = None
+            if sig == 'pause':
+                self.action_request_pause()
+            elif sig == 'quit':
+                self.action_request_quit()
 
         def _check_all_done(self) -> None:
             if SHUTDOWN_EVENT.is_set() and all(not t.is_alive() for t in self._threads):
@@ -583,12 +606,14 @@ def signal_handler(sig, frame):
                 SHUTDOWN_EVENT.set()
                 try: kill_processes()
                 except: pass
-                try: TUI_APP.call_from_thread(TUI_APP.exit)
-                except: pass
+                global _TUI_SIGNAL
+                _TUI_SIGNAL = 'quit'
             else:
-                # SIGINT (Ctrl+C) → pause menu
-                try: TUI_APP.call_from_thread(TUI_APP.action_request_pause)
-                except: pass
+                # SIGINT (Ctrl+C) → request pause via flag; the app's polling
+                # timer picks this up on the event loop thread (call_from_thread
+                # cannot be used from a signal handler — same thread as the loop).
+                global _TUI_SIGNAL
+                _TUI_SIGNAL = 'pause'
         elif not PAUSE_REQUESTED:
             PAUSE_REQUESTED = True
             try:
