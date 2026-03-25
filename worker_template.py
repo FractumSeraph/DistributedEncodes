@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.0.22"
+WORKER_VERSION = "3.0.23"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -386,12 +386,22 @@ if HAS_TEXTUAL:
             # Column keys assigned in on_mount
             self._col_file = self._col_phase = self._col_bar = None
             self._col_elapsed = self._col_done = self._col_eta = None
+            # Monotonic timestamp recorded when the pause modal is first shown.
+            # Used by _check_signals to distinguish a genuine second press (force-stop)
+            # from the race-condition echo of the *same* keypress handled by both
+            # Textual's binding and the _tty_key_reader fallback simultaneously.
+            self._pause_requested_at = 0.0
 
         def compose(self) -> ComposeResult:
             yield Header()
-            yield DataTable(id="workers-table", show_cursor=False)
+            # can_focus=False here (not just in on_mount) prevents the DataTable from
+            # receiving keyboard focus before on_mount runs.  In recent Textual versions
+            # DataTable captures unrecognised keys for its internal row-search feature
+            # instead of bubbling them, so focus on startup caused the first 'p' press
+            # to be swallowed and the second press to actually trigger the App binding.
+            yield DataTable(id="workers-table", show_cursor=False, can_focus=False)
             yield Label("", id="stats-bar", markup=False)
-            yield RichLog(id="log-panel", highlight=True, markup=False, max_lines=1000)
+            yield RichLog(id="log-panel", highlight=True, markup=False, max_lines=1000, can_focus=False)
             yield Footer()
 
         def on_mount(self) -> None:
@@ -406,9 +416,14 @@ if HAS_TEXTUAL:
             self.set_interval(0.5, self._tick)
             self.set_interval(0.25, self._check_signals)
             self.set_interval(1.5, self._check_all_done)
-            # Prevent these widgets from stealing focus and swallowing key events
+            # Prevent these widgets from stealing focus and swallowing key events.
+            # Belt-and-suspenders: can_focus=False is also set in the constructor,
+            # but re-set here for safety in case Textual ever resets it internally.
             self.query_one("#workers-table").can_focus = False
             self.query_one("#log-panel").can_focus = False
+            # Drop focus from any widget so the App (and its BINDINGS) receives
+            # key events directly from the first keypress, not the second.
+            self.set_focus(None)
             # NOTE: do NOT write raw escape sequences to sys.stdout here.
             # Textual owns the terminal once on_mount fires; writing outside its
             # rendering pipeline corrupts its cursor-position tracking and causes
@@ -542,7 +557,13 @@ if HAS_TEXTUAL:
                 if not PAUSE_REQUESTED:
                     await self.action_request_pause()
                 else:
-                    # Second Ctrl+C / P while already paused = force stop
+                    # Second Ctrl+C / P while already paused = force stop.
+                    # Debounce: if the modal was shown less than 0.5 s ago, this
+                    # signal is almost certainly the same keypress being handled by
+                    # both Textual's binding and the _tty_key_reader fallback at the
+                    # same time (race condition).  Ignore it; the modal stays open.
+                    if time.monotonic() - self._pause_requested_at < 0.5:
+                        return
                     if isinstance(self.screen, PauseModal):
                         self.screen.dismiss("stop")
                     else:
@@ -586,6 +607,7 @@ if HAS_TEXTUAL:
             if PAUSE_REQUESTED:
                 return
             PAUSE_REQUESTED = True
+            self._pause_requested_at = time.monotonic()
             threading.Thread(target=lambda: toggle_processes(suspend=True),
                              daemon=True).start()
             # Show the popup modal — buttons are mouse-clickable on Windows;
