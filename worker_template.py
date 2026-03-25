@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.0.19"
+WORKER_VERSION = "3.0.20"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -409,6 +409,21 @@ if HAS_TEXTUAL:
             # Prevent these widgets from stealing focus and swallowing key events
             self.query_one("#workers-table").can_focus = False
             self.query_one("#log-panel").can_focus = False
+            # Explicitly disable all mouse-tracking ANSI modes.  app.run(mouse=False)
+            # should handle this, but older Textual versions may ignore that
+            # parameter.  Sending the escape sequences directly is version-agnostic
+            # and ensures the [<35;67;2M SGR events never appear in the console.
+            try:
+                sys.stdout.write(
+                    '\033[?1000l'   # disable basic click tracking
+                    '\033[?1002l'   # disable button-event tracking
+                    '\033[?1003l'   # disable any-event (all motion) tracking
+                    '\033[?1006l'   # disable SGR extended mouse mode
+                    '\033[?1015l'   # disable URXVT extended mouse mode
+                )
+                sys.stdout.flush()
+            except Exception:
+                pass
             # Start a fallback key reader on /dev/tty.  On some SSH/tmux setups
             # Textual's own input driver receives no key events; reading /dev/tty
             # directly bypasses that entirely.  We only read p/q here so we
@@ -680,9 +695,13 @@ def safe_print(message):
     if TUI_APP is not None:
         try:
             TUI_APP.call_from_thread(TUI_APP.write_log, message)
-            return
         except Exception:
             pass
+        # Never fall through to direct stdout writes while the TUI owns the
+        # terminal — writing raw bytes into Textual's alternate screen places
+        # stray characters wherever the cursor happens to be (often top-left
+        # during a render cycle).
+        return
     if not CONSOLE_LOCK.acquire(timeout=2):
         return
     try:
@@ -2221,6 +2240,25 @@ def run_worker(args):
                 _k32.GetConsoleMode(_hOut, ctypes.byref(_m_out))
                 def _restore_win_console():
                     try:
+                        # Full terminal reset sequence — covers every mode Textual
+                        # may have enabled that survives an abnormal exit.
+                        sys.stdout.write(
+                            '\033[?1049l'   # exit alternate screen buffer (main symptom:
+                                            #   cursor stuck at top-left after exit)
+                            '\033[?2004l'   # disable bracketed-paste mode
+                            '\033[?1000l'   # disable basic mouse tracking
+                            '\033[?1002l'   # disable button-event tracking
+                            '\033[?1003l'   # disable any-event tracking
+                            '\033[?1006l'   # disable SGR extended mouse mode
+                            '\033[?1015l'   # disable URXVT extended mouse mode
+                            '\033[?25h'     # ensure cursor is visible
+                            '\033[0m'       # reset all SGR attributes (color, bold…)
+                            '\r\n'          # move to a clean line
+                        )
+                        sys.stdout.flush()
+                    except Exception:
+                        pass
+                    try:
                         _k32.SetConsoleMode(_hIn,  _m_in)
                         _k32.SetConsoleMode(_hOut, _m_out)
                     except Exception:
@@ -2228,8 +2266,25 @@ def run_worker(args):
                 _atexit.register(_restore_win_console)
             except Exception:
                 pass
-        app.run()
+        # mouse=False tells Textual not to enable any mouse-tracking ANSI
+        # sequences in the first place — the cleanest way to prevent the
+        # [<35;67;2M SGR events from bleeding into PowerShell on exit.
+        app.run(mouse=False)
         TUI_APP = None
+        # Explicit terminal reset after a clean exit — Textual should have
+        # done this itself, but belt-and-suspenders for any missed sequences.
+        try:
+            sys.stdout.write(
+                '\033[?1049l'   # exit alternate screen buffer
+                '\033[?2004l'   # disable bracketed-paste mode
+                '\033[?1000l\033[?1002l\033[?1003l\033[?1006l\033[?1015l'
+                '\033[?25h'     # show cursor
+                '\033[0m'       # reset SGR attributes
+                '\r\n'
+            )
+            sys.stdout.flush()
+        except Exception:
+            pass
     else:
         if HAS_TEXTUAL and getattr(args, 'no_tui', False):
             _tui_reason = "--no-tui flag passed"
