@@ -870,7 +870,7 @@ def receive_error_report():
     if not d:
         return jsonify({"status": "error"}), 400
 
-    job_id   = sanitize_input(d.get('job_id', ''))   or 'unknown'
+    job_id   = str(d.get('job_id', '') or 'unknown').strip()[:512]
     worker_id = sanitize_input(d.get('worker_id', '')) or 'unknown'
     error_type = sanitize_input(d.get('error_type', 'unknown')) or 'unknown'
     message  = str(d.get('message', ''))[:2048]
@@ -933,7 +933,7 @@ def download_encode_log():
 def job_status():
     """Worker-facing endpoint: returns the current status and assigned worker for a job.
     Used by recovering workers to detect whether a checkpoint is still viable."""
-    job_id = sanitize_input(request.args.get('job_id', ''))
+    job_id = (request.args.get('job_id', '') or '').strip()
     if not job_id:
         return jsonify({"status": "error", "message": "job_id required"}), 400
     with db_lock:
@@ -958,7 +958,7 @@ def reclaim_job():
     with fail_count < 5).  Returns {"status": "ok"} on success so the worker knows
     it is safe to upload the resumed encode."""
     d = request.json or {}
-    job_id   = sanitize_input(d.get('job_id', ''))
+    job_id   = str(d.get('job_id', '') or '').strip()
     worker_id = sanitize_input(d.get('worker_id', ''))
     worker_version = sanitize_input(d.get('version', ''))
     if not job_id or not worker_id:
@@ -994,7 +994,7 @@ def verify_source_hash():
     Returns {"status": "ok"} on match, {"status": "mismatch"} on mismatch,
     or {"status": "pending"} when the server has not yet computed its hash."""
     d = request.json or {}
-    job_id    = sanitize_input(d.get('job_id', ''))
+    job_id    = str(d.get('job_id', '') or '').strip()
     worker_id = sanitize_input(d.get('worker_id', ''))
     worker_hash = str(d.get('source_hash', '')).strip().lower()
 
@@ -1033,7 +1033,7 @@ def verify_source_hash():
 @app.route('/report_status', methods=['POST'])
 @requires_worker_auth
 def report_status():
-    d = request.json; status = d.get('status')
+    d = request.json or {}; status = d.get('status')
     worker_id = sanitize_input(d.get('worker_id'))
     worker_version = sanitize_input(d.get('version'))
     
@@ -1109,7 +1109,10 @@ def api_all_jobs():
 @app.route('/api/logs')
 @requires_auth
 def get_logs():
-    limit = request.args.get('limit', 100)
+    try:
+        limit = min(int(request.args.get('limit', 100)), 1000)
+    except (ValueError, TypeError):
+        limit = 100
     with db_lock:
         conn = db_handler.get_connection(); conn.row_factory = sqlite3.Row
         try:
@@ -1123,7 +1126,7 @@ def get_logs():
 @app.route('/api/admin_action', methods=['POST'])
 @requires_auth
 def admin_action():
-    data = request.json; job_id = data.get('job_id'); action = data.get('action')
+    data = request.json or {}; job_id = data.get('job_id'); action = data.get('action')
     log_event("WARN", f"Admin performed '{action}' on job", job_id)
     
     with db_lock:

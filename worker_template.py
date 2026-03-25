@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.0.21"
+WORKER_VERSION = "3.0.22"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -390,7 +390,7 @@ if HAS_TEXTUAL:
         def compose(self) -> ComposeResult:
             yield Header()
             yield DataTable(id="workers-table", show_cursor=False)
-            yield Label("", id="stats-bar")
+            yield Label("", id="stats-bar", markup=False)
             yield RichLog(id="log-panel", highlight=True, markup=False, max_lines=1000)
             yield Footer()
 
@@ -543,12 +543,21 @@ if HAS_TEXTUAL:
                     await self.action_request_pause()
                 else:
                     # Second Ctrl+C / P while already paused = force stop
-                    await self._handle_pause_result('stop')
+                    if isinstance(self.screen, PauseModal):
+                        self.screen.dismiss("stop")
+                    else:
+                        self._handle_pause_result('stop')
             elif sig == 'quit':
                 self.action_request_quit()
             elif sig.startswith('choice:'):
                 choice = sig[len('choice:'):]
-                await self._handle_pause_result(choice)
+                # SSH/tmux keyboard fallback: dismiss the modal so the callback
+                # fires automatically, rather than calling _handle_pause_result
+                # directly (which would leave the modal open on screen).
+                if isinstance(self.screen, PauseModal):
+                    self.screen.dismiss(choice)
+                else:
+                    self._handle_pause_result(choice)
 
         def _check_all_done(self) -> None:
             if SHUTDOWN_EVENT.is_set() and all(not t.is_alive() for t in self._threads):
@@ -579,18 +588,13 @@ if HAS_TEXTUAL:
             PAUSE_REQUESTED = True
             threading.Thread(target=lambda: toggle_processes(suspend=True),
                              daemon=True).start()
-            self.write_log("")
-            self.write_log("=" * 44)
-            self.write_log(" [!] WORKER PAUSED — FFmpeg suspended")
-            self.write_log("=" * 44)
-            self.write_log(" Press  C  — Continue encoding")
-            self.write_log(" Press  F  — Finish active job, then stop")
-            self.write_log(" Press  S  (or Ctrl+C again)  — Abort now")
-            self.write_log("=" * 44)
+            # Show the popup modal — buttons are mouse-clickable on Windows;
+            # keyboard C/F/S work via Textual bindings or the _tty_key_reader
+            # fallback for SSH/tmux (which dismisses the modal via _check_signals).
+            self.push_screen(PauseModal(), callback=self._handle_pause_result)
 
-        async def _handle_pause_result(self, choice: str | None) -> None:
+        def _handle_pause_result(self, choice) -> None:
             global PAUSE_REQUESTED
-            self._pause_modal = None
             if choice == "continue":
                 PAUSE_REQUESTED = False
                 threading.Thread(target=lambda: toggle_processes(suspend=False),
@@ -1484,15 +1488,22 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                     _r_vf    = _r_chk.get('video_filter', ENCODING_CONFIG['VIDEO_SCALE'])
                     _r_af    = _r_chk.get('audio_filter', 'aresample=async=1')
                     _r_crf   = _r_chk.get('target_crf', int(ENCODING_CONFIG['VIDEO_CRF']))
+                    # Determine if the source was a local file (--local-source) or HTTP.
+                    # Local paths don't start with http(s)://, so skip reconnect flags.
+                    _r_is_local_src = not (_r_dl.startswith('http://') or _r_dl.startswith('https://'))
                     log(worker_id, f"Encoding remainder from {_r_p1_dur:.1f}s...")
-                    _r_rem_cmd = (
-                        [FFMPEG_CMD,
-                         '-headers', _r_hdrs,
+                    _r_input_args = (
+                        ['-ss', str(_r_p1_dur), '-y', '-i', _r_dl]
+                        if _r_is_local_src else
+                        ['-headers', _r_hdrs,
                          '-reconnect', '1', '-reconnect_streamed', '1',
                          '-reconnect_delay_max', '60', '-reconnect_on_network_error', '1',
                          '-ss', str(_r_p1_dur),
-                         '-y', '-i', _r_dl,
-                         '-map', '0:v:0', '-map', f'0:{_r_ai}']
+                         '-y', '-i', _r_dl]
+                    )
+                    _r_rem_cmd = (
+                        [FFMPEG_CMD] + _r_input_args
+                        + ['-map', '0:v:0', '-map', f'0:{_r_ai}']
                         + [x for idx in _r_si for x in ['-map', f'0:{idx}']]
                         + ['-fps_mode', 'passthrough', '-avoid_negative_ts', 'make_zero',
                            '-c:v', ENCODING_CONFIG["VIDEO_CODEC"],
@@ -1757,6 +1768,13 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                         if _probe_attempt < 2:
                             log(worker_id, f"Probe failed (attempt {_probe_attempt+1}/3): {_probe_err}. Retrying in {5*(_probe_attempt+1)}s...", "WARN")
                             time.sleep(5 * (_probe_attempt + 1))
+                        else:
+                            log(worker_id, f"Probe failed after 3 attempts: {_probe_err}. Skipping job.", "ERROR")
+
+                if 'probe_data' not in locals():
+                    post_status("failed", error_msg="FFprobe failed after 3 attempts")
+                    report_error(job_id, "probe_failure", "FFprobe failed after 3 attempts")
+                    continue
 
                 log(worker_id, f"Encoding ({total_min}m)...")
                 post_status("processing", 0, total_min)
