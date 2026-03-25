@@ -68,7 +68,7 @@ def _bootstrap_textual():
             os.path.join(_VENV_DIR, 'bin', 'python')
         )
         result2 = subprocess.run(
-            [venv_python, '-m', 'pip', 'install', '--upgrade', 'textual'],
+            [venv_python, '-m', 'pip', 'install', '--upgrade', 'textual', 'requests'],
             capture_output=True, text=True,
         )
         if result2.returncode == 0:
@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.0.6" # Incremented for textual version check fix.
+WORKER_VERSION = "3.0.7" # Incremented for venv
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
