@@ -409,22 +409,32 @@ if HAS_TEXTUAL:
             if PAUSE_REQUESTED:
                 return
             PAUSE_REQUESTED = True
-            toggle_processes(suspend=True)
+            # Push the modal immediately so it always appears, regardless of how long
+            # OS-level process suspension takes.  toggle_processes acquires PROC_LOCK
+            # and makes blocking kernel calls — running it on the Textual event loop
+            # (main thread) can block long enough that push_screen never executes, or
+            # call_from_thread inside safe_print can raise when called from the main
+            # thread.  Offloading to a daemon thread fixes both issues.
             self.push_screen(PauseModal(), self._handle_pause_result)
+            threading.Thread(target=lambda: toggle_processes(suspend=True),
+                             daemon=True).start()
 
         def _handle_pause_result(self, choice: str) -> None:
             global PAUSE_REQUESTED
             if choice == "continue":
                 PAUSE_REQUESTED = False
-                toggle_processes(suspend=False)
+                threading.Thread(target=lambda: toggle_processes(suspend=False),
+                                 daemon=True).start()
                 self.write_log("[*] Encoding resumed.")
             elif choice == "finish":
                 PAUSE_REQUESTED = False
-                toggle_processes(suspend=False)
+                threading.Thread(target=lambda: toggle_processes(suspend=False),
+                                 daemon=True).start()
                 SHUTDOWN_EVENT.set()
                 self.write_log("[*] Finishing active jobs, then stopping...")
             elif choice == "stop":
-                toggle_processes(suspend=False)
+                threading.Thread(target=lambda: toggle_processes(suspend=False),
+                                 daemon=True).start()
                 kill_processes()
                 SHUTDOWN_EVENT.set()
                 PAUSE_REQUESTED = False
