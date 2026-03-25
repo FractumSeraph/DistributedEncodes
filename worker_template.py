@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.0.24"
+WORKER_VERSION = "3.0.25"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -400,9 +400,9 @@ if HAS_TEXTUAL:
             # DataTable captures unrecognised keys for its internal row-search feature
             # instead of bubbling them, so focus on startup caused the first 'p' press
             # to be swallowed and the second press to actually trigger the App binding.
-            yield DataTable(id="workers-table", show_cursor=False, can_focus=False)
+            yield DataTable(id="workers-table", show_cursor=False)
             yield Label("", id="stats-bar", markup=False)
-            yield RichLog(id="log-panel", highlight=True, markup=False, max_lines=1000, can_focus=False)
+            yield RichLog(id="log-panel", highlight=True, markup=False, max_lines=1000)
             yield Footer()
 
         def on_mount(self) -> None:
