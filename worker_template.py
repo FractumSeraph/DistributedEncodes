@@ -34,7 +34,7 @@ except ImportError:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.0.1" # Incremented for TUI detection fix.
+WORKER_VERSION = "3.0.2" # Incremented for Resuming encodes.
 
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
