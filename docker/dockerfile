@@ -10,6 +10,6 @@ RUN apt-get update && \
 RUN ffmpeg -encoders | grep libsvtav1
 
 WORKDIR /app
-RUN pip install requests
+RUN pip install requests textual
 
 ENTRYPOINT ["/bin/sh", "-c", "curl -fsSL -o worker.py https://encode.fractumseraph.net/dl/worker && exec python worker.py \"$@\"", "--"]

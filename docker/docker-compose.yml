@@ -5,7 +5,8 @@ services:
     build: .
     container_name: fractum_worker_node
     restart: unless-stopped
-    
+    # tty: true   # Uncomment to enable the Textual TUI (requires an interactive terminal)
+
     stop_grace_period: 30s
 
     environment:

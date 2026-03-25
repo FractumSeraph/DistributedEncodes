@@ -19,15 +19,83 @@ import hashlib
 from datetime import datetime, timedelta
 
 # Textual TUI (optional — install with: pip install textual)
+# Minimum required version: 0.20 (RichLog, ModalScreen, Binding, DataTable etc.)
+_TEXTUAL_MIN_VERSION = (0, 20)
+
+_VENV_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.worker_venv')
+
+def _bootstrap_textual():
+    """Auto-install/upgrade textual if missing or too old, then re-exec.
+
+    Strategy:
+      1. Try plain pip install into the current interpreter (works on most systems).
+      2. If pip rejects it (externally-managed-environment / PEP 668), create a
+         local venv at _VENV_DIR and install there, then re-exec with that Python.
+    """
+    try:
+        import textual as _t
+        if tuple(int(x) for x in _t.__version__.split('.')[:2]) >= _TEXTUAL_MIN_VERSION:
+            return  # already fine
+        reason = f"textual {_t.__version__} is too old (>= {'.'.join(str(x) for x in _TEXTUAL_MIN_VERSION)} required)"
+    except ImportError:
+        reason = "textual not found"
+    print(f"[*] {reason} — attempting automatic install...")
+
+    # Attempt 1: plain pip upgrade into current interpreter
+    result = subprocess.run(
+        [sys.executable, '-m', 'pip', 'install', '--upgrade', 'textual'],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        print("[*] textual installed — restarting...")
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    # Attempt 2: create/reuse a local venv and install there
+    print("[*] pip install failed (system-managed env?) — trying local venv...")
+    try:
+        import venv as _venv
+        if not os.path.isdir(_VENV_DIR):
+            print(f"[*] Creating venv at {_VENV_DIR} ...")
+            _venv.create(_VENV_DIR, with_pip=True)
+        venv_python = (
+            os.path.join(_VENV_DIR, 'Scripts', 'python.exe')  # Windows
+            if sys.platform == 'win32' else
+            os.path.join(_VENV_DIR, 'bin', 'python')
+        )
+        result2 = subprocess.run(
+            [venv_python, '-m', 'pip', 'install', '--upgrade', 'textual'],
+            capture_output=True, text=True,
+        )
+        if result2.returncode == 0:
+            print(f"[*] textual installed in venv — restarting under {venv_python} ...")
+            os.execv(venv_python, [venv_python] + sys.argv)
+        else:
+            print(f"[!] venv pip install failed:\n{result2.stderr.strip()}")
+    except Exception as _ve:
+        print(f"[!] venv setup failed: {_ve}")
+
+    print("[!] Could not install textual automatically — continuing without TUI.")
+
+_bootstrap_textual()
+
 try:
+    import textual as _textual_mod
+    _tv = tuple(int(x) for x in _textual_mod.__version__.split('.')[:2])
+    if _tv < _TEXTUAL_MIN_VERSION:
+        raise ImportError(
+            f"textual {_textual_mod.__version__} is too old; "
+            f">= {'.'.join(str(x) for x in _TEXTUAL_MIN_VERSION)} required"
+        )
     from textual.app import App, ComposeResult
     from textual.widgets import Header, Footer, RichLog, DataTable, Button, Label
     from textual.screen import ModalScreen
     from textual.containers import Horizontal, Vertical
     from textual.binding import Binding
     HAS_TEXTUAL = True
-except ImportError:
+    _TEXTUAL_UNAVAIL_REASON = ""
+except ImportError as _e:
     HAS_TEXTUAL = False
+    _TEXTUAL_UNAVAIL_REASON = str(_e)
 
 # ==============================================================================
 # CONFIGURATION
@@ -1876,7 +1944,10 @@ def run_worker(args):
         app.run()
         TUI_APP = None
     else:
-        _tui_reason = "--no-tui flag passed" if HAS_TEXTUAL and getattr(args, 'no_tui', False) else "textual not installed (pip install textual)"
+        if HAS_TEXTUAL and getattr(args, 'no_tui', False):
+            _tui_reason = "--no-tui flag passed"
+        else:
+            _tui_reason = _TEXTUAL_UNAVAIL_REASON or "textual not installed (pip install textual)"
         print(f"Fractum Worker v{WORKER_VERSION} — TUI disabled ({_tui_reason})")
         while True:
             if not PAUSE_REQUESTED:
