@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.0.7" # Incremented for venv
+WORKER_VERSION = "3.0.8" # Incremented for TUI over ssh and tmux.
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -289,9 +289,9 @@ if HAS_TEXTUAL:
                 yield Label("\u23f8  WORKER PAUSED", id="pause-title")
                 yield Label(subtitle, id="pause-subtitle")
                 with Horizontal(id="pause-buttons"):
-                    yield Button("Continue  [C]", id="btn-continue", variant="success")
-                    yield Button("Finish  [F]", id="btn-finish", variant="warning")
-                    yield Button("Stop  [S]", id="btn-stop", variant="error")
+                    yield Button("[C] Continue", id="btn-continue", variant="success")
+                    yield Button("[F] Finish", id="btn-finish", variant="warning")
+                    yield Button("[S] Stop", id="btn-stop", variant="error")
 
         def action_choose_continue(self) -> None: self.dismiss("continue")
         def action_choose_finish(self) -> None: self.dismiss("finish")
@@ -363,8 +363,9 @@ if HAS_TEXTUAL:
         """
 
         BINDINGS = [  # type: ignore[assignment]
-            Binding("p", "request_pause", "Pause"),
-            Binding("q", "request_quit", "Quit"),
+            Binding("ctrl+c", "request_pause", "Pause/Quit", show=True),
+            Binding("p", "request_pause", "Pause", show=False),
+            Binding("q", "request_quit", "Quit", show=False),
         ]
 
         def __init__(self, worker_ids: list, threads: list,
@@ -577,12 +578,18 @@ def signal_handler(sig, frame):
         sys.exit(0)
     else:
         if TUI_APP is not None:
-            # In TUI mode, Ctrl+C triggers a clean shutdown
-            SHUTDOWN_EVENT.set()
-            try: kill_processes()
-            except: pass
-            try: TUI_APP.call_from_thread(TUI_APP.exit)
-            except: pass
+            # In TUI mode, Ctrl+C opens the pause menu so the user can choose
+            # Continue / Finish / Stop.  SIGTERM still shuts down cleanly.
+            if sig == signal.SIGTERM:
+                SHUTDOWN_EVENT.set()
+                try: kill_processes()
+                except: pass
+                try: TUI_APP.call_from_thread(TUI_APP.exit)
+                except: pass
+            else:
+                # SIGINT (Ctrl+C) → pause menu
+                try: TUI_APP.call_from_thread(TUI_APP.action_request_pause)
+                except: pass
         elif not PAUSE_REQUESTED:
             PAUSE_REQUESTED = True
             try:
@@ -2003,7 +2010,9 @@ def run_worker(args):
     
     threads = []
     worker_ids = []
-    use_tui = HAS_TEXTUAL and not getattr(args, 'no_tui', False)
+    _force_tui = getattr(args, 'force_tui', False)
+
+    use_tui = HAS_TEXTUAL and (not getattr(args, 'no_tui', False) or _force_tui)
     single_mode = (num_jobs == 1) and not use_tui
 
     # Initialize per-worker detail state and session stats
@@ -2071,10 +2080,29 @@ def run_worker(args):
             print(" [C]ontinue  - Resume encoding")
             print(" [F]inish    - Finish active, then stop")
             print(" [S]top      - Abort immediately")
+            print(" Ctrl+C again - Force abort")
+
+            # Open /dev/tty directly so input works even when stdin is a pipe
+            # (e.g. launched via curl | bash or inside tmux with redirected stdin).
+            _input_src = None
+            if not sys.stdin.isatty():
+                try:
+                    _input_src = open('/dev/tty', 'r')
+                except Exception:
+                    pass
+
+            def _read_choice():
+                src = _input_src if _input_src else sys.stdin
+                sys.stdout.write("Select [c/f/s]: ")
+                sys.stdout.flush()
+                line = src.readline()
+                if not line:
+                    raise EOFError
+                return line.strip().lower()
 
             while PAUSE_REQUESTED:
                 try:
-                    choice = input("Select [c/f/s]: ").strip().lower()
+                    choice = _read_choice()
                     if choice == 'c':
                         print("[*] Resuming...")
                         MONITOR_PAUSED.clear()
@@ -2092,12 +2120,35 @@ def run_worker(args):
                         kill_processes()
                         SHUTDOWN_EVENT.set()
                         PAUSE_REQUESTED = False
+                        if _input_src:
+                            try: _input_src.close()
+                            except: pass
                         sys.exit(0)
-                except (EOFError, KeyboardInterrupt):
-                    sys.stdout.write("\n")
+                except KeyboardInterrupt:
+                    # Second Ctrl+C while paused = force stop
+                    print("\n[*] Force abort.")
+                    toggle_processes(suspend=False)
+                    kill_processes()
+                    SHUTDOWN_EVENT.set()
+                    PAUSE_REQUESTED = False
+                    if _input_src:
+                        try: _input_src.close()
+                        except: pass
+                    sys.exit(0)
+                except EOFError:
+                    # stdin fully exhausted and /dev/tty unavailable — can't prompt
+                    print("\n[!] No input available — aborting.")
+                    toggle_processes(suspend=False)
+                    kill_processes()
+                    SHUTDOWN_EVENT.set()
+                    PAUSE_REQUESTED = False
+                    sys.exit(0)
+                except Exception:
                     time.sleep(0.5)
-                    continue
-                except Exception: time.sleep(0.5)
+
+            if _input_src:
+                try: _input_src.close()
+                except: pass
 
     if UPDATE_AVAILABLE: apply_update(manager_url)
 
@@ -2112,6 +2163,7 @@ if __name__ == "__main__":
     parser.add_argument("--daily-quota", type=float, default=0, help="Daily download limit in GB (0 = unlimited)")
     parser.add_argument("--watermark", action="store_true", default=False, help="Burn the @FractumSeraph watermark into encoded video")
     parser.add_argument("--no-tui", action="store_true", default=False, help="Disable Textual TUI and use plain terminal output")
+    parser.add_argument("--force-tui", action="store_true", default=False, help="Force Textual TUI even in SSH/tmux environments (may have input issues)")
     parser.add_argument("--max-size-mb", type=int, default=0, help="Skip source files larger than this size in MB (0 = no limit)")
     parser.add_argument("--local-source", default=None, metavar="DIR",
                         help="Path to the source media directory on this machine. When set and the "
