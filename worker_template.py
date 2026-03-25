@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.0.14" # Incremented for TUI over ssh and tmux.
+WORKER_VERSION = "3.0.15" # Incremented for TUI over ssh and tmux.
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -386,8 +386,6 @@ if HAS_TEXTUAL:
             # Column keys assigned in on_mount
             self._col_file = self._col_phase = self._col_bar = None
             self._col_elapsed = self._col_done = self._col_eta = None
-            self._pause_modal: 'PauseModal | None' = None
-            self._tty_paused = threading.Event()  # set while suspend() is active
 
         def compose(self) -> ComposeResult:
             yield Header()
@@ -432,12 +430,19 @@ if HAS_TEXTUAL:
                         if not ch:
                             break
                         c = ch.decode('utf-8', errors='ignore').lower()
-                        if self._tty_paused.is_set():
-                            continue  # suspend() owns the tty right now
-                        if c == 'p' and _TUI_SIGNAL is None:
-                            _TUI_SIGNAL = 'pause'
-                        elif c == 'q' and _TUI_SIGNAL is None:
-                            _TUI_SIGNAL = 'quit'
+                        if PAUSE_REQUESTED:
+                            # While paused, route c/f/s as pause-choice signals
+                            if c == 'c':
+                                _TUI_SIGNAL = 'choice:continue'
+                            elif c == 'f':
+                                _TUI_SIGNAL = 'choice:finish'
+                            elif c == 's':
+                                _TUI_SIGNAL = 'choice:stop'
+                        else:
+                            if c == 'p' and _TUI_SIGNAL is None:
+                                _TUI_SIGNAL = 'pause'
+                            elif c == 'q' and _TUI_SIGNAL is None:
+                                _TUI_SIGNAL = 'quit'
                 finally:
                     termios.tcsetattr(tty_fd, termios.TCSADRAIN, old)
                     tty_fd.close()
@@ -509,27 +514,23 @@ if HAS_TEXTUAL:
                 pass
 
         async def _check_signals(self) -> None:
-            """Poll the signal flag set by the OS signal handler.
-
-            call_from_thread() cannot safely be called from a signal handler
-            because signal handlers run on the main thread, which is the same
-            thread as Textual's asyncio event loop.  Using a flag + timer avoids
-            the deadlock / silent-fail that results from that mistake.
-            """
+            """Poll the signal flag set by the OS signal handler or tty key reader."""
             global _TUI_SIGNAL
             sig = _TUI_SIGNAL
             if sig is None:
                 return
             _TUI_SIGNAL = None
             if sig == 'pause':
-                if PAUSE_REQUESTED and self._pause_modal is not None:
-                    # Second Ctrl+C while legacy modal is open = force stop
-                    try: self._pause_modal.dismiss("stop")
-                    except Exception: pass
-                else:
+                if not PAUSE_REQUESTED:
                     await self.action_request_pause()
+                else:
+                    # Second Ctrl+C / P while already paused = force stop
+                    await self._handle_pause_result('stop')
             elif sig == 'quit':
                 self.action_request_quit()
+            elif sig.startswith('choice:'):
+                choice = sig[len('choice:'):]
+                await self._handle_pause_result(choice)
 
         def _check_all_done(self) -> None:
             if SHUTDOWN_EVENT.is_set() and all(not t.is_alive() for t in self._threads):
@@ -558,31 +559,16 @@ if HAS_TEXTUAL:
             if PAUSE_REQUESTED:
                 return
             PAUSE_REQUESTED = True
-
-            if hasattr(self, 'suspend'):
-                # Start suspending FFmpeg in background (non-blocking) then
-                # suspend the TUI so the terminal is restored to normal mode.
-                # _run_text_pause_menu() is called synchronously — that's fine
-                # because the TUI renderer is already paused.
-                threading.Thread(target=lambda: toggle_processes(suspend=True),
-                                 daemon=True).start()
-                choice = 'stop'
-                try:
-                    self._tty_paused.set()
-                    async with self.suspend():
-                        choice = _run_text_pause_menu()
-                except Exception:
-                    pass
-                finally:
-                    self._tty_paused.clear()
-                await self._handle_pause_result(choice)
-            else:
-                # Older Textual without suspend(): fall back to modal
-                modal = PauseModal()
-                self._pause_modal = modal
-                self.push_screen(modal, self._handle_pause_result)
-                threading.Thread(target=lambda: toggle_processes(suspend=True),
-                                 daemon=True).start()
+            threading.Thread(target=lambda: toggle_processes(suspend=True),
+                             daemon=True).start()
+            self.write_log("")
+            self.write_log("=" * 44)
+            self.write_log(" [!] WORKER PAUSED — FFmpeg suspended")
+            self.write_log("=" * 44)
+            self.write_log(" Press  C  — Continue encoding")
+            self.write_log(" Press  F  — Finish active job, then stop")
+            self.write_log(" Press  S  (or Ctrl+C again)  — Abort now")
+            self.write_log("=" * 44)
 
         async def _handle_pause_result(self, choice: str | None) -> None:
             global PAUSE_REQUESTED
