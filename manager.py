@@ -868,6 +868,64 @@ def download_encode_log():
     return jsonify({"status": "error", "message": "Log file not found"}), 404
 
 
+@app.route('/job_status', methods=['GET'])
+@requires_worker_auth
+def job_status():
+    """Worker-facing endpoint: returns the current status and assigned worker for a job.
+    Used by recovering workers to detect whether a checkpoint is still viable."""
+    job_id = sanitize_input(request.args.get('job_id', ''))
+    if not job_id:
+        return jsonify({"status": "error", "message": "job_id required"}), 400
+    with db_lock:
+        conn = db_handler.get_connection()
+        conn.row_factory = sqlite3.Row
+        try:
+            c = conn.cursor()
+            c.execute("SELECT status, worker_id FROM jobs WHERE id=?", (job_id,))
+            row = c.fetchone()
+        finally:
+            conn.close()
+    if row is None:
+        return jsonify({"status": "error", "message": "not_found"}), 404
+    return jsonify({"job_status": row["status"], "worker_id": row["worker_id"]})
+
+
+@app.route('/reclaim_job', methods=['POST'])
+@requires_worker_auth
+def reclaim_job():
+    """Worker-facing endpoint: attempt to reclaim a queued (or timed-out) job by ID.
+    Only succeeds if the job is currently in a reclaimable state (queued / failed
+    with fail_count < 5).  Returns {"status": "ok"} on success so the worker knows
+    it is safe to upload the resumed encode."""
+    d = request.json or {}
+    job_id   = sanitize_input(d.get('job_id', ''))
+    worker_id = sanitize_input(d.get('worker_id', ''))
+    worker_version = sanitize_input(d.get('version', ''))
+    if not job_id or not worker_id:
+        return jsonify({"status": "error", "message": "job_id and worker_id required"}), 400
+    with db_lock:
+        conn = db_handler.get_connection()
+        conn.row_factory = sqlite3.Row
+        try:
+            c = conn.cursor()
+            c.execute("SELECT status, COALESCE(fail_count, 0) as fail_count FROM jobs WHERE id=?", (job_id,))
+            row = c.fetchone()
+            if row is None:
+                return jsonify({"status": "error", "message": "not_found"}), 404
+            if row["status"] not in ('queued', 'failed') or row["fail_count"] >= 5:
+                return jsonify({"status": "conflict",
+                                "message": f"Job is not reclaimable (status={row['status']})"}), 409
+            conn.execute(
+                "UPDATE jobs SET status='processing', worker_id=?, worker_version=?, "
+                "last_updated=?, started_at=COALESCE(started_at, ?) WHERE id=?",
+                (worker_id, worker_version, datetime.now(), datetime.now(), job_id))
+            conn.commit()
+        finally:
+            conn.close()
+    log_event("INFO", f"Job reclaimed by {worker_id} (resume path)", job_id)
+    return jsonify({"status": "ok"})
+
+
 @app.route('/report_status', methods=['POST'])
 @requires_worker_auth
 def report_status():

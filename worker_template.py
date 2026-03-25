@@ -661,6 +661,54 @@ def get_seconds(t):
     except: return 0
 
 # ==============================================================================
+# RESUME / PARTIAL ENCODE HELPERS
+# ==============================================================================
+
+_RESUME_CHK_PREFIX = "resume_chk_"
+
+def _probe_local_duration(file_path):
+    """Return duration in seconds of a local media file, or 0.0 on failure."""
+    try:
+        res = subprocess.run(
+            [FFPROBE_CMD, '-v', 'quiet', '-print_format', 'json', '-show_format', file_path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            encoding='utf-8', errors='replace', timeout=60)
+        dur = json.loads(res.stdout).get('format', {}).get('duration')
+        return float(dur) if dur else 0.0
+    except Exception:
+        return 0.0
+
+def _save_resume_checkpoint(path, payload):
+    """Atomically write a resume checkpoint JSON."""
+    tmp = path + '.tmp'
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(payload, f)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            if os.path.exists(tmp): os.remove(tmp)
+        except Exception:
+            pass
+
+def _load_resume_checkpoints(temp_dir):
+    """Return list of (path, data) for all resume checkpoints found in temp_dir."""
+    results = []
+    try:
+        for fname in os.listdir(temp_dir):
+            if fname.startswith(_RESUME_CHK_PREFIX) and fname.endswith('.json'):
+                fpath = os.path.join(temp_dir, fname)
+                try:
+                    with open(fpath, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    results.append((fpath, data))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return results
+
+# ==============================================================================
 # FFMPEG MANAGEMENT
 # ==============================================================================
 
@@ -910,6 +958,278 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                 continue
 
             update_status("Idle")
+
+            # =========================================================
+            # RESUME: Finish any partial encodes from a previous run
+            # =========================================================
+            for _r_chk_path, _r_chk in _load_resume_checkpoints(temp_dir):
+                if SHUTDOWN_EVENT.is_set(): break
+                _r_partial = _r_chk.get('partial_path', '')
+                _r_job_id  = _r_chk.get('job_id', '')
+                if not _r_job_id or not os.path.exists(_r_partial):
+                    log(worker_id, f"Stale resume checkpoint ({_r_job_id}). Removing.")
+                    try: os.remove(_r_chk_path)
+                    except: pass
+                    continue
+
+                # ----------------------------------------------------------
+                # Check with the server: is this job still ours to resume?
+                # ----------------------------------------------------------
+                _r_server_status = None
+                _r_server_owner  = None
+                _r_check_failed  = False
+                try:
+                    _r_chk_resp = requests.get(
+                        f"{manager_url}/job_status",
+                        params={"job_id": _r_job_id},
+                        headers=get_auth_headers(), timeout=10)
+                    if _r_chk_resp.status_code == 200:
+                        _r_chk_data    = _r_chk_resp.json()
+                        _r_server_status = _r_chk_data.get("job_status")
+                        _r_server_owner  = _r_chk_data.get("worker_id")
+                    elif _r_chk_resp.status_code == 404:
+                        # Job no longer exists on the server; discard checkpoint
+                        log(worker_id, f"Checkpoint job {_r_job_id} not found on server. Discarding.")
+                        for _fp in [_r_chk_path, _r_partial]:
+                            try:
+                                if os.path.exists(_fp): os.remove(_fp)
+                            except: pass
+                        continue
+                    else:
+                        _r_check_failed = True
+                except Exception as _r_ce:
+                    log(worker_id, f"Could not reach server to validate checkpoint ({_r_job_id}): {_r_ce}. Skipping resume this cycle.", "WARN")
+                    _r_check_failed = True
+
+                if _r_check_failed:
+                    # Can't confirm ownership — skip this iteration, try again next cycle
+                    continue
+
+                if _r_server_status == "completed":
+                    log(worker_id, f"Job {_r_job_id} already completed on server. Discarding checkpoint.")
+                    for _fp in [_r_chk_path, _r_partial]:
+                        try:
+                            if os.path.exists(_fp): os.remove(_fp)
+                        except: pass
+                    continue
+
+                if _r_server_status == "permanently_failed":
+                    log(worker_id, f"Job {_r_job_id} is permanently failed. Discarding checkpoint.")
+                    for _fp in [_r_chk_path, _r_partial]:
+                        try:
+                            if os.path.exists(_fp): os.remove(_fp)
+                        except: pass
+                    continue
+
+                if _r_server_status == "processing" and _r_server_owner and _r_server_owner != worker_id:
+                    # A different worker has been assigned this job — leave it alone
+                    log(worker_id, f"Job {_r_job_id} is now owned by {_r_server_owner}. Abandoning checkpoint.")
+                    for _fp in [_r_chk_path, _r_partial]:
+                        try:
+                            if os.path.exists(_fp): os.remove(_fp)
+                        except: pass
+                    continue
+
+                # Job is queued (timed out) or still ours — reclaim it before resuming
+                if _r_server_status in ("queued", "failed"):
+                    try:
+                        _r_reclaim = requests.post(
+                            f"{manager_url}/reclaim_job",
+                            json={"job_id": _r_job_id, "worker_id": worker_id,
+                                  "version": WORKER_VERSION},
+                            headers=get_auth_headers(), timeout=10)
+                        if _r_reclaim.status_code == 409:
+                            # Race: another worker claimed it first
+                            log(worker_id, f"Job {_r_job_id} reclaim failed (already taken). Abandoning checkpoint.")
+                            for _fp in [_r_chk_path, _r_partial]:
+                                try:
+                                    if os.path.exists(_fp): os.remove(_fp)
+                                except: pass
+                            continue
+                        if _r_reclaim.status_code != 200:
+                            log(worker_id, f"Job {_r_job_id} reclaim returned {_r_reclaim.status_code}. Skipping.", "WARN")
+                            continue
+                        log(worker_id, f"Reclaimed job {_r_job_id} from the queue.")
+                    except Exception as _r_re:
+                        log(worker_id, f"Reclaim request failed for {_r_job_id}: {_r_re}. Skipping.", "WARN")
+                        continue
+                # ----------------------------------------------------------
+
+                _r_partial_dur = _probe_local_duration(_r_partial)
+                if _r_partial_dur < 5.0:
+                    log(worker_id, f"Partial encode for {_r_job_id} unreadable/too short ({_r_partial_dur:.1f}s). Discarding.")
+                    for _fp in [_r_chk_path, _r_partial]:
+                        try:
+                            if os.path.exists(_fp): os.remove(_fp)
+                        except: pass
+                    continue
+                _r_total_sec = _r_chk.get('total_sec', 0)
+                _r_total_min = _r_chk.get('total_min', 0)
+                _r_pct = int(_r_partial_dur / _r_total_sec * 100) if _r_total_sec > 0 else 0
+                log(worker_id, f"Resuming job {_r_job_id}: was {_r_pct}% done ({_r_partial_dur:.1f}s/{_r_total_sec:.1f}s).")
+                job_id = _r_job_id
+                d = WORKER_DETAILS.get(worker_id)
+                if d is not None:
+                    d.update({"file": _r_job_id, "phase": "Encoding", "pct": _r_pct, "job_start": time.time()})
+                post_status("processing", _r_pct, _r_total_min)
+
+                _r_p1     = _r_partial + '.p1.mp4'
+                _r_p2     = _r_partial + '.p2.mp4'
+                _r_clist  = _r_partial + '.concat.txt'
+                _r_merged = _r_partial + '.merged.mp4'
+                _r_tmps   = [_r_p1, _r_p2, _r_clist, _r_merged]
+                _resume_ok = False
+                try:
+                    # Trim part1 to a clean keyframe boundary using stream-copy (no re-encode)
+                    _r_trim_pt = max(0.0, _r_partial_dur - 5.0)
+                    _r_trim_rc = subprocess.run(
+                        [FFMPEG_CMD, '-y', '-i', _r_partial,
+                         '-t', str(_r_trim_pt), '-c', 'copy', _r_p1],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        encoding='utf-8', errors='replace', timeout=300)
+                    if _r_trim_rc.returncode != 0 or not os.path.exists(_r_p1):
+                        raise RuntimeError(f"Part-1 trim failed (rc={_r_trim_rc.returncode})")
+                    _r_p1_dur = _probe_local_duration(_r_p1)
+                    if _r_p1_dur <= 0:
+                        raise RuntimeError("Trimmed part-1 not readable")
+
+                    # Encode the remainder starting from _r_p1_dur
+                    _r_hdrs  = f"X-Worker-Token: {WORKER_SECRET}\r\n"
+                    _r_dl    = _r_chk.get('dl_url', '')
+                    _r_ai    = _r_chk.get('audio_index', 0)
+                    _r_si    = _r_chk.get('subtitle_indices', [])
+                    _r_vf    = _r_chk.get('video_filter', ENCODING_CONFIG['VIDEO_SCALE'])
+                    _r_af    = _r_chk.get('audio_filter', 'aresample=async=1')
+                    _r_crf   = _r_chk.get('target_crf', int(ENCODING_CONFIG['VIDEO_CRF']))
+                    log(worker_id, f"Encoding remainder from {_r_p1_dur:.1f}s...")
+                    _r_rem_cmd = (
+                        [FFMPEG_CMD,
+                         '-headers', _r_hdrs,
+                         '-reconnect', '1', '-reconnect_streamed', '1',
+                         '-reconnect_delay_max', '60', '-reconnect_on_network_error', '1',
+                         '-ss', str(_r_p1_dur),
+                         '-y', '-i', _r_dl,
+                         '-map', '0:v:0', '-map', f'0:{_r_ai}']
+                        + [x for idx in _r_si for x in ['-map', f'0:{idx}']]
+                        + ['-fps_mode', 'passthrough', '-avoid_negative_ts', 'make_zero',
+                           '-c:v', ENCODING_CONFIG["VIDEO_CODEC"],
+                           '-preset', ENCODING_CONFIG["VIDEO_PRESET"],
+                           '-crf', str(_r_crf),
+                           '-pix_fmt', ENCODING_CONFIG["VIDEO_PIX_FMT"],
+                           '-vf', _r_vf,
+                           '-c:a', ENCODING_CONFIG["AUDIO_CODEC"],
+                           '-b:a', ENCODING_CONFIG["AUDIO_BITRATE"],
+                           '-ac', ENCODING_CONFIG["AUDIO_CHANNELS"],
+                           '-af', _r_af,
+                           '-c:s', ENCODING_CONFIG["SUBTITLE_CODEC"],
+                           '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+                           '-progress', 'pipe:1', _r_p2])
+
+                    _r_popen_kw = {}
+                    if platform.system() == 'Windows':
+                        _r_popen_kw['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP
+                    else:
+                        _r_popen_kw['start_new_session'] = True
+                    _r_rem = subprocess.Popen(
+                        _r_rem_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        stdin=subprocess.DEVNULL, encoding='utf-8', errors='replace', **_r_popen_kw)
+                    with PROC_LOCK: ACTIVE_PROCS[worker_id] = _r_rem
+                    _r_last_rep = 0
+                    while True:
+                        if SHUTDOWN_EVENT.is_set(): _r_rem.terminate(); break
+                        _r_ln = _r_rem.stdout.readline()
+                        if not _r_ln and _r_rem.poll() is not None: break
+                        if "out_time=" in _r_ln and "N/A" not in _r_ln and _r_total_sec > 0:
+                            try:
+                                _r_cur = get_seconds(_r_ln.split('=')[1].strip())
+                                _r_ov  = min(100, int((_r_p1_dur + _r_cur) / _r_total_sec * 100))
+                                update_status(f"Enc {_r_ov}%")
+                                if time.time() - _r_last_rep > 10:
+                                    post_status("processing", _r_ov, _r_total_min)
+                                    _r_last_rep = time.time()
+                            except: pass
+                    with PROC_LOCK:
+                        if worker_id in ACTIVE_PROCS: del ACTIVE_PROCS[worker_id]
+                    if SHUTDOWN_EVENT.is_set():
+                        break  # keep partial + checkpoint for the next run
+                    if _r_rem.returncode != 0 or not os.path.exists(_r_p2):
+                        raise RuntimeError(f"Remainder encode failed (rc={_r_rem.returncode})")
+
+                    # Concatenate part1 + part2 into the final merged file
+                    log(worker_id, "Concatenating resume parts...")
+                    with open(_r_clist, 'w', encoding='utf-8') as _cf:
+                        _cf.write(f"file '{_r_p1.replace(os.sep, '/')}'\n")
+                        _cf.write(f"file '{_r_p2.replace(os.sep, '/')}'\n")
+                    _r_cat_rc = subprocess.run(
+                        [FFMPEG_CMD, '-y', '-f', 'concat', '-safe', '0',
+                         '-i', _r_clist, '-c', 'copy', '-movflags', '+faststart', _r_merged],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        encoding='utf-8', errors='replace', timeout=600)
+                    if _r_cat_rc.returncode != 0 or not os.path.exists(_r_merged):
+                        raise RuntimeError(f"Concat failed (rc={_r_cat_rc.returncode})")
+                    os.replace(_r_merged, _r_partial)
+                    _r_tmps.remove(_r_merged)  # already moved, skip final-cleanup
+                    _resume_ok = True
+
+                except Exception as _r_err:
+                    log(worker_id, f"Resume failed for {_r_job_id}: {_r_err}. Discarding.", "ERROR")
+                finally:
+                    for _fp in _r_tmps:
+                        try:
+                            if os.path.exists(_fp): os.remove(_fp)
+                        except: pass
+
+                if not _resume_ok:
+                    for _fp in [_r_chk_path, _r_partial]:
+                        try:
+                            if os.path.exists(_fp): os.remove(_fp)
+                        except: pass
+                    continue
+
+                # Upload the resumed, fully merged file
+                _r_file_bytes = os.path.getsize(_r_partial)
+                log(worker_id, f"Resume complete ({_r_file_bytes/1024/1024:.2f} MB). Uploading...")
+                post_status("uploading", 0)
+                update_status("Up 0%")
+                _r_up_ok = False
+                for _r_up_att in range(3):
+                    if SHUTDOWN_EVENT.is_set(): break
+                    try:
+                        with open(_r_partial, 'rb') as _r_f:
+                            _r_resp = requests.post(
+                                f"{manager_url}/upload_result",
+                                files={'file': (_r_job_id, _r_f)},
+                                data={'job_id': _r_job_id, 'worker_id': worker_id,
+                                      'duration': _r_total_min},
+                                headers=get_auth_headers(), timeout=300)
+                            if _r_resp.status_code == 200:
+                                _r_up_ok = True; break
+                            else:
+                                log(worker_id, f"Resume upload rejected: {_r_resp.status_code}", "WARN")
+                    except Exception as _r_ue:
+                        log(worker_id, f"Resume upload attempt {_r_up_att+1} failed: {_r_ue}", "WARN")
+                        time.sleep(10)
+
+                if _r_up_ok:
+                    log(worker_id, f"Resumed job {_r_job_id} complete.")
+                    d = WORKER_DETAILS.get(worker_id)
+                    if d is not None:
+                        d.update({"phase": "Done", "pct": 100})
+                        d["jobs_done"] += 1
+                    with STATS_LOCK:
+                        SESSION_STATS["jobs_done"] += 1
+                        SESSION_STATS["bytes_uploaded"] += _r_file_bytes
+                else:
+                    log(worker_id, f"Resume upload failed for {_r_job_id}.", "ERROR")
+                    post_status("failed", error_msg="Resume upload failed after 3 attempts")
+
+                # Always clean up the checkpoint and partial file after an upload attempt
+                for _fp in [_r_chk_path, _r_partial]:
+                    try:
+                        if os.path.exists(_fp): os.remove(_fp)
+                    except: pass
+            # ========================================================
+
             if check_version(manager_url):
                 UPDATE_AVAILABLE = True; SHUTDOWN_EVENT.set(); break
 
@@ -1084,10 +1404,30 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                     '-ac', ENCODING_CONFIG["AUDIO_CHANNELS"], # Enforce 1 channel (Mono)
                     '-af', audio_filter, 
                     '-c:s', ENCODING_CONFIG["SUBTITLE_CODEC"], 
+                    # frag_keyframe writes each GOP as a self-contained fragment so the file
+                    # remains readable even if the process is killed mid-encode.
+                    '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
                     '-progress', 'pipe:1', 
                     local_dst
                 ])
-                
+
+                # Save a resume checkpoint so we can recover this encode if interrupted.
+                _chk_safe_id = re.sub(r'[^a-zA-Z0-9_\-]', '_', str(job_id))
+                _chk_path = os.path.join(temp_dir, f"{_RESUME_CHK_PREFIX}{_chk_safe_id}.json")
+                _save_resume_checkpoint(_chk_path, {
+                    "job_id":           job_id,
+                    "dl_url":           dl_url,
+                    "partial_path":     local_dst,
+                    "total_sec":        total_sec,
+                    "total_min":        total_min,
+                    "audio_index":      audio_index,
+                    "subtitle_indices": subtitle_indices,
+                    "target_crf":       target_crf,
+                    "video_filter":     video_filter,
+                    "audio_filter":     audio_filter,
+                    "created_at":       time.time(),
+                })
+
                 proc = None; enc_time = 0
                 for _enc_attempt in range(3):
                     if SHUTDOWN_EVENT.is_set(): break
@@ -1239,6 +1579,11 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                         with STATS_LOCK:
                             SESSION_STATS["jobs_done"] += 1
                             SESSION_STATS["bytes_uploaded"] += final_size_bytes
+                        # Remove the resume checkpoint now that the job is finished
+                        try:
+                            _done_chk = os.path.join(temp_dir, f"{_RESUME_CHK_PREFIX}{re.sub(r'[^a-zA-Z0-9_\\-]', '_', str(job_id))}.json")
+                            if os.path.exists(_done_chk): os.remove(_done_chk)
+                        except: pass
                         upload_encode_log()
                     else:
                         d = WORKER_DETAILS.get(worker_id)
