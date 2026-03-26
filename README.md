@@ -101,7 +101,7 @@ Append `&series_id=X` to focus on a specific series.
 
 2. **Install dependencies:**
    ```powershell
-   pip install requests
+   pip install requests textual
    ```
    > `textual` (the TUI library) is installed automatically on first run if it is not already present. You can pre-install it with `pip install textual` if you prefer.
 
