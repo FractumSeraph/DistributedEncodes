@@ -64,8 +64,6 @@ services:
     container_name: fractum_worker_node
     restart: unless-stopped
     stop_grace_period: 30s
-    environment:
-      - WORKER_SECRET=YourSecretHere
     entrypoint: ["/bin/sh", "-c",
       "apt-get update && apt-get install -y ffmpeg curl && pip install requests textual &&
        curl -fsSL -o worker.py https://encode.fractumseraph.net/dl/worker &&
@@ -110,7 +108,6 @@ Append `&series_id=X` to focus on a specific series.
 
 4. **Run it:**
    ```powershell
-   $env:WORKER_SECRET = "YourSecretHere"
    python worker.py --manager "https://encode.fractumseraph.net/" --username "MyName" --workername "MyPC" --jobs 1
    ```
 
