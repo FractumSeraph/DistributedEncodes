@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.0.25"
+WORKER_VERSION = "3.0.26"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -373,8 +373,8 @@ if HAS_TEXTUAL:
         """
 
         BINDINGS = [  # type: ignore[assignment]
-            Binding("p", "request_pause", "Pause  [P]", show=True),
-            Binding("q", "request_quit",  "Quit   [Q]", show=True),
+            Binding("p", "request_pause", "Pause  [P]", show=True, priority=True),
+            Binding("q", "request_quit",  "Quit   [Q]", show=True, priority=True),
         ]
 
         def __init__(self, worker_ids: list, threads: list,
