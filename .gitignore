@@ -1,3 +1,9 @@
 config.py
 __pycache__/
 *.pyc
+chunk_store/
+temp_uploads/
+encode_logs/
+*.db
+*.db-wal
+*.db-shm

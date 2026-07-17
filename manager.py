@@ -1,6 +1,5 @@
 import os
 import time
-import queue
 import threading
 import sqlite3
 import subprocess
@@ -72,9 +71,27 @@ try:
     except ImportError:
         DB_MODE = 'disk'
 
+    # [ADDED] Chunked encoding: split long videos into time-range chunks so
+    # multiple workers can encode a single video in parallel.
+    try:
+        from config import CHUNKED_ENCODING
+    except ImportError:
+        CHUNKED_ENCODING = True
+
+    try:
+        from config import CHUNK_DURATION_SEC
+    except ImportError:
+        CHUNK_DURATION_SEC = 300
+
 except ImportError:
     print("[!] Critical Error: config.py not found.")
     exit(1)
+
+# Sanity clamp: chunks shorter than 60s waste more overhead than they parallelize
+try:
+    CHUNK_DURATION_SEC = max(60, int(CHUNK_DURATION_SEC))
+except (TypeError, ValueError):
+    CHUNK_DURATION_SEC = 300
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
@@ -91,9 +108,14 @@ limiter = Limiter(
     storage_uri="memory://"
 )
 
-job_queue = queue.Queue()
-queued_job_ids = set()
 db_lock = threading.RLock()
+
+# --- Chunked encoding state ---
+CHUNK_STORE_DIR = os.path.abspath("chunk_store")   # uploaded chunk files live here until assembly
+CHUNK_STALE_SECONDS = 1800                          # processing chunk with no heartbeat -> pending
+CHUNK_MAX_FAILS = 3                                 # chunk failures before whole-job fallback
+ASSEMBLING_JOBS = set()                             # job_ids with an assembly thread running
+ASSEMBLY_LOCK = threading.Lock()
 
 # Cache for outdated worker logs to prevent spamming DB
 OUTDATED_LOG_CACHE = {} 
@@ -305,6 +327,449 @@ def verify_upload(filepath):
         return False, str(e)
 
 # ==============================================================================
+# CHUNKED ENCODING (split one video across many workers)
+# ==============================================================================
+
+def build_download_url(job_id, source_type, source_url):
+    """Build the URL a worker should stream the source from."""
+    if source_type == 'remote':
+        base_url = source_url if source_url else REMOTE_SOURCE_URL
+        return urljoin(base_url, quote(job_id)) if base_url else ""
+    return f"{SERVER_URL_DISPLAY.rstrip('/')}/download_source/{quote(job_id, safe='/')}"
+
+def _chunk_dir(job_id):
+    """Directory where uploaded chunks for a job are stored (short + unique)."""
+    safe = re.sub(r'[^a-zA-Z0-9_.-]', '_', job_id)[:60]
+    tag = hashlib.md5(job_id.encode('utf-8', 'replace')).hexdigest()[:10]
+    return os.path.join(CHUNK_STORE_DIR, f"{safe}_{tag}")
+
+def _parse_rate(rate_str):
+    """Parse an ffprobe frame-rate fraction like '24000/1001' into a float."""
+    try:
+        num, _, den = str(rate_str).partition('/')
+        num = float(num); den = float(den) if den else 1.0
+        return num / den if den else 0.0
+    except (ValueError, ZeroDivisionError):
+        return 0.0
+
+def _probe_media(src):
+    """ffprobe a local path or URL. Returns a dict with duration/stream layout,
+    or None on failure."""
+    try:
+        cmd = ['ffprobe', '-v', 'error', '-print_format', 'json',
+               '-show_streams', '-show_format', src]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if res.returncode != 0:
+            return None
+        data = json.loads(res.stdout)
+        dur = float(data.get('format', {}).get('duration') or 0)
+        if dur <= 0:
+            return None
+        streams = data.get('streams', [])
+        has_audio = any(s.get('codec_type') == 'audio' for s in streams)
+        sub_codecs = ['subrip', 'ass', 'webvtt', 'mov_text', 'text', 'srt', 'ssa']
+        has_subs = any(s.get('codec_type') == 'subtitle'
+                       and s.get('codec_name', '').lower() in sub_codecs
+                       for s in streams)
+
+        # Frame-rate info of the first video stream — chunk boundaries must be
+        # snapped to the frame grid, which is only well-defined for CFR sources.
+        fps = 0.0; start_time = 0.0; is_cfr = False
+        video = next((s for s in streams if s.get('codec_type') == 'video'), None)
+        if video:
+            r_rate = _parse_rate(video.get('r_frame_rate', '0/1'))
+            avg_rate = _parse_rate(video.get('avg_frame_rate', '0/1'))
+            try: start_time = float(video.get('start_time') or 0)
+            except (TypeError, ValueError): start_time = 0.0
+            fps = r_rate
+            # CFR when the container's average rate agrees with the nominal rate
+            is_cfr = (r_rate > 0 and avg_rate > 0 and abs(r_rate - avg_rate) / r_rate < 0.005)
+        return {
+            "duration": dur, "has_audio": has_audio, "has_subs": has_subs,
+            "fps": fps, "start_time": start_time, "cfr": is_cfr,
+        }
+    except Exception:
+        return None
+
+def _plan_chunks(duration_sec, fps, start_time=0.0):
+    """Return a list of (start, dur) video chunk ranges, or None if not worth splitting.
+
+    Boundaries are snapped to half a frame BEFORE a source frame time, so every
+    cut falls cleanly between two frames: chunk N's `-t` window ends exactly
+    where chunk N+1's accurate `-ss` seek begins — no duplicated or dropped
+    boundary frames, which keeps A/V sync exact after concatenation."""
+    if not fps or fps <= 0:
+        return None
+    if duration_sec < CHUNK_DURATION_SEC * 1.5:
+        return None
+    n = max(2, int(round(duration_sec / CHUNK_DURATION_SEC)))
+    n = min(n, 400)
+    target = duration_sec / n
+    bounds = [0.0]
+    for i in range(1, n):
+        frame_no = round(i * target * fps)
+        b = start_time + (frame_no - 0.5) / fps
+        bounds.append(round(max(b, 0.0), 5))
+    ranges = []
+    for i in range(n):
+        start = bounds[i]
+        end = duration_sec if i == n - 1 else bounds[i + 1]
+        if end - start <= 0:
+            return None  # degenerate plan (absurd fps/duration metadata)
+        ranges.append((start, round(end - start, 5)))
+    return ranges
+
+def _resolve_folder_filter(series_id):
+    """Map a numeric series_id to its folder prefix, or None."""
+    if not series_id or not str(series_id).isdigit():
+        return None
+    for s in get_series_list()[0]:
+        if s['id'] == int(series_id):
+            return s['folder']
+    return None
+
+def _requeue_job_whole(conn, job_id, reason):
+    """Chunking gave up on this job: drop chunk state and requeue it for
+    classic whole-file encoding (chunkable=0 so it is never split again)."""
+    c = conn.cursor()
+    c.execute("SELECT COALESCE(fail_count, 0) FROM jobs WHERE id=?", (job_id,))
+    row = c.fetchone()
+    if row is None:
+        return
+    new_fc = row[0] + 1
+    new_status = 'permanently_failed' if new_fc >= 5 else 'queued'
+    c.execute("DELETE FROM chunks WHERE job_id=?", (job_id,))
+    c.execute("UPDATE jobs SET status=?, chunked=0, chunkable=0, progress=0, worker_id=NULL, "
+              "started_at=NULL, fail_count=?, last_updated=? WHERE id=?",
+              (new_status, new_fc, datetime.now(), job_id))
+    # Commit before log_event opens its own write connection, otherwise the
+    # pending transaction on `conn` would block it (SQLite single-writer).
+    conn.commit()
+    try:
+        shutil.rmtree(_chunk_dir(job_id), ignore_errors=True)
+    except Exception:
+        pass
+    log_event("WARN", f"Chunked encode abandoned ({reason}). Job requeued as whole-file (status={new_status}).", job_id)
+
+def _update_job_chunk_progress(conn, job_id):
+    """Recompute aggregate job progress from its chunks (call with db_lock held)."""
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*), SUM(CASE WHEN status='completed' THEN 100 ELSE COALESCE(progress, 0) END) "
+              "FROM chunks WHERE job_id=?", (job_id,))
+    total, score = c.fetchone()
+    if not total:
+        return
+    pct = min(99, int((score or 0) / total))  # 100 is reserved for the assembled result
+    c.execute("UPDATE jobs SET progress=?, last_updated=? WHERE id=? AND status='processing'",
+              (pct, datetime.now(), job_id))
+
+def _register_chunk_failure(job_id, kind, chunk_index, worker_id, reason):
+    """A worker reported a chunk failure (or its upload failed verification)."""
+    with db_lock:
+        conn = db_handler.get_connection()
+        try:
+            c = conn.cursor()
+            c.execute("SELECT COALESCE(fail_count, 0), status, worker_id FROM chunks WHERE job_id=? AND kind=? AND chunk_index=?",
+                      (job_id, kind, chunk_index))
+            row = c.fetchone()
+            if row is None:
+                conn.commit()
+                return
+            # Only the worker currently assigned to an in-flight chunk may fail it —
+            # ignores stray/duplicate reports that could otherwise kill a healthy job.
+            if row[1] != 'processing' or (row[2] and worker_id and row[2] != worker_id):
+                conn.commit()
+                return
+            new_fc = row[0] + 1
+            if new_fc >= CHUNK_MAX_FAILS:
+                _requeue_job_whole(conn, job_id, f"chunk {kind}#{chunk_index} failed {new_fc}x: {reason}")
+            else:
+                c.execute("UPDATE chunks SET status='pending', worker_id=NULL, progress=0, "
+                          "fail_count=?, last_updated=? WHERE job_id=? AND kind=? AND chunk_index=?",
+                          (new_fc, datetime.now(), job_id, kind, chunk_index))
+            conn.commit()
+        finally:
+            conn.close()
+    log_event("WARN", f"Chunk {kind}#{chunk_index} failed on {worker_id}: {reason}", job_id)
+
+def _claim_job_for_split(folder_filter, max_size_mb):
+    """Pick the next queued, chunk-eligible job and mark it as being split.
+    Returns the job row dict or None. Runs entirely under db_lock."""
+    with db_lock:
+        conn = db_handler.get_connection()
+        conn.row_factory = sqlite3.Row
+        try:
+            params = []
+            query_parts = ["status='queued'", "COALESCE(fail_count,0) < 5", "COALESCE(chunkable,1)=1"]
+            if max_size_mb and str(max_size_mb).isdigit():
+                query_parts.append("file_size <= ?")
+                params.append(int(max_size_mb) * 1024 * 1024)
+            if folder_filter:
+                query_parts.append("id LIKE ?")
+                params.append(f"{folder_filter}%")
+            # Prefer remote sources first, mirroring /get_job's search order
+            sql = ("SELECT id, filename, file_size, source_type, source_url, content_profile "
+                   f"FROM jobs WHERE {' AND '.join(query_parts)} "
+                   "ORDER BY CASE WHEN source_type='remote' THEN 0 ELSE 1 END, id ASC LIMIT 1")
+            c = conn.cursor()
+            c.execute(sql, tuple(params))
+            row = c.fetchone()
+            if row is None:
+                return None
+            job = dict(row)
+            # '(chunking)' marks the short-lived probe/split window; the
+            # maintenance loop clears it if the split crashes mid-way.
+            c.execute("UPDATE jobs SET status='processing', worker_id='(chunking)', "
+                      "last_updated=?, started_at=? WHERE id=?",
+                      (datetime.now(), datetime.now(), job['id']))
+            conn.commit()
+            return job
+        finally:
+            conn.close()
+
+def _split_claimed_job(job):
+    """Probe a claimed job and create its chunk rows.
+    Returns True when the job was split, False when it was reverted to the queue."""
+    job_id = job['id']
+    if job['source_type'] == 'remote':
+        src = build_download_url(job_id, 'remote', job.get('source_url'))
+    else:
+        src = os.path.join(SOURCE_DIRECTORY, job_id.replace('/', os.sep))
+
+    probe = _probe_media(src) if src else None
+    ranges = None
+    if probe and probe['cfr']:
+        ranges = _plan_chunks(probe['duration'], probe['fps'], probe['start_time'])
+    elif probe:
+        log_event("INFO", "Source is VFR / has no reliable frame grid — encoding whole.", job_id)
+
+    with db_lock:
+        conn = db_handler.get_connection()
+        try:
+            c = conn.cursor()
+            if not ranges:
+                # Too short / VFR / unprobeable: hand it back for whole-file encoding
+                c.execute("UPDATE jobs SET status='queued', worker_id=NULL, started_at=NULL, "
+                          "chunkable=0, source_duration_sec=?, last_updated=? WHERE id=?",
+                          (probe['duration'] if probe else None, datetime.now(), job_id))
+                conn.commit()
+                return False
+
+            duration, has_audio, has_subs = probe['duration'], probe['has_audio'], probe['has_subs']
+            now = datetime.now()
+            # Stale rows can exist if this job was reset earlier — start clean
+            c.execute("DELETE FROM chunks WHERE job_id=?", (job_id,))
+            for i, (start, dur) in enumerate(ranges):
+                c.execute("INSERT INTO chunks (job_id, kind, chunk_index, start_sec, duration_sec, "
+                          "status, last_updated) VALUES (?, 'video', ?, ?, ?, 'pending', ?)",
+                          (job_id, i, start, dur, now))
+            total = len(ranges)
+            if has_audio or has_subs:
+                c.execute("INSERT INTO chunks (job_id, kind, chunk_index, start_sec, duration_sec, "
+                          "status, last_updated) VALUES (?, 'audio', -1, 0, ?, 'pending', ?)",
+                          (job_id, duration, now))
+                total += 1
+            c.execute("UPDATE jobs SET chunked=1, chunkable=1, source_duration_sec=?, total_chunks=?, "
+                      "progress=0, worker_id='(chunked)', last_updated=? WHERE id=?",
+                      (duration, total, now, job_id))
+            conn.commit()
+            log_event("INFO", f"Split into {total} chunk(s) ({duration/60:.1f} min source).", job_id)
+            return True
+        finally:
+            conn.close()
+
+def _assign_pending_chunk(worker_id, folder_filter, max_size_mb):
+    """Hand the oldest pending chunk to a worker. Prioritizes the earliest-started
+    job so the swarm finishes one video before spilling into the next."""
+    with db_lock:
+        conn = db_handler.get_connection()
+        conn.row_factory = sqlite3.Row
+        try:
+            params = []
+            query_parts = ["c.status='pending'", "j.status='processing'", "COALESCE(j.chunked,0)=1"]
+            if folder_filter:
+                query_parts.append("j.id LIKE ?")
+                params.append(f"{folder_filter}%")
+            if max_size_mb and str(max_size_mb).isdigit():
+                # Estimate the bytes this chunk will stream (audio reads the whole file)
+                query_parts.append("(CASE WHEN c.kind='audio' THEN j.file_size "
+                                   "ELSE j.file_size * c.duration_sec / MAX(COALESCE(j.source_duration_sec, 1), 1) END) <= ?")
+                params.append(int(max_size_mb) * 1024 * 1024)
+            sql = ("SELECT c.rowid AS chunk_rowid, c.job_id, c.kind, c.chunk_index, c.start_sec, c.duration_sec, "
+                   "j.filename, j.file_size, j.source_type, j.source_url, j.content_profile, "
+                   "j.source_duration_sec, j.total_chunks, "
+                   "(SELECT MAX(c2.chunk_index) FROM chunks c2 WHERE c2.job_id = c.job_id AND c2.kind='video') AS max_video_index "
+                   "FROM chunks c JOIN jobs j ON j.id = c.job_id "
+                   f"WHERE {' AND '.join(query_parts)} "
+                   "ORDER BY j.started_at ASC, CASE WHEN c.kind='audio' THEN 0 ELSE 1 END, c.chunk_index ASC "
+                   "LIMIT 1")
+            c = conn.cursor()
+            c.execute(sql, tuple(params))
+            row = c.fetchone()
+            if row is None:
+                return None
+            chunk = dict(row)
+            # The final video chunk encodes to EOF instead of using -t
+            max_video_index = chunk.pop('max_video_index')
+            chunk['is_last'] = bool(chunk['kind'] == 'video' and chunk['chunk_index'] == max_video_index)
+            now = datetime.now()
+            c.execute("UPDATE chunks SET status='processing', worker_id=?, progress=0, last_updated=? "
+                      "WHERE rowid=?", (worker_id, now, chunk.pop('chunk_rowid')))
+            c.execute("UPDATE jobs SET last_updated=? WHERE id=?", (now, chunk['job_id']))
+            conn.commit()
+            chunk['download_url'] = build_download_url(chunk['job_id'], chunk['source_type'], chunk.pop('source_url'))
+            return chunk
+        finally:
+            conn.close()
+
+def _verify_chunk(filepath, kind, expected_dur, is_last):
+    """Validate an uploaded chunk with ffprobe."""
+    try:
+        cmd = ['ffprobe', '-v', 'error', '-print_format', 'json', '-show_streams', '-show_format', filepath]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if result.returncode != 0:
+            return False, "FFprobe Error"
+        data = json.loads(result.stdout)
+        streams = data.get('streams', [])
+        dur = float(data.get('format', {}).get('duration') or 0)
+
+        if kind == 'video':
+            video = [s for s in streams if s.get('codec_type') == 'video']
+            if not video:
+                return False, "No Video Stream"
+            if video[0].get('codec_name') != 'av1':
+                return False, "Invalid Codec (Not AV1)"
+            if int(video[0].get('height', 0)) != 480:
+                return False, "Invalid Height"
+            tolerance = max(10.0, expected_dur * 0.10) if is_last else max(2.0, expected_dur * 0.05)
+            if expected_dur > 0 and abs(dur - expected_dur) > tolerance:
+                return False, f"Duration mismatch ({dur:.1f}s vs expected {expected_dur:.1f}s)"
+        else:
+            audio = [s for s in streams if s.get('codec_type') == 'audio']
+            subs = [s for s in streams if s.get('codec_type') == 'subtitle']
+            if not audio and not subs:
+                return False, "No Audio/Subtitle Streams"
+            for s in audio:
+                if s.get('codec_name') != 'opus':
+                    return False, "Invalid Audio Codec"
+        return True, "Verified"
+    except Exception as e:
+        return False, str(e)
+
+def _maybe_start_assembly(job_id):
+    """Spawn an assembly thread if all chunks of the job are completed."""
+    with ASSEMBLY_LOCK:
+        if job_id in ASSEMBLING_JOBS:
+            return
+        ASSEMBLING_JOBS.add(job_id)
+    threading.Thread(target=_assemble_job, args=(job_id,), daemon=True).start()
+
+def _assemble_job(job_id):
+    """Concatenate all uploaded video chunks (stream copy — zero quality loss)
+    and mux in the audio/subtitle track, then verify and finalize the job."""
+    try:
+        with db_lock:
+            conn = db_handler.get_connection()
+            conn.row_factory = sqlite3.Row
+            try:
+                c = conn.cursor()
+                c.execute("SELECT status, source_duration_sec, total_chunks FROM jobs WHERE id=? AND COALESCE(chunked,0)=1", (job_id,))
+                jrow = c.fetchone()
+                if jrow is None or jrow['status'] != 'processing':
+                    return
+                c.execute("SELECT kind, chunk_index, duration_sec, uploaded_path, worker_id FROM chunks "
+                          "WHERE job_id=? ORDER BY chunk_index ASC", (job_id,))
+                rows = [dict(r) for r in c.fetchall()]
+                c.execute("SELECT COUNT(*) FROM chunks WHERE job_id=? AND status != 'completed'", (job_id,))
+                if c.fetchone()[0] != 0:
+                    return  # not everything is in yet
+            finally:
+                conn.close()
+
+        video_chunks = sorted([r for r in rows if r['kind'] == 'video'], key=lambda r: r['chunk_index'])
+        audio_chunk = next((r for r in rows if r['kind'] == 'audio'), None)
+        if not video_chunks:
+            raise RuntimeError("no video chunks recorded")
+        for r in video_chunks:
+            if not r['uploaded_path'] or not os.path.exists(r['uploaded_path']):
+                raise RuntimeError(f"chunk file missing: video#{r['chunk_index']}")
+        if audio_chunk and (not audio_chunk['uploaded_path'] or not os.path.exists(audio_chunk['uploaded_path'])):
+            raise RuntimeError("chunk file missing: audio")
+
+        cdir = _chunk_dir(job_id)
+        list_path = os.path.join(cdir, "concat_list.txt")
+        out_tmp = os.path.join(cdir, "assembled.mp4")
+        with open(list_path, 'w', encoding='utf-8') as f:
+            for r in video_chunks:
+                # Paths are manager-generated (safe charset), so no quote escaping needed
+                f.write(f"file '{os.path.abspath(r['uploaded_path']).replace(os.sep, '/')}'\n")
+
+        log_event("INFO", f"All chunks received. Assembling final file...", job_id)
+        cmd = ['ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', list_path]
+        if audio_chunk:
+            cmd += ['-i', audio_chunk['uploaded_path'], '-map', '0:v:0', '-map', '1:a?', '-map', '1:s?']
+        else:
+            cmd += ['-map', '0:v:0']
+        cmd += ['-c', 'copy', '-movflags', '+faststart', out_tmp]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+        if res.returncode != 0 or not os.path.exists(out_tmp):
+            raise RuntimeError(f"concat failed (rc={res.returncode}): {res.stderr[-500:] if res.stderr else ''}")
+
+        is_valid, reason = verify_upload(out_tmp)
+        if not is_valid:
+            raise RuntimeError(f"assembled file failed verification: {reason}")
+
+        # Sanity: assembled duration should match the source (warn-only)
+        warn = None
+        src_dur = jrow['source_duration_sec'] or 0
+        final_probe = _probe_media(out_tmp)
+        if src_dur and final_probe and abs(final_probe['duration'] - src_dur) > 2.0:
+            warn = f"CHUNK ASSEMBLY DRIFT ({final_probe['duration']:.1f}s vs source {src_dur:.1f}s)"
+
+        new_filename = os.path.splitext(job_id)[0] + ".mp4"
+        save_path = os.path.abspath(os.path.join(COMPLETED_DIRECTORY, new_filename))
+        if not save_path.startswith(os.path.abspath(COMPLETED_DIRECTORY) + os.sep):
+            raise RuntimeError("path traversal blocked")
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        shutil.move(out_tmp, save_path)
+
+        workers = sorted({r['worker_id'] for r in rows if r['worker_id']})
+        with db_lock:
+            conn = db_handler.get_connection()
+            try:
+                conn.execute("UPDATE jobs SET status='completed', progress=100, duration=?, worker_id=?, last_updated=? WHERE id=?",
+                             (int(src_dur / 60), f"(chunked x{len(workers)})", datetime.now(), job_id))
+                if warn:
+                    conn.execute("UPDATE jobs SET warnings = COALESCE(warnings || ' | ', '') || ? WHERE id=?",
+                                 (warn, job_id))
+                conn.commit()
+            finally:
+                conn.close()
+        db_handler.sync_to_disk()
+
+        # Chunk files are no longer needed; rows are kept for the scoreboard
+        try:
+            shutil.rmtree(cdir, ignore_errors=True)
+        except Exception:
+            pass
+        if warn:
+            log_event("WARN", warn, job_id)
+        log_event("INFO", f"Chunked job assembled and completed ({len(video_chunks)} chunks by {len(workers)} worker(s)).", job_id)
+
+    except Exception as e:
+        log_event("ERROR", f"Chunk assembly failed: {e}", job_id)
+        with db_lock:
+            conn = db_handler.get_connection()
+            try:
+                _requeue_job_whole(conn, job_id, f"assembly failed: {e}")
+                conn.commit()
+            finally:
+                conn.close()
+    finally:
+        with ASSEMBLY_LOCK:
+            ASSEMBLING_JOBS.discard(job_id)
+
+# ==============================================================================
 # HYBRID SCANNER (STREAMING GENERATOR)
 # ==============================================================================
 
@@ -433,34 +898,6 @@ def scan_and_queue():
         if count_new > 0:
             print(f"[*] Added {count_new} new files to Database...")
 
-        # 2. Update Active Queue (Push to Workers)
-        with db_lock:
-            conn = db_handler.get_connection()
-            try:
-                cursor = conn.cursor()
-                cursor.execute("SELECT id, filename, file_size, source_type, source_url FROM jobs WHERE status = 'queued'")
-                for row in cursor.fetchall():
-                    jid, fname, fsize, stype, surl = row
-                    if jid not in queued_job_ids:
-                        dl_link = ""
-                        if stype == 'remote':
-                            base_url = surl if surl else REMOTE_SOURCE_URL
-                            if base_url:
-                                dl_link = urljoin(base_url, quote(jid))
-                        else:
-                            dl_link = f"{SERVER_URL_DISPLAY.rstrip('/')}/download_source/{quote(jid, safe='/')}"
-                        
-                        if dl_link:
-                            job_queue.put({ 
-                                "id": jid, 
-                                "filename": fname, 
-                                "file_size": fsize, 
-                                "download_url": dl_link 
-                            })
-                            queued_job_ids.add(jid)
-            finally:
-                conn.close()
-
     # --- 1. Scan Local ---
     print(f"[*] Scanning LOCAL Source: {SOURCE_DIRECTORY} ...")
     local_batch = []
@@ -563,6 +1000,39 @@ def init_db():
         # [ADDED] source_hash: MD5 of first 4 MB of source file for integrity verification
         try: cursor.execute("ALTER TABLE jobs ADD COLUMN source_hash TEXT")
         except sqlite3.OperationalError: pass
+        # [ADDED] Chunked encoding columns (all additive — existing queues survive updates)
+        # chunked:  1 = this job is currently split into chunks
+        # chunkable: NULL = unknown, 1 = allowed, 0 = never chunk (too short / probe failed / chunking failed before)
+        try: cursor.execute("ALTER TABLE jobs ADD COLUMN chunked INTEGER DEFAULT 0")
+        except sqlite3.OperationalError: pass
+        try: cursor.execute("ALTER TABLE jobs ADD COLUMN chunkable INTEGER")
+        except sqlite3.OperationalError: pass
+        try: cursor.execute("ALTER TABLE jobs ADD COLUMN source_duration_sec REAL")
+        except sqlite3.OperationalError: pass
+        try: cursor.execute("ALTER TABLE jobs ADD COLUMN total_chunks INTEGER DEFAULT 0")
+        except sqlite3.OperationalError: pass
+
+        # Chunk work-items for split jobs.  kind = 'video' (a time range) or
+        # 'audio' (full-length audio + subtitles, encoded once by one worker).
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS chunks (
+                job_id TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'video',
+                chunk_index INTEGER NOT NULL DEFAULT 0,
+                start_sec REAL DEFAULT 0,
+                duration_sec REAL DEFAULT 0,
+                status TEXT DEFAULT 'pending',
+                worker_id TEXT,
+                progress INTEGER DEFAULT 0,
+                fail_count INTEGER DEFAULT 0,
+                last_updated TIMESTAMP,
+                uploaded_path TEXT,
+                PRIMARY KEY (job_id, kind, chunk_index)
+            )
+        ''')
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_chunks_status ON chunks(status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_chunks_job ON chunks(job_id)")
 
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS error_reports (
@@ -756,6 +1226,165 @@ def get_job():
         log_event("ERROR", f"get_job failed: {e}")
         return jsonify({"status": "error"}), 500
 
+@app.route('/get_chunk', methods=['GET'])
+@requires_worker_auth
+def get_chunk():
+    """Assign one chunk of a split video to a worker. Splits the next queued
+    job on demand when no pending chunks exist. Workers fall back to /get_job
+    when this returns empty."""
+    if not CHUNKED_ENCODING:
+        return jsonify({"status": "empty", "message": "Chunking disabled"})
+
+    max_size_mb = request.args.get('max_size_mb')
+    series_id = request.args.get('series_id')
+    worker_id = sanitize_input(request.args.get('worker_id'))
+    worker_version = sanitize_input(request.args.get('version'))
+
+    if is_worker_banned(worker_id):
+        return jsonify({"status": "empty", "message": "Unauthorized"}), 403
+    if not is_version_sufficient(worker_version, MIN_CLIENT_VERSION):
+        return jsonify({"status": "empty", "message": "Update Required"}), 200
+
+    try:
+        folder_filter = _resolve_folder_filter(series_id)
+
+        chunk = _assign_pending_chunk(worker_id, folder_filter, max_size_mb)
+        if chunk is None:
+            # No pending chunks anywhere — split the next queued job.
+            # Try a few candidates since some may turn out too short to split.
+            for _ in range(3):
+                job = _claim_job_for_split(folder_filter, max_size_mb)
+                if job is None:
+                    break
+                if _split_claimed_job(job):
+                    chunk = _assign_pending_chunk(worker_id, folder_filter, max_size_mb)
+                    break
+
+        if chunk is None:
+            return jsonify({"status": "empty"})
+        return jsonify({"status": "ok", "chunk": chunk})
+    except Exception as e:
+        log_event("ERROR", f"get_chunk failed: {e}")
+        return jsonify({"status": "error"}), 500
+
+@app.route('/upload_chunk', methods=['POST'])
+@requires_worker_auth
+def upload_chunk():
+    """Receive one encoded chunk, verify it, and store it until assembly."""
+    job_id = request.form.get('job_id')
+    worker_id = sanitize_input(request.form.get('worker_id'))
+    kind = request.form.get('kind', 'video')
+    if kind not in ('video', 'audio'):
+        return jsonify({"status": "error", "message": "invalid kind"}), 400
+    try:
+        chunk_index = int(request.form.get('chunk_index'))
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "chunk_index required"}), 400
+    if 'file' not in request.files or not job_id:
+        return jsonify({"status": "error"}), 400
+
+    with db_lock:
+        conn = db_handler.get_connection()
+        conn.row_factory = sqlite3.Row
+        try:
+            c = conn.cursor()
+            c.execute("SELECT status, duration_sec FROM chunks WHERE job_id=? AND kind=? AND chunk_index=?",
+                      (job_id, kind, chunk_index))
+            crow = c.fetchone()
+            c.execute("SELECT COALESCE(total_chunks,0) as total_chunks, status FROM jobs WHERE id=?", (job_id,))
+            jrow = c.fetchone()
+        finally:
+            conn.close()
+
+    if crow is None or jrow is None or jrow['status'] != 'processing':
+        return jsonify({"status": "stale", "message": "Chunk no longer expected"}), 409
+    if crow['status'] == 'completed':
+        return jsonify({"status": "stale", "message": "Chunk already uploaded"}), 409
+
+    quarantine_dir = os.path.join("temp_uploads", "quarantine")
+    os.makedirs(quarantine_dir, exist_ok=True)
+    temp_path = os.path.join(quarantine_dir, f"{uuid.uuid4().hex}.mp4")
+    request.files['file'].save(temp_path)
+
+    # The highest-indexed video chunk runs to EOF, so its duration is fuzzier
+    n_video = jrow['total_chunks']
+    is_last = (kind == 'video' and chunk_index >= n_video - 2)
+    is_valid, reason = _verify_chunk(temp_path, kind, float(crow['duration_sec'] or 0), is_last)
+    if not is_valid:
+        try: os.remove(temp_path)
+        except OSError: pass
+        _register_chunk_failure(job_id, kind, chunk_index, worker_id, f"upload rejected: {reason}")
+        return jsonify({"status": "error", "message": reason}), 400
+
+    cdir = _chunk_dir(job_id)
+    os.makedirs(cdir, exist_ok=True)
+    final_path = os.path.join(cdir, f"{kind}_{chunk_index if chunk_index >= 0 else 'track'}.mp4")
+    shutil.move(temp_path, final_path)
+
+    all_done = False
+    with db_lock:
+        conn = db_handler.get_connection()
+        try:
+            c = conn.cursor()
+            c.execute("UPDATE chunks SET status='completed', progress=100, worker_id=?, "
+                      "uploaded_path=?, last_updated=? WHERE job_id=? AND kind=? AND chunk_index=?",
+                      (worker_id, final_path, datetime.now(), job_id, kind, chunk_index))
+            _update_job_chunk_progress(conn, job_id)
+            c.execute("SELECT COUNT(*) FROM chunks WHERE job_id=? AND status != 'completed'", (job_id,))
+            all_done = (c.fetchone()[0] == 0)
+            conn.commit()
+        finally:
+            conn.close()
+
+    log_event("INFO", f"Chunk {kind}#{chunk_index} received from {worker_id}", job_id)
+    if all_done:
+        _maybe_start_assembly(job_id)
+    return jsonify({"status": "success"})
+
+@app.route('/report_chunk', methods=['POST'])
+@requires_worker_auth
+def report_chunk():
+    """Heartbeat / failure / abandon notifications for an in-flight chunk."""
+    d = request.json or {}
+    job_id = str(d.get('job_id', '') or '').strip()
+    worker_id = sanitize_input(d.get('worker_id'))
+    kind = d.get('kind', 'video')
+    status = d.get('status')
+    try:
+        chunk_index = int(d.get('chunk_index'))
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "chunk_index required"}), 400
+    if not job_id or kind not in ('video', 'audio'):
+        return jsonify({"status": "error"}), 400
+
+    if status == 'failed':
+        err = str(d.get('error', 'Unknown Error'))[:512]
+        _register_chunk_failure(job_id, kind, chunk_index, worker_id, err)
+        return jsonify({"status": "received"})
+
+    with db_lock:
+        conn = db_handler.get_connection()
+        try:
+            c = conn.cursor()
+            if status == 'abandoned':
+                # Worker is shutting down mid-chunk: return it to the pool without penalty
+                c.execute("UPDATE chunks SET status='pending', worker_id=NULL, progress=0, last_updated=? "
+                          "WHERE job_id=? AND kind=? AND chunk_index=? AND status='processing' AND worker_id=?",
+                          (datetime.now(), job_id, kind, chunk_index, worker_id))
+            else:
+                try:
+                    progress = max(0, min(100, int(d.get('progress', 0))))
+                except (TypeError, ValueError):
+                    progress = 0
+                c.execute("UPDATE chunks SET progress=?, last_updated=?, worker_id=? "
+                          "WHERE job_id=? AND kind=? AND chunk_index=? AND status='processing'",
+                          (progress, datetime.now(), worker_id, job_id, kind, chunk_index))
+            _update_job_chunk_progress(conn, job_id)
+            conn.commit()
+        finally:
+            conn.close()
+    return jsonify({"status": "received"})
+
 @app.route('/upload_result', methods=['POST'])
 @requires_worker_auth
 def upload_result():
@@ -784,7 +1413,7 @@ def upload_result():
             return jsonify({"status": "error", "message": reason}), 400
 
         save_path = os.path.abspath(os.path.join(COMPLETED_DIRECTORY, new_filename))
-        if not save_path.startswith(os.path.abspath(COMPLETED_DIRECTORY)):
+        if not save_path.startswith(os.path.abspath(COMPLETED_DIRECTORY) + os.sep):
              os.remove(temp_path); return jsonify({"status": "error"}), 403
 
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -812,7 +1441,12 @@ def receive_log():
 
     job_id = request.form.get('job_id')
     worker_id = sanitize_input(request.form.get('worker_id'))
-    
+
+    # Chunk logs arrive as "<job_id>::chunk_<kind>_<index>" — warnings are
+    # recorded against the parent job, the log file keeps the full name.
+    parent_job_id = job_id.split('::chunk', 1)[0] if job_id else job_id
+    is_chunk_log = (parent_job_id != job_id)
+
     if 'log_file' in request.files and job_id:
         log_dir = os.path.join(os.getcwd(), "encode_logs")
         os.makedirs(log_dir, exist_ok=True)
@@ -823,40 +1457,46 @@ def receive_log():
         request.files['log_file'].save(log_path)
         
         warnings = []
+        # Audio chunks contain no video encoder — the video cheat checks below
+        # would false-positive on them.
+        is_audio_chunk_log = is_chunk_log and '::chunk_audio' in job_id
         try:
-            with gzip.open(log_path, 'rt', encoding='utf-8', errors='ignore') as f:
-                log_content = f.read().lower()
-                
-                # 1. Check for GPU Encoders (Safely)
-                mapping_block = re.search(r'stream mapping:(.*?)(?:press \[|output #)', log_content, re.DOTALL)
-                
-                if mapping_block:
-                    mapping_text = mapping_block.group(1)
-                    gpu_encoders = ['nvenc', 'qsv', 'amf', 'videotoolbox', 'hevc_amf']
-                    for enc in gpu_encoders:
-                        if enc in mapping_text:
-                            warnings.append(f"GPU USED ({enc.upper()})")
-                            break
-                
-                # 2. Check SVT-AV1 preset 
-                preset_match = re.search(r'svt\[info\]:\s*preset\s*:\s*(\d+)', log_content)
-                if preset_match:
-                    used_preset = preset_match.group(1)
-                    if used_preset != "2": 
-                        warnings.append(f"PRESET MODIFIED (Used {used_preset}, Expected 2)")
-                elif "libsvtav1" not in log_content:
-                    if not warnings:
-                        warnings.append("NON-STANDARD ENCODER USED")
+            if not is_audio_chunk_log:
+                with gzip.open(log_path, 'rt', encoding='utf-8', errors='ignore') as f:
+                    log_content = f.read().lower()
+
+                    # 1. Check for GPU Encoders (Safely)
+                    mapping_block = re.search(r'stream mapping:(.*?)(?:press \[|output #)', log_content, re.DOTALL)
+
+                    if mapping_block:
+                        mapping_text = mapping_block.group(1)
+                        gpu_encoders = ['nvenc', 'qsv', 'amf', 'videotoolbox', 'hevc_amf']
+                        for enc in gpu_encoders:
+                            if enc in mapping_text:
+                                warnings.append(f"GPU USED ({enc.upper()})")
+                                break
+
+                    # 2. Check SVT-AV1 preset
+                    preset_match = re.search(r'svt\[info\]:\s*preset\s*:\s*(\d+)', log_content)
+                    if preset_match:
+                        used_preset = preset_match.group(1)
+                        if used_preset != "2":
+                            warnings.append(f"PRESET MODIFIED (Used {used_preset}, Expected 2)")
+                    elif "libsvtav1" not in log_content:
+                        if not warnings:
+                            warnings.append("NON-STANDARD ENCODER USED")
 
         except Exception as e:
             log_event("WARN", f"Could not parse log for {job_id}: {e}")
             
         if warnings:
             warning_str = " | ".join(warnings)
-            log_event("WARN", f"CHEATING DETECTED by {worker_id}: {warning_str}", job_id)
+            if is_chunk_log:
+                warning_str = f"[{job_id.split('::', 1)[1]}] {warning_str}"
+            log_event("WARN", f"CHEATING DETECTED by {worker_id}: {warning_str}", parent_job_id)
             with db_lock:
                 conn = db_handler.get_connection()
-                conn.execute("UPDATE jobs SET warnings=? WHERE id=?", (warning_str, job_id))
+                conn.execute("UPDATE jobs SET warnings=? WHERE id=?", (warning_str, parent_job_id))
                 conn.commit()
                 conn.close()
                 
@@ -1069,11 +1709,41 @@ def api_stats():
         conn = db_handler.get_connection(); conn.row_factory = sqlite3.Row
         try:
             c = conn.cursor()
-            c.execute(f"SELECT CASE WHEN instr(worker_id, '-') > 0 THEN substr(worker_id, 1, instr(worker_id, '-') - 1) ELSE worker_id END as worker_id, SUM(duration) as total_minutes, COUNT(*) as files_count FROM jobs WHERE status='completed' AND worker_id IS NOT NULL {time_filter} GROUP BY 1 ORDER BY total_minutes DESC")
+            # Scoreboard: whole-file jobs credit their single worker; chunked jobs
+            # credit each contributor with the minutes of source they encoded.
+            c.execute(f"""
+                SELECT worker_id, SUM(total_minutes) as total_minutes, SUM(files_count) as files_count FROM (
+                    SELECT CASE WHEN instr(worker_id, '-') > 0 THEN substr(worker_id, 1, instr(worker_id, '-') - 1) ELSE worker_id END as worker_id,
+                           SUM(duration) as total_minutes, COUNT(*) as files_count
+                    FROM jobs WHERE status='completed' AND worker_id IS NOT NULL AND COALESCE(chunked, 0)=0 {time_filter}
+                    GROUP BY 1
+                    UNION ALL
+                    SELECT CASE WHEN instr(worker_id, '-') > 0 THEN substr(worker_id, 1, instr(worker_id, '-') - 1) ELSE worker_id END as worker_id,
+                           CAST(SUM(duration_sec) / 60.0 AS INTEGER) as total_minutes, COUNT(DISTINCT job_id) as files_count
+                    FROM chunks WHERE status='completed' AND worker_id IS NOT NULL {time_filter}
+                    GROUP BY 1
+                ) GROUP BY worker_id ORDER BY total_minutes DESC""")
             sb = [dict(r) for r in c.fetchall()]
-            
-            c.execute("SELECT COALESCE(worker_id, 'Pending...') as worker_id, filename, duration, progress, status FROM jobs WHERE status IN ('processing', 'downloading', 'uploading')")
+
+            c.execute("SELECT id, COALESCE(worker_id, 'Pending...') as worker_id, filename, duration, progress, status, COALESCE(chunked, 0) as chunked FROM jobs WHERE status IN ('processing', 'downloading', 'uploading')")
             act = [dict(r) for r in c.fetchall()]
+
+            # For chunked jobs, show swarm status instead of a single worker name
+            chunk_info = {}
+            c.execute("""SELECT job_id, COUNT(*) as total,
+                                SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) as done,
+                                COUNT(DISTINCT CASE WHEN status='processing' THEN worker_id END) as active_workers
+                         FROM chunks GROUP BY job_id""")
+            for r in c.fetchall():
+                chunk_info[r['job_id']] = dict(r)
+            for a in act:
+                ci = chunk_info.get(a['id'])
+                if a['chunked'] and ci:
+                    if ci['active_workers'] > 0:
+                        a['worker_id'] = f"{ci['active_workers']} worker(s) · {ci['done']}/{ci['total']} chunks"
+                    else:
+                        a['worker_id'] = f"chunked · {ci['done']}/{ci['total']} chunks"
+                a.pop('id', None); a.pop('chunked', None)
             
             c.execute("SELECT id, status, worker_id FROM jobs ORDER BY last_updated DESC LIMIT 20")
             hist = [dict(r) for r in c.fetchall()]
@@ -1134,13 +1804,23 @@ def admin_action():
         try:
             if action == 'delete':
                 c.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+                c.execute("DELETE FROM chunks WHERE job_id = ?", (job_id,))
+                shutil.rmtree(_chunk_dir(job_id), ignore_errors=True)
             elif action == 'retry':
-                c.execute("UPDATE jobs SET status='queued', progress=0, worker_id=NULL, fail_count=0, last_updated=? WHERE id=?", (datetime.now(), job_id))
+                c.execute("DELETE FROM chunks WHERE job_id = ?", (job_id,))
+                shutil.rmtree(_chunk_dir(job_id), ignore_errors=True)
+                c.execute("UPDATE jobs SET status='queued', progress=0, worker_id=NULL, fail_count=0, chunked=0, chunkable=NULL, started_at=NULL, last_updated=? WHERE id=?", (datetime.now(), job_id))
             elif action == 'retry_all_failed':
-                c.execute("UPDATE jobs SET status='queued', progress=0, worker_id=NULL, fail_count=0, last_updated=? WHERE status IN ('failed', 'permanently_failed')", (datetime.now(),))
+                c.execute("SELECT id FROM jobs WHERE status IN ('failed', 'permanently_failed')")
+                for (fid,) in c.fetchall():
+                    shutil.rmtree(_chunk_dir(fid), ignore_errors=True)
+                c.execute("DELETE FROM chunks WHERE job_id IN (SELECT id FROM jobs WHERE status IN ('failed', 'permanently_failed'))")
+                c.execute("UPDATE jobs SET status='queued', progress=0, worker_id=NULL, fail_count=0, chunked=0, chunkable=NULL, started_at=NULL, last_updated=? WHERE status IN ('failed', 'permanently_failed')", (datetime.now(),))
             elif action == 'clear_stale':
                 cutoff = datetime.now() - timedelta(minutes=10)
-                c.execute("UPDATE jobs SET status='queued', progress=0, worker_id=NULL, last_updated=?, started_at=NULL WHERE status IN ('processing', 'downloading', 'uploading') AND last_updated < ?", (datetime.now(), cutoff))
+                # Chunked jobs are excluded: their liveness is tracked per-chunk by the maintenance loop
+                c.execute("UPDATE jobs SET status='queued', progress=0, worker_id=NULL, last_updated=?, started_at=NULL WHERE status IN ('processing', 'downloading', 'uploading') AND COALESCE(chunked, 0)=0 AND last_updated < ?", (datetime.now(), cutoff))
+                c.execute("UPDATE chunks SET status='pending', worker_id=NULL, progress=0, last_updated=? WHERE status='processing' AND last_updated < ?", (datetime.now(), cutoff))
             elif action == 'archive_history':
                 ts = int(time.time())
                 c.execute("SELECT id FROM jobs WHERE status='completed' AND id NOT LIKE 'HISTORY_%'")
@@ -1148,6 +1828,8 @@ def admin_action():
                 for (jid,) in rows:
                     new_id = f"HISTORY_{ts}_{jid}"
                     c.execute("UPDATE jobs SET id = ? WHERE id = ?", (new_id, jid))
+                    # Keep chunk rows pointing at the archived job so scoreboard credit survives
+                    c.execute("UPDATE chunks SET job_id = ? WHERE job_id = ?", (new_id, jid))
                 log_event("WARN", f"Admin archived {len(rows)} jobs.")
             elif action == 'purge_queue':
                 c.execute("DELETE FROM jobs WHERE status='queued'")
@@ -1218,25 +1900,54 @@ def sweep_quarantine():
 def maintenance_loop():
     while True:
         try:
-            logs_to_write = [] 
+            logs_to_write = []
+            assembly_candidates = []
             with db_lock:
                 conn = db_handler.get_connection(); cursor = conn.cursor()
                 try:
                     now = datetime.now()
-                    cursor.execute("SELECT id, filename, last_updated, worker_id FROM jobs WHERE status IN ('processing', 'downloading', 'uploading')")
+                    # Whole-file jobs: 4h heartbeat timeout (chunked jobs are handled below)
+                    cursor.execute("SELECT id, filename, last_updated, worker_id FROM jobs WHERE status IN ('processing', 'downloading', 'uploading') AND COALESCE(chunked, 0)=0")
                     for row in cursor.fetchall():
                         jid, fname, last_up, worker_id = row
                         if last_up:
                             try:
                                 l_time = datetime.strptime(str(last_up).split('.')[0], "%Y-%m-%d %H:%M:%S")
-                                if (now - l_time).total_seconds() > 14400: # 4 Hours Timeout
+                                stale_sec = (now - l_time).total_seconds()
+                                # '(chunking)' = a split probe that crashed mid-way; recover quickly
+                                if worker_id == '(chunking)' and stale_sec > 600:
+                                    logs_to_write.append(("WARN", "Chunk split never finished. Returning job to queue.", jid))
+                                    cursor.execute("UPDATE jobs SET status='queued', progress=0, worker_id=NULL, last_updated=?, started_at=NULL WHERE id=?", (now, jid))
+                                elif stale_sec > 14400: # 4 Hours Timeout
                                     logs_to_write.append(("WARN", f"Worker {worker_id} timed out. Resetting.", jid))
                                     cursor.execute("UPDATE jobs SET status='queued', progress=0, worker_id=NULL, last_updated=?, started_at=NULL WHERE id=?", (now, jid))
-                            except: pass 
+                            except: pass
+
+                    # Chunks: return silent ones to the pool so another worker picks them up
+                    chunk_cutoff = now - timedelta(seconds=CHUNK_STALE_SECONDS)
+                    cursor.execute("UPDATE chunks SET status='pending', worker_id=NULL, progress=0, last_updated=? WHERE status='processing' AND last_updated < ?", (now, chunk_cutoff))
+                    if cursor.rowcount > 0:
+                        logs_to_write.append(("WARN", f"Reset {cursor.rowcount} stale chunk(s) to pending.", None))
+
+                    # Chunked jobs with every chunk completed but no final file yet
+                    # (e.g. the manager restarted mid-assembly) — re-trigger assembly
+                    cursor.execute("""SELECT j.id FROM jobs j
+                                      WHERE COALESCE(j.chunked, 0)=1 AND j.status='processing'
+                                        AND EXISTS (SELECT 1 FROM chunks c WHERE c.job_id = j.id)
+                                        AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.job_id = j.id AND c.status != 'completed')""")
+                    assembly_candidates = [r[0] for r in cursor.fetchall()]
+
+                    # Backstop: a chunked job with zero activity for 24h gets requeued whole
+                    dead_cutoff = now - timedelta(hours=24)
+                    cursor.execute("SELECT id FROM jobs WHERE COALESCE(chunked, 0)=1 AND status='processing' AND last_updated < ?", (dead_cutoff,))
+                    for (jid,) in cursor.fetchall():
+                        _requeue_job_whole(conn, jid, "no chunk activity for 24h")
                     conn.commit()
                 finally:
                     conn.close()
             for level, msg, jid in logs_to_write: log_event(level, msg, jid)
+            for jid in assembly_candidates:
+                _maybe_start_assembly(jid)
 
             # Prune quarantine (files older than 1 hour)
             sweep_quarantine()

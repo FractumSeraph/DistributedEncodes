@@ -54,6 +54,21 @@ DB_MODE = 'ram'
 USE_WAL_MODE = True
 
 # ==============================================================================
+# CHUNKED ENCODING
+# ==============================================================================
+# When True, long videos are split into time-range chunks so several workers
+# (or several cores via --jobs) can encode ONE video in parallel. The manager
+# stitches the chunks back together with a lossless stream-copy concat, so
+# there is no quality or file-size penalty beyond one extra keyframe per
+# chunk boundary. Requires FFmpeg on the manager (already needed for
+# upload verification). Workers can opt out with --no-chunks.
+CHUNKED_ENCODING = True
+
+# Target length of each video chunk in seconds (minimum 60).
+# Shorter = more parallelism, slightly more coordination overhead.
+CHUNK_DURATION_SEC = 300
+
+# ==============================================================================
 # RATE LIMITING
 # ==============================================================================
 # Limits how many jobs a single IP can TAKE per hour.

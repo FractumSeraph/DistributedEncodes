@@ -39,6 +39,7 @@ Encoded output is intended for [https://vsv.fractumseraph.net/](https://vsv.frac
 | `--force-tui` | off | Force the TUI on even when auto-detection disables it |
 | `--max-size-mb N` | `0` (no limit) | Skip source files larger than N MB |
 | `--local-source DIR` | *(none)* | Read source files directly from disk instead of HTTP — useful when the worker runs on the same machine as the manager |
+| `--no-chunks` | off | Opt out of chunked encoding — always take whole files |
 
 The `WORKER_SECRET` environment variable is the preferred way to pass the auth token.
 
@@ -298,6 +299,38 @@ The manager detects a `live_action` content profile and tells the worker to redu
 
 ---
 
+## Chunked Encoding (many workers, one video)
+
+By default the manager splits long videos into ~5-minute **chunks** so that multiple workers — or multiple cores on one machine via `--jobs N` — encode a *single* video in parallel, instead of each worker grabbing a different video. The swarm finishes one file at a time.
+
+**How it works:**
+
+1. When a worker asks for work (`/get_chunk`), the manager probes the next queued video and splits it into time ranges. Each range becomes a video-only chunk; the audio track (plus subtitles) becomes one extra chunk encoded by a single worker.
+2. Workers encode their slice with the exact same settings (SVT-AV1, preset 2, same CRF) using an accurate `-ss` seek on the streamed source — no full download needed.
+3. Uploaded chunks are verified with `ffprobe` (codec, resolution, expected duration) and cheat-checked from the FFmpeg log, same as whole files.
+4. When the last chunk arrives, the manager **concatenates the chunks with a lossless stream copy** (`-c copy`) and muxes in the audio, then runs the normal upload verification.
+
+**Quality / size impact:** effectively none. Encoding is CRF-based (constant quality, not bitrate-targeted), so per-chunk encoding produces the same quality as a single pass. The only overhead is one extra keyframe at each chunk boundary — SVT-AV1 already places keyframes every few seconds, so the size difference is negligible. The final concat is a bit-exact stream copy.
+
+**Fallbacks & safety:**
+
+- Videos shorter than ~1.5× the chunk length are encoded whole via the classic path.
+- If a chunk fails 3 times, or assembly fails, the job automatically falls back to whole-file encoding.
+- Chunks with no heartbeat for 30 minutes are handed to another worker; completed chunks are never lost when a worker dies (only the in-flight chunk is redone).
+- Old workers and the browser-based web worker keep using `/get_job` untouched.
+- Watermarks (`--watermark`) are skipped on chunks so the final video is consistent.
+
+**Config** (`config.py`, both optional):
+
+```python
+CHUNKED_ENCODING = True     # set False to disable splitting entirely
+CHUNK_DURATION_SEC = 300    # target chunk length in seconds
+```
+
+> **Note:** the manager temporarily stores uploaded chunks in `chunk_store/` until assembly — keep roughly one encoded video's worth of free disk per active chunked job.
+
+---
+
 ## Utility Scripts
 
 ### `maintenance_tool.py`
@@ -324,10 +357,10 @@ Pulls the latest code from git and restarts the service. Run on the manager host
                 ┌─────────────────────────────────┐
                 │        Manager (Flask)          │
                 │  – Job queue (SQLite)           │
-                │  – /get_job                     │
+                │  – /get_job  /get_chunk         │
                 │  – /download_source/<file>      │
-                │  – /upload_result               │
-                │  – /report_status               │
+                │  – /upload_result /upload_chunk │
+                │  – /report_status /report_chunk │
                 │  – /report_error                │
                 │  – /admin  (dashboard)          │
                 └────────────┬────────────────────┘
@@ -341,6 +374,8 @@ Pulls the latest code from git and restarts the service. Run on the manager host
 ```
 
 - **Job lifecycle:** `queued` → `processing` → `completed` / `failed` / `permanently_failed`
+- **Chunked jobs** additionally track per-chunk state in a `chunks` table (`pending` → `processing` → `completed`), and the job completes when the manager assembles the chunks.
+- **Upgrades are queue-safe:** all database changes are additive (`CREATE TABLE IF NOT EXISTS` / `ALTER TABLE ADD COLUMN`), so updating the manager never drops or rewrites the existing job queue.
 - **Permanent failures:** jobs that fail 5 times are marked `permanently_failed` and excluded from the queue. An admin can re-enable them via *Reset Failed* in the admin panel.
 - **Stale jobs** (no heartbeat for 4 hours) are automatically reset to `queued` by the maintenance loop.
 - **Upload verification:** The manager runs `ffprobe` on every uploaded file and rejects anything that isn't AV1 at 480p.
