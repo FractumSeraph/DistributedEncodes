@@ -219,13 +219,19 @@ def log_event(level, message, related_id=None):
         if clean_id:
             clean_id = re.sub(r'[^a-zA-Z0-9_.-]', '', clean_id)
         
+        # NOTE: never call log_event while another connection in the same
+        # thread has an uncommitted write transaction — SQLite allows one
+        # writer at a time, so this INSERT would block for the full busy
+        # timeout while db_lock is held, freezing every endpoint.
         with db_lock:
             conn = db_handler.get_connection()
-            conn.execute("INSERT INTO system_logs (timestamp, level, message, related_id) VALUES (?, ?, ?, ?)",
-                         (datetime.now(), level, clean_msg, clean_id))
-            conn.commit()
-            conn.close()
-        print(f"[{level}] {message}") 
+            try:
+                conn.execute("INSERT INTO system_logs (timestamp, level, message, related_id) VALUES (?, ?, ?, ?)",
+                             (datetime.now(), level, clean_msg, clean_id))
+                conn.commit()
+            finally:
+                conn.close()
+        print(f"[{level}] {message}")
     except Exception as e:
         print(f"[!] Logging failed: {e}")
 
@@ -823,13 +829,28 @@ def _assemble_job(job_id):
 # HYBRID SCANNER (STREAMING GENERATOR)
 # ==============================================================================
 
-def scan_remote_http(url, prefix="", depth=0):
+# Only one scan may run at a time. Startup, the admin rescan button, and the
+# purge/archive actions all spawn scan threads — without this guard they used
+# to stack up and crawl the HTTP source several times concurrently.
+SCAN_LOCK = threading.Lock()
+
+def _legacy_encoded_id(job_id):
+    """The pre-fix scanner left subdirectory components percent-encoded.
+    Return that legacy form of a decoded job id (identical when no subdirs)."""
+    parts = job_id.split('/')
+    if len(parts) <= 1:
+        return job_id
+    return '/'.join(quote(p, safe='') for p in parts[:-1]) + '/' + parts[-1]
+
+def scan_remote_http(url, prefix="", depth=0, known_ids=None):
     """
     Recursively scans an HTTP directory listing for video files.
     YIELDS results as they are found (Generator) to allow real-time queuing.
+    Files whose job id is already in known_ids are skipped entirely, so a
+    rescan only fetches directory listings instead of re-HEADing every file.
     """
     if depth > 10: return # Prevent infinite recursion
-    
+
     headers = {'User-Agent': 'FractumManager/1.0'}
     
     # Retry Loop & Increased Timeout
@@ -867,18 +888,24 @@ def scan_remote_http(url, prefix="", depth=0):
                 # Without this, a percent-encoded subdir name (e.g. %C2%B7 for ·)
                 # gets double-encoded to %25C2%25B7, producing a 404.
                 from urllib.parse import unquote as _unquote
-                yield from scan_remote_http(full_url, prefix=f"{prefix}{_unquote(link)}", depth=depth+1)
+                yield from scan_remote_http(full_url, prefix=f"{prefix}{_unquote(link)}", depth=depth+1, known_ids=known_ids)
             elif any(link.lower().endswith(ext) for ext in VIDEO_EXTENSIONS):
                 from urllib.parse import unquote
                 clean_name = unquote(link)
                 clean_id = f"{prefix}{clean_name}"
-                
+
+                # Already tracked (under the current or legacy-encoded id)?
+                # Skip the per-file HEAD request — the dominant cost of a rescan.
+                if known_ids is not None and (clean_id in known_ids
+                                              or _legacy_encoded_id(clean_id) in known_ids):
+                    continue
+
                 size = 0
                 try:
                     h = requests.head(full_url, headers=headers, timeout=15)
                     size = int(h.headers.get('content-length', 0))
                 except: pass
-                
+
                 # Yield the found file immediately
                 yield (clean_id, clean_name, size)
                 
@@ -888,8 +915,17 @@ def scan_remote_http(url, prefix="", depth=0):
 def scan_and_queue():
     """
     Scans local and remote sources and updates the database/queue in batches.
+    Only one scan runs at a time; extra requests are dropped.
     """
-    
+    if not SCAN_LOCK.acquire(blocking=False):
+        print("[*] Scan already in progress — ignoring duplicate scan request.")
+        return
+    try:
+        _scan_and_queue_inner()
+    finally:
+        SCAN_LOCK.release()
+
+def _scan_and_queue_inner():
     # --- Helper: Process a batch of files ---
     def process_batch(file_batch):
         if not file_batch: return
@@ -924,14 +960,7 @@ def scan_and_queue():
                         # components are decoded, so the IDs differ even for the same
                         # file.  We normalise before inserting to avoid re-queuing
                         # files that are already done or in-progress.
-                        _id_parts = job_id.split('/')
-                        if len(_id_parts) > 1:
-                            _legacy_id = (
-                                '/'.join(quote(p, safe='') for p in _id_parts[:-1])
-                                + '/' + _id_parts[-1]
-                            )
-                        else:
-                            _legacy_id = job_id
+                        _legacy_id = _legacy_encoded_id(job_id)
                         if _legacy_id != job_id:
                             cursor.execute("SELECT id FROM jobs WHERE id=?", (_legacy_id,))
                             if cursor.fetchone():
@@ -969,9 +998,18 @@ def scan_and_queue():
     # --- 2. Scan Remote (Streaming) ---
     if REMOTE_SOURCE_URL:
         print(f"[*] Scanning REMOTE Source: {REMOTE_SOURCE_URL} ...")
+        # Snapshot the ids we already track so the crawl can skip the
+        # per-file HEAD request for every known file.
+        known_ids = set()
+        with db_lock:
+            conn = db_handler.get_connection()
+            try:
+                known_ids = {r[0] for r in conn.execute("SELECT id FROM jobs")}
+            finally:
+                conn.close()
         remote_batch = []
         # Iterate over the generator
-        for r_id, r_name, r_size in scan_remote_http(REMOTE_SOURCE_URL):
+        for r_id, r_name, r_size in scan_remote_http(REMOTE_SOURCE_URL, known_ids=known_ids):
             remote_batch.append((r_id, r_name, r_size, 'remote', REMOTE_SOURCE_URL))
             
             # Commit every 10 files so workers don't wait
@@ -1207,20 +1245,24 @@ def get_job():
     search_phases.append('local')
 
     try:
+        # Resolve series folders BEFORE taking db_lock: get_series_list reads
+        # the filesystem, and a slow/hung source mount must not stall every
+        # endpoint behind the lock.
+        search_attempts = [series_id] if series_id and series_id.isdigit() else []
+        search_attempts.append(None)
+        folder_filters = {sid: _resolve_folder_filter(sid) for sid in search_attempts}
+
         with db_lock:
             conn = db_handler.get_connection(); conn.row_factory = sqlite3.Row
             try:
                 c = conn.cursor()
                 job = None
-                
+
                 for source_type in search_phases:
                     if job: break
-                    
-                    search_attempts = [series_id] if series_id and series_id.isdigit() else []
-                    search_attempts.append(None) 
-                    
+
                     for current_search_id in search_attempts:
-                        folder_filter = _resolve_folder_filter(current_search_id)
+                        folder_filter = folder_filters.get(current_search_id)
 
                         params = [source_type]
                         query_parts = ["status='queued'", "source_type=?", "COALESCE(fail_count,0) < 5"]
@@ -1239,27 +1281,37 @@ def get_job():
                 
                 if job:
                     job['download_url'] = build_download_url(job['id'], job['source_type'], job.get('source_url'))
-                    if job['source_type'] != 'remote':
-                         # Lazily compute source hash for local files on first pickup
-                         if not job.get('source_hash'):
-                             _src_path = os.path.join(SOURCE_DIRECTORY, job['id'].replace('/', os.sep))
-                             _computed = _fast_hash_file(_src_path)
-                             if _computed:
-                                 conn.execute("UPDATE jobs SET source_hash=? WHERE id=?",
-                                              (_computed, job['id']))
-                                 job['source_hash'] = _computed
-
-                    # Never reveal the hash to the worker — workers must submit their own
-                    # computed hash blind so they cannot cheat by echoing the known value.
-                    job.pop('source_hash', None)
-
-                    conn.execute("UPDATE jobs SET status='processing', worker_id=?, worker_version=?, last_updated=?, started_at=? WHERE id=?", 
+                    conn.execute("UPDATE jobs SET status='processing', worker_id=?, worker_version=?, last_updated=?, started_at=? WHERE id=?",
                         (worker_id, worker_version, datetime.now(), datetime.now(), job['id']))
                     conn.commit()
-                    return jsonify({"status": "ok", "job": job})
             finally:
                 conn.close()
+
+        if job is None:
             return jsonify({"status": "empty"})
+
+        # Lazily compute the source hash for local files on first pickup —
+        # OUTSIDE db_lock, since it reads 4 MB from the source disk and a slow
+        # drive/mount would otherwise stall every endpoint. If the worker's
+        # hash check races this, /verify_source_hash just answers "pending".
+        needs_hash = (job['source_type'] != 'remote' and not job.get('source_hash'))
+        # Never reveal the hash to the worker — workers must submit their own
+        # computed hash blind so they cannot cheat by echoing the known value.
+        job.pop('source_hash', None)
+        if needs_hash:
+            _src_path = os.path.join(SOURCE_DIRECTORY, job['id'].replace('/', os.sep))
+            _computed = _fast_hash_file(_src_path)
+            if _computed:
+                with db_lock:
+                    conn = db_handler.get_connection()
+                    try:
+                        conn.execute("UPDATE jobs SET source_hash=? WHERE id=? AND source_hash IS NULL",
+                                     (_computed, job['id']))
+                        conn.commit()
+                    finally:
+                        conn.close()
+
+        return jsonify({"status": "ok", "job": job})
     except Exception as e:
         log_event("ERROR", f"get_job failed: {e}")
         return jsonify({"status": "error"}), 500
@@ -1862,7 +1914,8 @@ def get_logs():
 def admin_action():
     data = request.json or {}; job_id = data.get('job_id'); action = data.get('action')
     log_event("WARN", f"Admin performed '{action}' on job", job_id)
-    
+    post_commit_logs = []
+
     with db_lock:
         conn = db_handler.get_connection(); c = conn.cursor()
         try:
@@ -1900,18 +1953,24 @@ def admin_action():
                     c.execute("UPDATE jobs SET id = ? WHERE id = ?", (new_id, jid))
                     # Keep chunk rows pointing at the archived job so scoreboard credit survives
                     c.execute("UPDATE chunks SET job_id = ? WHERE job_id = ?", (new_id, jid))
-                log_event("WARN", f"Admin archived {len(rows)} jobs.")
+                post_commit_logs.append(f"Admin archived {len(rows)} jobs.")
             elif action == 'purge_queue':
                 c.execute("DELETE FROM jobs WHERE status='queued'")
-                log_event("WARN", "Admin PURGED the queue. Rescan triggered (background).")
+                post_commit_logs.append("Admin PURGED the queue. Rescan triggered (background).")
             elif action == 'clear_error_reports':
                 c.execute("DELETE FROM error_reports")
-                log_event("WARN", "Admin cleared all error reports.")
+                post_commit_logs.append("Admin cleared all error reports.")
 
             conn.commit()
         finally:
             conn.close()
-            
+
+    # log_event opens its own write connection — calling it while the
+    # transaction above was still open used to block it for the full SQLite
+    # busy timeout (60s) WITH db_lock held, freezing every worker endpoint.
+    for _msg in post_commit_logs:
+        log_event("WARN", _msg)
+
     if action == 'purge_queue' or action == 'archive_history':
         # FIXED: Run scan in a background thread to prevent client timeout
         threading.Thread(target=scan_and_queue, daemon=True).start()
