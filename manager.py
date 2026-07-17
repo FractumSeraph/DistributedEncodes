@@ -1366,7 +1366,16 @@ def _fast_hash_file(path, nbytes=_HASH_BYTES):
     return h.hexdigest()
 
 @app.route('/')
+@app.route('/dashboard')
 def dashboard(): return render_template('dashboard.html')
+
+@app.route('/web')
+@app.route('/node')
+def web_worker():
+    # In-browser encoder page. The worker token is injected so a volunteer can
+    # just open the page and contribute (same exposure as /install, which by
+    # policy also embeds the secret). Safely embedded via |tojson in the page.
+    return render_template('web_worker.html', worker_token=WORKER_SECRET)
 
 @app.route('/admin')
 @limiter.limit("5 per minute") 

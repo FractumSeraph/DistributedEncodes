@@ -168,23 +168,32 @@ async function processJob(job) {
         postMessage({type: 'log', level: 'sys', msg: "Starting FFmpeg..."});
         
         // STRICT ENCODING CONFIGURATION
+        // Matches the manager's verified target: SVT-AV1 preset 2 / CRF 63, 480p,
+        // mono Opus. Notes specific to the browser build:
+        //  - This wasm has --disable-ffprobe, so we can't inspect streams. We map
+        //    the first video + first (optional) audio explicitly and drop
+        //    subtitles (-sn): blindly transcoding an unknown subtitle codec to
+        //    mov_text is a common hard-failure, and bitmap subs can't convert.
+        //  - A single -svtav1-params: the previous two flags silently overrode
+        //    each other (only the last applied). lp=1 keeps browser memory down.
         const args = [
-            '-threads', '1', 
+            '-threads', '1',
             '-v', 'verbose',
             '-i', inputPath,
+            '-map', '0:v:0',
+            '-map', '0:a:0?',
+            '-sn',
             '-c:v', 'libsvtav1',
             '-preset', '2',
             '-crf', '63',
             '-g', '240',
-            '-pix_fmt', 'yuv420p', 
+            '-pix_fmt', 'yuv420p',
             '-svtav1-params', 'tune=0:lp=1',
             '-vf', 'scale=-2:480',
             '-c:a', 'opus',
             '-b:a', '12k',
             '-ac', '1',
             '-strict', '-2',
-            '-c:s', 'mov_text',
-            '-svtav1-params', 'logical-processors=2',
             outputPath
         ];
 
@@ -231,10 +240,14 @@ async function processJob(job) {
         const formData = new FormData();
         formData.append('job_id', job.id);
         formData.append('worker_id', job.worker_id);
+        if (job.wallet) formData.append('wallet', job.wallet);
         formData.append('file', blob, 'result.mp4');
 
-        const up = await fetch('/upload_result', { method: 'POST', body: formData });
-        if (!up.ok) throw new Error("Upload failed: " + up.statusText);
+        // Auth: the manager now requires the worker token (REQUIRE_WORKER_TOKEN).
+        // Sent as a header so it isn't logged in the URL.
+        const upHeaders = job.token ? { 'X-Worker-Token': job.token } : {};
+        const up = await fetch('/upload_result', { method: 'POST', body: formData, headers: upHeaders });
+        if (!up.ok) throw new Error("Upload failed: " + up.status + " " + up.statusText);
         
         postMessage({type: 'done'});
 

@@ -345,6 +345,18 @@ Workers can attach a FractumCoin wallet address with `--wallet ADDR` (or `&walle
 
 ---
 
+## Browser Worker (no install)
+
+Volunteers can encode small files directly in their browser — no Python, no FFmpeg install. The manager serves an in-browser node at **`/web`** (linked from the dashboard) that runs a purpose-built FFmpeg WebAssembly bundle with **SVT-AV1 + Opus** compiled in, using the same targets as the native worker (preset 2, CRF 63, 480p, mono Opus).
+
+- The page authenticates automatically (the worker token is injected server-side).
+- It only accepts small source files — set **MAX SOURCE MB** on the page (default 150). Browser encoding is memory-bound (32-bit WebAssembly), so large files can crash the tab; the manager filters jobs by that size.
+- Threads require cross-origin isolation; the manager already sends the needed `Cross-Origin-Opener-Policy` / `Cross-Origin-Embedder-Policy` headers, and the `.wasm` is served with the correct `application/wasm` type.
+- Subtitles are dropped in the browser (no `ffprobe` in the wasm build to filter subtitle types safely); output is video + Opus audio.
+- A `WALLET` field on the page credits FractumCoin earnings just like the native `--wallet` flag.
+
+> The browser worker is best for casual, low-power contributors on small files. Native workers remain far faster and handle the large files.
+
 ## Utility Scripts
 
 ### `maintenance_tool.py`
