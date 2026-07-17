@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.1.1"
+WORKER_VERSION = "3.2.0"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -1301,7 +1301,7 @@ def verify_connection(manager_url):
     print(f"[!] Could not connect to {manager_url}"); return False
 
 
-def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=False, series_id=None, watermark=False, max_size_mb=0, local_source_dir=None, no_chunks=False):
+def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=False, series_id=None, watermark=False, max_size_mb=0, local_source_dir=None, no_chunks=False, wallet=None):
     global UPDATE_AVAILABLE
     log(worker_id, "Thread active.")
     os.makedirs(temp_dir, exist_ok=True)
@@ -1622,7 +1622,8 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                     r = requests.post(f"{manager_url}/upload_chunk",
                                       files={'file': (f"chunk_{kind}_{idx}.mp4", f)},
                                       data={'job_id': job_id, 'chunk_index': idx,
-                                            'kind': kind, 'worker_id': worker_id},
+                                            'kind': kind, 'worker_id': worker_id,
+                                            'wallet': wallet or ''},
                                       headers=get_auth_headers(), timeout=300)
                 if r.status_code == 200:
                     upload_ok = True; break
@@ -1930,7 +1931,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                                 f"{manager_url}/upload_result",
                                 files={'file': (_r_job_id, _r_f)},
                                 data={'job_id': _r_job_id, 'worker_id': worker_id,
-                                      'duration': _r_total_min},
+                                      'duration': _r_total_min, 'wallet': wallet or ''},
                                 headers=get_auth_headers(), timeout=300)
                             if _r_resp.status_code == 200:
                                 _r_up_ok = True; break
@@ -1984,6 +1985,16 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                         cdata = rc.json()
                         if cdata.get("status") == "ok" and cdata.get("chunk"):
                             process_chunk(cdata["chunk"])
+                            continue
+                        elif cdata.get("status") == "retry":
+                            # Manager is splitting a video right now — wait for
+                            # it instead of grabbing a different whole file, so
+                            # all threads converge on the same video.
+                            try: _wait = min(10, max(1, int(cdata.get("wait", 3))))
+                            except: _wait = 3
+                            for _ in range(_wait):
+                                if SHUTDOWN_EVENT.is_set(): break
+                                time.sleep(1)
                             continue
                         elif cdata.get("message") == "Chunking disabled":
                             # Config toggle is static per manager process — stop
@@ -2392,9 +2403,9 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                         try:
                             with ProgressFileReader(local_dst, upload_cb) as f:
                                 # Timeout = 300s (5 minutes) for socket silence
-                                r = requests.post(f"{manager_url}/upload_result", 
-                                              files={'file': (job_id, f)}, 
-                                              data={'job_id': job_id, 'worker_id': worker_id, 'duration': total_min},
+                                r = requests.post(f"{manager_url}/upload_result",
+                                              files={'file': (job_id, f)},
+                                              data={'job_id': job_id, 'worker_id': worker_id, 'duration': total_min, 'wallet': wallet or ''},
                                               headers=get_auth_headers(),
                                               timeout=300)
                                 if r.status_code == 200:
@@ -2488,6 +2499,9 @@ def run_worker(args):
                     args.username = saved_config['username']
                 if args.workername == DEFAULT_WORKERNAME and 'workername' in saved_config:
                     args.workername = saved_config['workername']
+                if not getattr(args, 'wallet', None) and saved_config.get('wallet'):
+                    args.wallet = saved_config['wallet']
+                    print(f"[*] Using saved FractumCoin wallet: {args.wallet}")
         except json.JSONDecodeError:
             print("[!] Config file corrupted. Resetting.")
             os.remove(config_file)
@@ -2519,11 +2533,29 @@ def run_worker(args):
 
         if config_changed:
             try:
+                cfg = dict(saved_config)
+                cfg.update({"username": args.username, "workername": args.workername})
+                if getattr(args, 'wallet', None):
+                    cfg["wallet"] = args.wallet
                 with open(config_file, 'w') as f:
-                    json.dump({"username": args.username, "workername": args.workername}, f, indent=4)
+                    json.dump(cfg, f, indent=4)
                 print(f"[*] Configuration saved to {config_file}")
             except:
                 print("[!] Failed to save configuration file.")
+
+    # Persist a newly provided wallet address (like username/workername) so
+    # future runs don't need the flag.
+    if getattr(args, 'wallet', None) and saved_config.get('wallet') != args.wallet:
+        try:
+            cfg = dict(saved_config)
+            cfg.setdefault("username", args.username)
+            cfg.setdefault("workername", args.workername)
+            cfg["wallet"] = args.wallet
+            with open(config_file, 'w') as f:
+                json.dump(cfg, f, indent=4)
+            print(f"[*] FractumCoin wallet saved to {config_file}")
+        except:
+            print("[!] Failed to save wallet to configuration file.")
 
     check_ffmpeg()
     update_ffmpeg_if_stale()
@@ -2578,7 +2610,7 @@ def run_worker(args):
         WORKER_DETAILS[worker_id] = {"file": "-", "phase": "Starting", "pct": 0, "job_start": 0.0, "jobs_done": 0}
         temp_dir = f"./temp_encode_{base_workername}_{i+1}"
 
-        t = threading.Thread(target=worker_task, args=(worker_id, manager_url, temp_dir, quota_tracker, single_mode, args.series_id, args.watermark, args.max_size_mb, getattr(args, 'local_source', None), getattr(args, 'no_chunks', False)))
+        t = threading.Thread(target=worker_task, args=(worker_id, manager_url, temp_dir, quota_tracker, single_mode, args.series_id, args.watermark, args.max_size_mb, getattr(args, 'local_source', None), getattr(args, 'no_chunks', False), getattr(args, 'wallet', None)))
         t.daemon = True
         t.start()
         threads.append(t)
@@ -2781,5 +2813,9 @@ if __name__ == "__main__":
     parser.add_argument("--no-chunks", action="store_true", default=False,
                         help="Opt out of chunked encoding: always take whole files instead of "
                              "time-slices of videos split across multiple workers.")
+    parser.add_argument("--wallet", default=None, metavar="ADDRESS",
+                        help="FractumCoin wallet address. Every verified upload is credited to "
+                             "this address on the manager so encoding rewards can be paid out. "
+                             "Saved to worker_config.json after first use.")
     args = parser.parse_args()
     run_worker(args)

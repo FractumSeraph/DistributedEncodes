@@ -243,6 +243,21 @@ def sanitize_input(val):
     if not val: return None
     return re.sub(r'[^a-zA-Z0-9_.-]', '', str(val))
 
+def sanitize_wallet(val):
+    """Normalize a FractumCoin wallet address for storage (charset kept a bit
+    wider than sanitize_input since address formats may include ':')."""
+    if not val: return None
+    cleaned = re.sub(r'[^a-zA-Z0-9:_.-]', '', str(val))[:128]
+    return cleaned or None
+
+def _record_earning(conn, wallet, worker_id, job_id, kind, chunk_index, minutes):
+    """Append one verified upload to the FractumCoin earnings ledger.
+    Caller holds db_lock and commits."""
+    conn.execute(
+        "INSERT INTO earnings (timestamp, wallet, worker_id, job_id, kind, chunk_index, minutes) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (datetime.now(), wallet, worker_id, job_id, kind, chunk_index, round(float(minutes), 3)))
+
 def is_version_sufficient(client_ver, min_ver):
     if not client_ver: return False
     try:
@@ -312,26 +327,30 @@ def requires_worker_auth(f):
     return decorated
 
 def verify_upload(filepath):
+    """Validate a finished encode. Returns (ok, reason, duration_sec) — the
+    duration comes from ffprobe, so earnings credit is based on what was
+    actually delivered, not on what the worker claims."""
     try:
         cmd = ['ffprobe', '-v', 'error', '-print_format', 'json', '-show_streams', '-show_format', filepath]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
-            return False, "FFprobe Error"
-        
+            return False, "FFprobe Error", 0.0
+
         data = json.loads(result.stdout)
+        duration = float(data.get('format', {}).get('duration') or 0)
         has_video = False
         for stream in data.get('streams', []):
             if stream['codec_type'] == 'video':
-                if stream.get('codec_name') != 'av1': return False, "Invalid Codec (Not AV1)"
-                if int(stream.get('height', 0)) != 480: return False, "Invalid Height"
+                if stream.get('codec_name') != 'av1': return False, "Invalid Codec (Not AV1)", 0.0
+                if int(stream.get('height', 0)) != 480: return False, "Invalid Height", 0.0
                 has_video = True
             elif stream['codec_type'] == 'audio':
-                if stream.get('codec_name') != 'opus': return False, "Invalid Audio Codec"
-                
-        if not has_video: return False, "No Video Stream"
-        return True, "Verified"
+                if stream.get('codec_name') != 'opus': return False, "Invalid Audio Codec", 0.0
+
+        if not has_video: return False, "No Video Stream", 0.0
+        return True, "Verified", duration
     except Exception as e:
-        return False, str(e)
+        return False, str(e), 0.0
 
 # ==============================================================================
 # CHUNKED ENCODING (split one video across many workers)
@@ -771,7 +790,7 @@ def _assemble_job(job_id):
         if res.returncode != 0 or not os.path.exists(out_tmp):
             raise RuntimeError(f"concat failed (rc={res.returncode}): {res.stderr[-500:] if res.stderr else ''}")
 
-        is_valid, reason = verify_upload(out_tmp)
+        is_valid, reason, _assembled_dur = verify_upload(out_tmp)
         if not is_valid:
             raise RuntimeError(f"assembled file failed verification: {reason}")
 
@@ -798,12 +817,15 @@ def _assemble_job(job_id):
                 if warn:
                     conn.execute("UPDATE jobs SET warnings = COALESCE(warnings || ' | ', '') || ? WHERE id=?",
                                  (warn, job_id))
+                # Worker credit lives in the earnings ledger (recorded at chunk
+                # upload), so the work-queue rows can go — keeps the chunks
+                # table holding only active work.
+                conn.execute("DELETE FROM chunks WHERE job_id=?", (job_id,))
                 conn.commit()
             finally:
                 conn.close()
         db_handler.sync_to_disk()
 
-        # Chunk files are no longer needed; rows are kept for the scoreboard
         try:
             shutil.rmtree(cdir, ignore_errors=True)
         except Exception:
@@ -1122,6 +1144,46 @@ def init_db():
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_chunks_status ON chunks(status)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_chunks_job ON chunks(job_id)")
 
+        # FractumCoin earnings ledger: one row per VERIFIED upload (whole file
+        # or video chunk). Durable payout record — unlike the jobs/chunks
+        # tables, rows here are never rewritten by retries, archives, or
+        # chunk cleanup. `paid` is reserved for future payout tooling.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS earnings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TIMESTAMP,
+                wallet TEXT,
+                worker_id TEXT,
+                job_id TEXT,
+                kind TEXT DEFAULT 'full',
+                chunk_index INTEGER,
+                minutes REAL DEFAULT 0,
+                paid INTEGER DEFAULT 0
+            )
+        ''')
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_earnings_wallet ON earnings(wallet)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_earnings_worker ON earnings(worker_id)")
+
+        # One-time backfill so historical scoreboard credit carries over into
+        # the ledger (wallet unknown for past work — recorded as NULL).
+        cursor.execute("SELECT COUNT(*) FROM earnings")
+        if cursor.fetchone()[0] == 0:
+            cursor.execute('''
+                INSERT INTO earnings (timestamp, wallet, worker_id, job_id, kind, chunk_index, minutes)
+                SELECT last_updated, NULL, worker_id, id, 'full', NULL, COALESCE(duration, 0)
+                FROM jobs WHERE status='completed' AND worker_id IS NOT NULL AND COALESCE(chunked, 0)=0
+            ''')
+            backfilled_full = cursor.rowcount
+            cursor.execute('''
+                INSERT INTO earnings (timestamp, wallet, worker_id, job_id, kind, chunk_index, minutes)
+                SELECT c2.last_updated, NULL, c2.worker_id, c2.job_id, 'video_chunk', c2.chunk_index, c2.duration_sec / 60.0
+                FROM chunks c2 JOIN jobs j2 ON j2.id = c2.job_id
+                WHERE c2.status='completed' AND c2.kind='video' AND c2.worker_id IS NOT NULL AND j2.status='completed'
+            ''')
+            backfilled_chunks = cursor.rowcount
+            if backfilled_full > 0 or backfilled_chunks > 0:
+                print(f"[*] Earnings ledger backfilled from history: {backfilled_full} whole file(s), {backfilled_chunks} chunk(s).")
+
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS error_reports (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1191,16 +1253,18 @@ def api_series_list():
 def install_script():
     u = sanitize_input(request.args.get('username')) or 'Anonymous'
     w = sanitize_input(request.args.get('workername')) or 'LinuxNode'
-    s_id = request.args.get('series_id', '') 
+    s_id = request.args.get('series_id', '')
     if s_id and not s_id.isdigit(): s_id = ''
     j = request.args.get('jobs', '1')
     if not j.isdigit(): j = '1'
+    wallet = sanitize_wallet(request.args.get('wallet'))
+    wallet_arg = f' --wallet "{wallet}"' if wallet else ''
     script = f"""#!/bin/bash
 if [ -x "$(command -v apt-get)" ]; then sudo apt-get update -qq && sudo apt-get install -y ffmpeg python3 python3-requests; fi
 if [ -x "$(command -v dnf)" ]; then sudo dnf install -y ffmpeg python3 python3-requests; fi
 curl -s "{SERVER_URL_DISPLAY.rstrip('/')}/dl/worker" -o worker.py
 export WORKER_SECRET="{WORKER_SECRET}"
-python3 worker.py --username "{u}" --workername "{w}" --jobs {j} --manager "{SERVER_URL_DISPLAY}" --series-id "{s_id}"
+python3 worker.py --username "{u}" --workername "{w}" --jobs {j} --manager "{SERVER_URL_DISPLAY}" --series-id "{s_id}"{wallet_arg}
 """
     return Response(script, mimetype='text/x-shellscript')
 
@@ -1339,19 +1403,26 @@ def get_chunk():
         folder_filter = _resolve_folder_filter(series_id)
 
         chunk = _assign_pending_chunk(worker_id, folder_filter, max_size_mb)
-        if chunk is None and SPLIT_LOCK.acquire(blocking=False):
-            # No pending chunks anywhere — split the next queued job.
-            # One candidate per request and one split at a time: this keeps
-            # the request latency bounded (workers time out around 30s) and
-            # stops a poll storm from splitting many jobs simultaneously.
-            # An unsplittable candidate is requeued with chunkable=0 and gets
-            # picked up whole via /get_job instead.
-            try:
-                job = _claim_job_for_split(folder_filter, max_size_mb)
-                if job is not None and _split_claimed_job(job):
-                    chunk = _assign_pending_chunk(worker_id, folder_filter, max_size_mb)
-            finally:
-                SPLIT_LOCK.release()
+        if chunk is None:
+            if SPLIT_LOCK.acquire(blocking=False):
+                # No pending chunks anywhere — split the next queued job.
+                # One candidate per request and one split at a time: this keeps
+                # the request latency bounded (workers time out around 30s) and
+                # stops a poll storm from splitting many jobs simultaneously.
+                # An unsplittable candidate is requeued with chunkable=0 and gets
+                # picked up whole via /get_job instead.
+                try:
+                    job = _claim_job_for_split(folder_filter, max_size_mb)
+                    if job is not None and _split_claimed_job(job):
+                        chunk = _assign_pending_chunk(worker_id, folder_filter, max_size_mb)
+                finally:
+                    SPLIT_LOCK.release()
+            else:
+                # Another request is mid-split: tell the worker to ask again in
+                # a moment INSTEAD of falling back to /get_job — otherwise a
+                # worker started with --jobs N grabs N different whole videos
+                # in the few seconds before the first split lands.
+                return jsonify({"status": "retry", "wait": 3})
 
         if chunk is None:
             return jsonify({"status": "empty"})
@@ -1366,6 +1437,7 @@ def upload_chunk():
     """Receive one encoded chunk, verify it, and store it until assembly."""
     job_id = request.form.get('job_id')
     worker_id = sanitize_input(request.form.get('worker_id'))
+    wallet = sanitize_wallet(request.form.get('wallet'))
     kind = request.form.get('kind', 'video')
     if kind not in ('video', 'audio'):
         return jsonify({"status": "error", "message": "invalid kind"}), 400
@@ -1421,8 +1493,17 @@ def upload_chunk():
         try:
             c = conn.cursor()
             c.execute("UPDATE chunks SET status='completed', progress=100, worker_id=?, "
-                      "uploaded_path=?, last_updated=? WHERE job_id=? AND kind=? AND chunk_index=?",
+                      "uploaded_path=?, last_updated=? WHERE job_id=? AND kind=? AND chunk_index=? "
+                      "AND status != 'completed'",
                       (worker_id, final_path, datetime.now(), job_id, kind, chunk_index))
+            newly_completed = (c.rowcount == 1)
+            # FractumCoin credit: each verified video chunk earns its slice of
+            # the source's minutes (the audio helper pass earns 0, so a chunked
+            # job totals exactly its real length). rowcount guard = no double
+            # credit if two workers race the same chunk.
+            if newly_completed and kind == 'video':
+                _record_earning(conn, wallet, worker_id, job_id, 'video_chunk', chunk_index,
+                                float(crow['duration_sec'] or 0) / 60.0)
             _update_job_chunk_progress(conn, job_id)
             c.execute("SELECT COUNT(*) FROM chunks WHERE job_id=? AND status != 'completed'", (job_id,))
             all_done = (c.fetchone()[0] == 0)
@@ -1487,6 +1568,7 @@ def report_chunk():
 def upload_result():
     job_id = request.form.get('job_id')
     worker_id = sanitize_input(request.form.get('worker_id'))
+    wallet = sanitize_wallet(request.form.get('wallet'))
     try:
         duration = int(float(request.form.get('duration', 0)))
     except:
@@ -1498,8 +1580,8 @@ def upload_result():
         os.makedirs(quarantine_dir, exist_ok=True)
         temp_path = os.path.join(quarantine_dir, f"{uuid.uuid4().hex}.mp4")
         request.files['file'].save(temp_path)
-        
-        is_valid, reason = verify_upload(temp_path)
+
+        is_valid, reason, verified_dur = verify_upload(temp_path)
         if not is_valid:
             log_event("WARN", f"Security: Upload rejected ({reason})", job_id)
             os.remove(temp_path)
@@ -1518,13 +1600,24 @@ def upload_result():
 
         with db_lock:
             conn = db_handler.get_connection()
-            conn.execute("UPDATE jobs SET status='completed', progress=100, worker_id=?, last_updated=?, duration=? WHERE id=?", 
-                (worker_id, datetime.now(), duration, job_id))
-            conn.commit(); conn.close()
-        
+            try:
+                c = conn.cursor()
+                c.execute("SELECT status FROM jobs WHERE id=?", (job_id,))
+                prev = c.fetchone()
+                c.execute("UPDATE jobs SET status='completed', progress=100, worker_id=?, last_updated=?, duration=? WHERE id=?",
+                    (worker_id, datetime.now(), duration, job_id))
+                # FractumCoin credit: minutes come from ffprobe of the delivered
+                # file, not the worker's claim. A re-upload to an already
+                # completed job (stale worker) earns nothing twice.
+                if prev is not None and prev[0] != 'completed':
+                    _record_earning(conn, wallet, worker_id, job_id, 'full', None, verified_dur / 60.0)
+                conn.commit()
+            finally:
+                conn.close()
+
         # [CRITICAL] Immediate Sync to Disk
         db_handler.sync_to_disk()
-        
+
         log_event("INFO", f"Job completed by {worker_id}", job_id)
         return jsonify({"status": "success"})
     return jsonify({"status": "error"}), 400
@@ -1810,38 +1903,30 @@ def report_status():
 @app.route('/api/stats')
 def api_stats():
     filter_val = request.args.get('filter')
-    time_filter = " AND last_updated > datetime('now', '-1 day')" if filter_val == '24h' else " AND last_updated > datetime('now', '-30 days')" if filter_val == '30d' else ""
 
     with db_lock:
         conn = db_handler.get_connection(); conn.row_factory = sqlite3.Row
         try:
             c = conn.cursor()
-            # Scoreboard: whole-file jobs credit their single worker; chunked jobs
-            # credit each contributor with the minutes of source they encoded.
-            # Chunk credit counts only video chunks (the audio pass spans the
-            # whole file and would double the job's minutes) and only jobs
-            # that actually completed.
+            # Scoreboard = the earnings ledger: minutes of successful,
+            # verified encodes uploaded (whole files + video chunk slices;
+            # the audio helper pass earns 0 so chunked jobs count exactly
+            # once). The ledger is append-only, so scores survive retries,
+            # archives, and chunk cleanup.
+            earn_filter = (" AND timestamp > datetime('now', '-1 day')" if filter_val == '24h'
+                           else " AND timestamp > datetime('now', '-30 days')" if filter_val == '30d' else "")
             c.execute(f"""
-                SELECT worker_id, SUM(total_minutes) as total_minutes, SUM(files_count) as files_count FROM (
-                    SELECT CASE WHEN instr(worker_id, '-') > 0 THEN substr(worker_id, 1, instr(worker_id, '-') - 1) ELSE worker_id END as worker_id,
-                           SUM(duration) as total_minutes, COUNT(*) as files_count
-                    FROM jobs WHERE status='completed' AND worker_id IS NOT NULL AND COALESCE(chunked, 0)=0 {time_filter}
-                    GROUP BY 1
-                    UNION ALL
-                    SELECT CASE WHEN instr(worker_id, '-') > 0 THEN substr(worker_id, 1, instr(worker_id, '-') - 1) ELSE worker_id END as worker_id,
-                           CAST(SUM(duration_sec) / 60.0 AS INTEGER) as total_minutes, COUNT(DISTINCT job_id) as files_count
-                    FROM chunks WHERE status='completed' AND worker_id IS NOT NULL AND kind='video'
-                          AND EXISTS (SELECT 1 FROM jobs j2 WHERE j2.id = chunks.job_id AND j2.status='completed') {time_filter}
-                    GROUP BY 1
-                ) GROUP BY worker_id ORDER BY total_minutes DESC""")
+                SELECT CASE WHEN instr(worker_id, '-') > 0 THEN substr(worker_id, 1, instr(worker_id, '-') - 1) ELSE worker_id END as worker_id,
+                       CAST(SUM(minutes) AS INTEGER) as total_minutes,
+                       COUNT(DISTINCT job_id) as files_count
+                FROM earnings WHERE worker_id IS NOT NULL {earn_filter}
+                GROUP BY 1 ORDER BY total_minutes DESC""")
             sb = [dict(r) for r in c.fetchall()]
 
             c.execute("SELECT id, COALESCE(worker_id, 'Pending...') as worker_id, filename, duration, progress, status, COALESCE(chunked, 0) as chunked FROM jobs WHERE status IN ('processing', 'downloading', 'uploading')")
             act = [dict(r) for r in c.fetchall()]
 
-            # For chunked jobs, show swarm status instead of a single worker
-            # name. Scoped to the active jobs — the chunks table keeps
-            # historical rows for the scoreboard and grows over time.
+            # For chunked jobs, show swarm status instead of a single worker name.
             chunk_info = {}
             active_chunked_ids = [a['id'] for a in act if a['chunked']]
             if active_chunked_ids:
@@ -1891,6 +1976,37 @@ def api_all_jobs():
         finally:
             conn.close()
         return jsonify({"jobs": jobs})
+
+@app.route('/api/earnings')
+@requires_auth
+def api_earnings():
+    """FractumCoin payout view: per-wallet totals plus the most recent ledger
+    rows. Work uploaded without --wallet is grouped under '(no wallet)'."""
+    try:
+        limit = min(int(request.args.get('limit', 100)), 1000)
+    except (ValueError, TypeError):
+        limit = 100
+    with db_lock:
+        conn = db_handler.get_connection(); conn.row_factory = sqlite3.Row
+        try:
+            c = conn.cursor()
+            c.execute("""
+                SELECT COALESCE(NULLIF(wallet, ''), '(no wallet)') as wallet,
+                       ROUND(SUM(minutes), 2) as total_minutes,
+                       ROUND(SUM(CASE WHEN paid=0 THEN minutes ELSE 0 END), 2) as unpaid_minutes,
+                       COUNT(*) as uploads,
+                       COUNT(DISTINCT job_id) as jobs,
+                       COUNT(DISTINCT worker_id) as workers,
+                       MIN(timestamp) as first_upload,
+                       MAX(timestamp) as last_upload
+                FROM earnings GROUP BY 1 ORDER BY total_minutes DESC""")
+            wallets = [dict(r) for r in c.fetchall()]
+            c.execute("SELECT id, timestamp, wallet, worker_id, job_id, kind, chunk_index, minutes, paid "
+                      "FROM earnings ORDER BY id DESC LIMIT ?", (limit,))
+            recent = [dict(r) for r in c.fetchall()]
+        finally:
+            conn.close()
+    return jsonify({"wallets": wallets, "recent": recent})
 
 @app.route('/api/logs')
 @requires_auth
