@@ -40,6 +40,7 @@ Encoded output is intended for [https://vsv.fractumseraph.net/](https://vsv.frac
 | `--max-size-mb N` | `0` (no limit) | Skip source files larger than N MB |
 | `--local-source DIR` | *(none)* | Read source files directly from disk instead of HTTP — useful when the worker runs on the same machine as the manager |
 | `--no-chunks` | off | Opt out of chunked encoding — always take whole files |
+| `--wallet ADDR` | *(none)* | FractumCoin wallet address — verified uploads are credited to it for later payout (saved to `worker_config.json`) |
 
 The `WORKER_SECRET` environment variable is the preferred way to pass the auth token.
 
@@ -328,6 +329,19 @@ CHUNK_DURATION_SEC = 300    # target chunk length in seconds
 ```
 
 > **Note:** the manager temporarily stores uploaded chunks in `chunk_store/` until assembly — keep roughly one encoded video's worth of free disk per active chunked job.
+
+---
+
+## FractumCoin Rewards
+
+Workers can attach a FractumCoin wallet address with `--wallet ADDR` (or `&wallet=ADDR` on the `/install` one-liner). The manager keeps an append-only **earnings ledger**: one row per *verified* upload, credited in **minutes of source video encoded**.
+
+- A whole-file upload earns the encode's duration, measured by the manager's own `ffprobe` of the delivered file (not the worker's claim).
+- A video chunk earns its slice's minutes; the audio helper chunk earns 0, so a chunked video pays out exactly its real length across contributors.
+- Ledger rows are never rewritten by retries, archives, or chunk cleanup, and re-uploads to an already-completed job earn nothing — the payout record is stable.
+- The public scoreboard is a view of the same ledger, so score = minutes of successful encodes uploaded, identical between chunked and whole-file work. Existing history is backfilled into the ledger on first startup (with no wallet attached).
+
+**Payouts:** `GET /api/earnings` (admin auth) returns per-wallet totals (`total_minutes`, `unpaid_minutes`, upload counts, first/last activity) plus recent ledger rows. Work uploaded without a wallet appears under `(no wallet)`. A `paid` flag exists on every row for future payout tooling.
 
 ---
 
