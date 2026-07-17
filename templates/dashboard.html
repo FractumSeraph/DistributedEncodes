@@ -343,7 +343,12 @@
                 if (!res.ok) throw new Error("API Offline");
                 const rawData = await res.json();
                 
-                const completed = rawData.scoreboard.reduce((acc, u) => acc + u.files_count, 0);
+                // Prefer the true completed-jobs count: with chunked encoding a
+                // single video contributes to several workers' files_count, so
+                // summing the scoreboard would overcount.
+                const completed = (rawData.total_completed !== undefined)
+                    ? rawData.total_completed
+                    : rawData.scoreboard.reduce((acc, u) => acc + u.files_count, 0);
                 const activeCount = rawData.active.length;
                 
                 const data = {

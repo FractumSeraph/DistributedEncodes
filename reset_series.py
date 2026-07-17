@@ -42,16 +42,32 @@ def reset_series(search_term):
             return
 
         print(f"[*] Found {count} jobs. Resetting them to 'queued'...")
-        
+
         # Update status to 'queued' so workers pick them up again.
         # We also clear worker_id, progress, duration, and timestamps to ensure a clean start.
-        c.execute("""
-            UPDATE jobs 
-            SET status='queued', progress=0, worker_id=NULL, 
-                last_updated=?, duration=0, started_at=NULL
-            WHERE id LIKE ?
-        """, (datetime.now(), pattern))
-        
+        # Chunk state (chunked encoding) is cleared too, mirroring the admin
+        # 'retry' action — otherwise stale chunk rows could be assembled into
+        # a re-queued job or leave it invisible to the stale-job timeout.
+        try:
+            c.execute("DELETE FROM chunks WHERE job_id LIKE ?", (pattern,))
+        except sqlite3.OperationalError:
+            pass  # pre-chunking database: no chunks table yet
+        try:
+            c.execute("""
+                UPDATE jobs
+                SET status='queued', progress=0, worker_id=NULL,
+                    last_updated=?, duration=0, started_at=NULL,
+                    chunked=0, chunkable=NULL
+                WHERE id LIKE ?
+            """, (datetime.now(), pattern))
+        except sqlite3.OperationalError:
+            c.execute("""
+                UPDATE jobs
+                SET status='queued', progress=0, worker_id=NULL,
+                    last_updated=?, duration=0, started_at=NULL
+                WHERE id LIKE ?
+            """, (datetime.now(), pattern))
+
         conn.commit()
         conn.close()
         print(f"[+] Success! {count} jobs have been reset and added back to the queue.")

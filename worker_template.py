@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.1.0"
+WORKER_VERSION = "3.1.1"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -1985,6 +1985,11 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                         if cdata.get("status") == "ok" and cdata.get("chunk"):
                             process_chunk(cdata["chunk"])
                             continue
+                        elif cdata.get("message") == "Chunking disabled":
+                            # Config toggle is static per manager process — stop
+                            # doubling every idle poll with a pointless request.
+                            _CHUNK_SUPPORT["ok"] = False
+                            log(worker_id, "Chunked encoding disabled on manager — using whole-file mode.")
                 except Exception:
                     pass  # chunk fetch failed — fall through to /get_job
 

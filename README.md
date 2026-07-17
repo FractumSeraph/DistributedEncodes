@@ -314,9 +314,9 @@ By default the manager splits long videos into ~5-minute **chunks** so that mult
 
 **Fallbacks & safety:**
 
-- Videos shorter than ~1.5× the chunk length are encoded whole via the classic path.
+- Videos shorter than ~1.5× the chunk length, VFR sources, and sources whose audio/video streams start at different offsets are encoded whole via the classic path.
 - If a chunk fails 3 times, or assembly fails, the job automatically falls back to whole-file encoding.
-- Chunks with no heartbeat for 30 minutes are handed to another worker; completed chunks are never lost when a worker dies (only the in-flight chunk is redone).
+- Chunks with no heartbeat for 30 minutes are handed to another worker; completed chunks are never lost when a worker dies (only the in-flight chunk is redone). If a split job sees no chunk activity at all for 6 hours (e.g. every chunk-capable worker left), it is returned to the normal queue without penalty.
 - Old workers and the browser-based web worker keep using `/get_job` untouched.
 - Watermarks (`--watermark`) are skipped on chunks so the final video is consistent.
 
