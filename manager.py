@@ -12,6 +12,7 @@ import secrets
 import platform
 import gzip
 import hashlib
+import html as html_lib
 from functools import wraps
 from datetime import datetime, timedelta
 from urllib.parse import quote, urljoin
@@ -864,6 +865,29 @@ def _legacy_encoded_id(job_id):
         return job_id
     return '/'.join(quote(p, safe='') for p in parts[:-1]) + '/' + parts[-1]
 
+def _broken_id_variants(clean_id):
+    """All historical broken forms this file's id may be stored under:
+      1. legacy: directory components percent-encoded (pre-double-encoding fix)
+      2. mojibake: UTF-8 listing decoded as Latin-1 (e.g. 'BURN·E' → 'BURNÂ·E')
+         — happened when the remote server omitted the charset header
+      3. legacy encoding of the mojibake form (both eras combined)
+    Download URLs built from any of these 404 on the real source, so rows
+    stored under them can never encode successfully until migrated."""
+    variants = []
+    legacy = _legacy_encoded_id(clean_id)
+    if legacy != clean_id:
+        variants.append(legacy)
+    try:
+        moji = clean_id.encode('utf-8').decode('latin-1')
+        if moji != clean_id:
+            variants.append(moji)
+            moji_legacy = _legacy_encoded_id(moji)
+            if moji_legacy != moji:
+                variants.append(moji_legacy)
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        pass
+    return variants
+
 def scan_remote_http(url, prefix="", depth=0, known_ids=None):
     """
     Recursively scans an HTTP directory listing for video files.
@@ -892,15 +916,25 @@ def scan_remote_http(url, prefix="", depth=0, known_ids=None):
 
     if not r or r.status_code != 200: return
 
+    # Directory listings are almost always UTF-8, but when the server omits
+    # the charset, `requests` falls back to Latin-1 (an HTTP/1.1 relic).
+    # That turns e.g. "BURN·E.2008" into the mojibake "BURNÂ·E.2008", which
+    # then percent-encodes to the wrong bytes and 404s on every download.
+    if 'charset' not in (r.headers.get('Content-Type') or '').lower():
+        r.encoding = 'utf-8'
+
     try:
         links = re.findall(r'href=["\']([^"\'<>]+)["\']', r.text)
-        
+
         for link in links:
+            # hrefs are HTML-escaped attributes: "&amp;" in a listing means a
+            # literal "&" in the real filename.
+            link = html_lib.unescape(link)
             if link.startswith('?') or link.startswith('/') or link in ['../', './']: continue
             if "parent directory" in link.lower(): continue
-            
+
             full_url = urljoin(url, link)
-            
+
             if link.endswith('/'):
                 time.sleep(0.2) # Tiny delay to prevent hammering
                 # Recursively yield results from subdirectories.
@@ -916,10 +950,11 @@ def scan_remote_http(url, prefix="", depth=0, known_ids=None):
                 clean_name = unquote(link)
                 clean_id = f"{prefix}{clean_name}"
 
-                # Already tracked (under the current or legacy-encoded id)?
-                # Skip the per-file HEAD request — the dominant cost of a rescan.
-                if known_ids is not None and (clean_id in known_ids
-                                              or _legacy_encoded_id(clean_id) in known_ids):
+                # Already tracked under the correct id? Skip the per-file HEAD
+                # request — the dominant cost of a rescan. Files tracked only
+                # under a BROKEN historical id are deliberately not skipped:
+                # process_batch migrates those rows to the working id.
+                if known_ids is not None and clean_id in known_ids:
                     continue
 
                 size = 0
@@ -953,6 +988,7 @@ def _scan_and_queue_inner():
         if not file_batch: return
         
         count_new = 0
+        migrations = []
         # 1. Update Database
         with db_lock:
             conn = db_handler.get_connection()
@@ -975,29 +1011,46 @@ def _scan_and_queue_inner():
 
                     cursor.execute("SELECT id FROM jobs WHERE id=?", (job_id,))
                     if not cursor.fetchone():
-                        # Also check the legacy partially-encoded ID format produced
-                        # before the double-encoding bug fix.  The old scanner left
-                        # subdir components percent-encoded (e.g. BURN%C2%B7E.../)
-                        # while decoding only the filename.  After the fix, all path
-                        # components are decoded, so the IDs differ even for the same
-                        # file.  We normalise before inserting to avoid re-queuing
-                        # files that are already done or in-progress.
-                        _legacy_id = _legacy_encoded_id(job_id)
-                        if _legacy_id != job_id:
-                            cursor.execute("SELECT id FROM jobs WHERE id=?", (_legacy_id,))
-                            if cursor.fetchone():
-                                continue  # already exists under the old encoded ID
+                        # The same file may be tracked under a BROKEN historical
+                        # id (percent-encoded directories from the old scanner,
+                        # or mojibake from charset-less listings — see
+                        # _broken_id_variants). Those ids build download URLs
+                        # that 404 forever, so repair the row in place instead
+                        # of inserting a duplicate.
+                        migrated = False
+                        for variant in _broken_id_variants(job_id):
+                            cursor.execute("SELECT status FROM jobs WHERE id=?", (variant,))
+                            vrow = cursor.fetchone()
+                            if vrow is None:
+                                continue
+                            cursor.execute("UPDATE jobs SET id=?, filename=? WHERE id=?",
+                                           (job_id, fname, variant))
+                            cursor.execute("UPDATE chunks SET job_id=? WHERE job_id=?", (job_id, variant))
+                            cursor.execute("UPDATE earnings SET job_id=? WHERE job_id=?", (job_id, variant))
+                            if vrow[0] in ('failed', 'permanently_failed'):
+                                # Its failures were caused by the broken id
+                                # (unreachable download URL) — give it a clean slate.
+                                cursor.execute("UPDATE jobs SET status='queued', fail_count=0, progress=0, "
+                                               "worker_id=NULL, started_at=NULL, chunked=0, chunkable=NULL, "
+                                               "last_updated=? WHERE id=?", (datetime.now(), job_id))
+                            migrations.append((variant, job_id, vrow[0]))
+                            migrated = True
+                            break
+                        if migrated:
+                            continue
                         cursor.execute(
-                            "INSERT INTO jobs (id, filename, status, last_updated, file_size, source_type, source_url, content_profile, fail_count) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, 0)", 
+                            "INSERT INTO jobs (id, filename, status, last_updated, file_size, source_type, source_url, content_profile, fail_count) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, 0)",
                             (job_id, fname, datetime.now(), fsize, src_type, src_url, profile)
                         )
                         count_new += 1
                 conn.commit()
             finally:
                 conn.close()
-        
+
         if count_new > 0:
             print(f"[*] Added {count_new} new files to Database...")
+        for old_id, new_id, old_status in migrations:
+            log_event("INFO", f"Repaired broken job id: '{old_id}' -> '{new_id}' (was {old_status}).", new_id)
 
     # --- 1. Scan Local ---
     print(f"[*] Scanning LOCAL Source: {SOURCE_DIRECTORY} ...")
