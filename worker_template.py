@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.0.26"
+WORKER_VERSION = "3.1.0"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -136,6 +136,10 @@ _TUI_SIGNAL = None  # Set to 'pause' or 'quit' by signal handler, polled by app 
 WORKER_DETAILS = {}
 SESSION_STATS = {"jobs_done": 0, "bytes_uploaded": 0, "start": 0.0}
 STATS_LOCK = threading.Lock()
+
+# Chunked encoding: set to False once the manager responds 404 to /get_chunk
+# (older manager) so we stop asking. Shared across worker threads.
+_CHUNK_SUPPORT = {"ok": True}
 
 # Global paths for executables
 FFMPEG_CMD = "ffmpeg"
@@ -1297,7 +1301,7 @@ def verify_connection(manager_url):
     print(f"[!] Could not connect to {manager_url}"); return False
 
 
-def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=False, series_id=None, watermark=False, max_size_mb=0, local_source_dir=None):
+def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=False, series_id=None, watermark=False, max_size_mb=0, local_source_dir=None, no_chunks=False):
     global UPDATE_AVAILABLE
     log(worker_id, "Thread active.")
     os.makedirs(temp_dir, exist_ok=True)
@@ -1358,6 +1362,307 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                 timeout=10
             )
         except: pass
+
+    # ==========================================================
+    # CHUNKED ENCODING — encode one time-slice (or the audio
+    # track) of a video that is being split across many workers.
+    # ==========================================================
+    def process_chunk(chunk):
+        job_id     = chunk['job_id']
+        kind       = chunk.get('kind', 'video')
+        idx        = int(chunk.get('chunk_index', 0))
+        start_sec  = float(chunk.get('start_sec', 0) or 0)
+        dur_sec    = float(chunk.get('duration_sec', 0) or 0)
+        total      = int(chunk.get('total_chunks', 0) or 0)
+        src_dur    = float(chunk.get('source_duration_sec', 0) or 0)
+        dl_url     = chunk['download_url']
+        profile    = chunk.get('content_profile', 'standard')
+        filename   = chunk.get('filename', job_id)
+        chunk_tag  = "audio" if kind == 'audio' else f"chunk {idx+1}"
+
+        def report_chunk(status, progress=0, error_msg=None):
+            payload = {
+                "job_id": job_id, "chunk_index": idx, "kind": kind,
+                "worker_id": worker_id, "status": status,
+                "progress": progress, "version": WORKER_VERSION,
+            }
+            if error_msg: payload["error"] = error_msg
+            try:
+                requests.post(f"{manager_url}/report_chunk", json=payload,
+                              headers=get_auth_headers(), timeout=10)
+            except: pass
+
+        # Prefer a direct file path when the source directory is mounted locally
+        if local_source_dir:
+            _cand = os.path.join(local_source_dir, job_id.replace('/', os.sep))
+            if os.path.isfile(_cand):
+                dl_url = os.path.abspath(_cand)
+        _is_local = not (dl_url.startswith('http://') or dl_url.startswith('https://'))
+
+        d = WORKER_DETAILS.get(worker_id)
+        if d is not None:
+            d.update({"file": f"{filename} [{chunk_tag}]",
+                      "phase": "Probe" if kind == 'audio' else "Encoding",
+                      "pct": 0, "job_start": time.time()})
+        log(worker_id, f"Chunk job: {filename} [{chunk_tag}/{total}] ({dur_sec/60:.1f}m slice)")
+
+        # Quota: estimate the share of the source this chunk will stream.
+        # The audio pass reads the whole (interleaved) file.
+        if quota_tracker:
+            try:
+                fsize = int(chunk.get('file_size') or 0)
+                if fsize > 0:
+                    est = fsize if (kind == 'audio' or src_dur <= 0) else int(fsize * dur_sec / src_dur)
+                    quota_tracker.add_usage(est)
+                    quota_tracker.force_save()
+            except: pass
+
+        ffmpeg_http_headers = f"X-Worker-Token: {WORKER_SECRET}\r\n"
+        input_flags = [] if _is_local else [
+            '-headers', ffmpeg_http_headers,
+            '-reconnect', '1', '-reconnect_streamed', '1',
+            '-reconnect_delay_max', '60', '-reconnect_on_network_error', '1',
+        ]
+        out_path = os.path.join(temp_dir, f"chunk_out{ENCODING_CONFIG['OUTPUT_EXT']}")
+        raw_log_path = os.path.join(temp_dir, "chunk_encode.log")
+        gz_log_path = os.path.join(temp_dir, "chunk_encode.log.gz")
+
+        base_crf = int(ENCODING_CONFIG["VIDEO_CRF"])
+        target_crf = (base_crf - 6) if profile == 'live_action' else base_crf
+        if profile == 'live_action':
+            log(worker_id, f"Live Action profile detected! Allocating 2x bitrate (CRF: {target_crf})")
+        if watermark and kind == 'video':
+            log(worker_id, "Watermark is skipped on chunked jobs to keep the final video consistent.", "WARN")
+
+        if kind == 'video':
+            # NOTE: -ss before -i = accurate input seek (decode starts at the exact
+            # cut point); -t bounds the slice. The manager snaps boundaries between
+            # two source frames and setpts re-zeroes each chunk's timeline, so the
+            # stream-copy concat is frame-exact (no dup/drop at boundaries, no A/V
+            # drift). No watermark/audio/subs here — the audio chunk carries those.
+            is_last = bool(chunk.get('is_last'))
+            seek_flags = ['-ss', f"{start_sec:.5f}"] if start_sec > 0 else []
+            limit_flags = [] if is_last else ['-t', f"{dur_sec:.5f}"]  # last chunk runs to EOF
+            cmd = ([FFMPEG_CMD] + input_flags + seek_flags +
+                   ['-y', '-i', dl_url] + limit_flags +
+                   ['-map', '0:v:0', '-an', '-sn',
+                    '-fps_mode', 'passthrough', '-avoid_negative_ts', 'make_zero',
+                    '-c:v', ENCODING_CONFIG["VIDEO_CODEC"],
+                    '-preset', ENCODING_CONFIG["VIDEO_PRESET"],
+                    '-crf', str(target_crf),
+                    '-pix_fmt', ENCODING_CONFIG["VIDEO_PIX_FMT"],
+                    '-vf', f"setpts=PTS-STARTPTS,{ENCODING_CONFIG['VIDEO_SCALE']}",
+                    '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+                    '-progress', 'pipe:1', out_path])
+            prog_total = dur_sec
+        else:
+            # Audio + subtitles for the whole file, encoded once.
+            update_status("Probing")
+            probe_data = None
+            for _pa in range(3):
+                try:
+                    cmd_probe = ([FFPROBE_CMD] if _is_local else [FFPROBE_CMD, '-headers', ffmpeg_http_headers]) + \
+                                ['-v', 'quiet', '-print_format', 'json', '-show_streams', '-show_format', dl_url]
+                    res = subprocess.run(cmd_probe, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                         encoding='utf-8', errors='replace', timeout=60)
+                    probe_data = json.loads(res.stdout)
+                    break
+                except Exception as _pe:
+                    if _pa < 2:
+                        time.sleep(5 * (_pa + 1))
+                    else:
+                        log(worker_id, f"Chunk probe failed: {_pe}", "ERROR")
+            if probe_data is None:
+                report_chunk("failed", error_msg="FFprobe failed after 3 attempts")
+                return
+
+            audio_index = None; subtitle_indices = []; audio_channels = 2
+            audio_streams = [s for s in probe_data.get('streams', []) if s['codec_type'] == 'audio']
+            if audio_streams:
+                audio_index = audio_streams[0]['index']
+                for s in audio_streams:
+                    if s.get('tags', {}).get('language', '').lower() in ['eng', 'en', 'english']:
+                        audio_index = s['index']; break
+                for s in audio_streams:
+                    if s['index'] == audio_index:
+                        try: audio_channels = int(s.get('channels', 2))
+                        except: pass
+                        break
+            for s in probe_data.get('streams', []):
+                if s['codec_type'] == 'subtitle':
+                    if s.get('codec_name', '').lower() in ['subrip', 'ass', 'webvtt', 'mov_text', 'text', 'srt', 'ssa']:
+                        subtitle_indices.append(s['index'])
+            if audio_index is None and not subtitle_indices:
+                report_chunk("failed", error_msg="No audio or subtitle streams found")
+                return
+
+            if audio_channels > 2:
+                audio_filter = "pan=mono|c0=0.5*FC+0.25*FL+0.25*FR+0.1*BL+0.1*BR,aresample=async=1"
+            elif audio_channels == 2:
+                audio_filter = "pan=mono|c0=0.5*c0+0.5*c1,aresample=async=1"
+            else:
+                audio_filter = "aresample=async=1"
+
+            cmd = [FFMPEG_CMD] + input_flags + ['-y', '-i', dl_url, '-vn']
+            if audio_index is not None:
+                cmd += ['-map', f'0:{audio_index}',
+                        '-c:a', ENCODING_CONFIG["AUDIO_CODEC"],
+                        '-b:a', ENCODING_CONFIG["AUDIO_BITRATE"],
+                        '-ac', ENCODING_CONFIG["AUDIO_CHANNELS"],
+                        '-af', audio_filter]
+            for sidx in subtitle_indices:
+                cmd += ['-map', f'0:{sidx}']
+            if subtitle_indices:
+                cmd += ['-c:s', ENCODING_CONFIG["SUBTITLE_CODEC"]]
+            cmd += ['-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+                    '-progress', 'pipe:1', out_path]
+            prog_total = src_dur if src_dur > 0 else dur_sec
+
+        # ---- Encode (2 attempts) ----
+        proc = None; log_buffer = []
+        report_chunk("processing", 0)
+        for _att in range(2):
+            if SHUTDOWN_EVENT.is_set(): break
+            if _att > 0:
+                log(worker_id, f"Chunk encode failed (rc={proc.returncode if proc else '?'}). Retrying in 15s...", "WARN")
+                update_status("Retrying")
+                for _ in range(15):
+                    if SHUTDOWN_EVENT.is_set(): break
+                    time.sleep(1)
+                if SHUTDOWN_EVENT.is_set(): break
+
+            popen_kwargs = {}
+            if platform.system() == 'Windows':
+                popen_kwargs['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                popen_kwargs['start_new_session'] = True
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    stdin=subprocess.DEVNULL, encoding='utf-8', errors='replace', **popen_kwargs)
+            assert proc.stdout is not None
+            with PROC_LOCK: ACTIVE_PROCS[worker_id] = proc
+
+            last_rep = 0; last_pct = 0; last_hb = time.time()
+            log_buffer = []
+            with open(raw_log_path, 'w', encoding='utf-8') as raw_log:
+                while True:
+                    if PAUSE_REQUESTED:
+                        if time.time() - last_hb > 30:
+                            report_chunk("processing", last_pct)
+                            last_hb = time.time()
+                        time.sleep(0.2)
+                        continue
+                    line = proc.stdout.readline()
+                    if line:
+                        log_buffer.append(line); log_buffer = log_buffer[-50:]
+                        raw_log.write(line); raw_log.flush()
+                    if not line and proc.poll() is not None: break
+                    if "out_time=" in line and "N/A" not in line and prog_total > 0:
+                        try:
+                            curr_sec = get_seconds(line.split('=')[1].strip())
+                            pct = min(100, int((curr_sec / prog_total) * 100))
+                            last_pct = pct
+                            if single_mode: print_progress(worker_id, curr_sec, prog_total, prefix='Enc')
+                            else: update_status(f"Enc {pct}%")
+                            if time.time() - last_rep > 10:
+                                report_chunk("processing", pct)
+                                last_rep = time.time(); last_hb = last_rep
+                        except: pass
+            with PROC_LOCK:
+                if worker_id in ACTIVE_PROCS: del ACTIVE_PROCS[worker_id]
+            if proc.returncode == 0 or SHUTDOWN_EVENT.is_set(): break
+
+        def upload_chunk_log():
+            try:
+                with open(raw_log_path, 'rb') as f_in, gzip.open(gz_log_path, 'wb') as f_out:
+                    shutil.copyfileobj(f_in, f_out)
+                chunk_log_id = f"{job_id}::chunk_{kind}_{idx}"
+                with open(gz_log_path, 'rb') as lf:
+                    requests.post(f"{manager_url}/upload_log",
+                                  files={'log_file': (f"{chunk_log_id.replace('/', '_')}.log.gz", lf)},
+                                  data={'job_id': chunk_log_id, 'worker_id': worker_id},
+                                  headers=get_auth_headers(), timeout=60)
+            except Exception as _le:
+                log(worker_id, f"Failed to upload chunk log: {_le}", "WARN")
+
+        def cleanup():
+            for _fp in [out_path, raw_log_path, gz_log_path]:
+                try:
+                    if os.path.exists(_fp): os.remove(_fp)
+                except: pass
+
+        if SHUTDOWN_EVENT.is_set() and (proc is None or proc.returncode != 0):
+            # Shutting down mid-encode: hand the chunk back without penalty
+            report_chunk("abandoned")
+            cleanup()
+            return
+
+        if proc is None or proc.returncode != 0 or not os.path.exists(out_path):
+            rc = proc.returncode if proc else -1
+            err_msg = f"FFmpeg exited with code {rc} ({chunk_tag})"
+            log(worker_id, err_msg, "ERROR")
+            report_chunk("failed", error_msg=err_msg)
+            report_error(job_id, "chunk_encode_failure", err_msg,
+                         "\n".join(l.rstrip() for l in log_buffer))
+            upload_chunk_log()
+            cleanup()
+            d = WORKER_DETAILS.get(worker_id)
+            if d is not None: d["phase"] = "Failed"
+            return
+
+        # ---- Upload (3 attempts) ----
+        chunk_bytes = os.path.getsize(out_path)
+        log(worker_id, f"Chunk done ({chunk_bytes/1024/1024:.2f} MB). Uploading...")
+        update_status("Up 0%")
+        upload_ok = False
+        upload_final = False  # 409/400: manager already resolved this chunk, don't re-report
+        for up_attempt in range(3):
+            if SHUTDOWN_EVENT.is_set(): break
+            try:
+                with open(out_path, 'rb') as f:
+                    r = requests.post(f"{manager_url}/upload_chunk",
+                                      files={'file': (f"chunk_{kind}_{idx}.mp4", f)},
+                                      data={'job_id': job_id, 'chunk_index': idx,
+                                            'kind': kind, 'worker_id': worker_id},
+                                      headers=get_auth_headers(), timeout=300)
+                if r.status_code == 200:
+                    upload_ok = True; break
+                elif r.status_code == 409:
+                    # Job was reassigned/reset while we encoded — drop it quietly
+                    log(worker_id, f"Chunk no longer needed by manager ({chunk_tag}).", "WARN")
+                    upload_final = True; break
+                elif r.status_code == 400:
+                    # Failed manager-side verification; failure already registered there
+                    _msg = ""
+                    try: _msg = r.json().get('message', '')
+                    except: pass
+                    log(worker_id, f"Chunk rejected by manager: {_msg}", "WARN")
+                    upload_final = True; break
+                else:
+                    log(worker_id, f"Chunk upload rejected: {r.status_code}", "WARN")
+            except Exception as e:
+                log(worker_id, f"Chunk upload attempt {up_attempt+1} failed: {e}", "WARN")
+                time.sleep(10)
+
+        if upload_ok:
+            log(worker_id, f"Chunk complete ({chunk_tag}).")
+            d = WORKER_DETAILS.get(worker_id)
+            if d is not None:
+                d.update({"phase": "Done", "pct": 100})
+                d["jobs_done"] += 1
+            with STATS_LOCK:
+                SESSION_STATS["jobs_done"] += 1
+                SESSION_STATS["bytes_uploaded"] += chunk_bytes
+        elif SHUTDOWN_EVENT.is_set():
+            report_chunk("abandoned")
+        elif not upload_final:
+            err_msg = "Chunk upload failed after 3 attempts"
+            log(worker_id, err_msg, "ERROR")
+            report_chunk("failed", error_msg=err_msg)
+            d = WORKER_DETAILS.get(worker_id)
+            if d is not None: d["phase"] = "Failed"
+
+        upload_chunk_log()
+        cleanup()
 
     while not SHUTDOWN_EVENT.is_set():
         if PAUSE_REQUESTED:
@@ -1658,7 +1963,32 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
             if check_version(manager_url):
                 UPDATE_AVAILABLE = True; SHUTDOWN_EVENT.set(); break
 
-            try: 
+            # =========================================================
+            # CHUNKED MODE: ask for a slice of a split video first, so
+            # the whole swarm works on one file at a time. Falls back
+            # to classic whole-file jobs when nothing is chunkable.
+            # =========================================================
+            if not no_chunks and _CHUNK_SUPPORT["ok"]:
+                try:
+                    params = {'worker_id': worker_id, 'version': WORKER_VERSION}
+                    if series_id: params['series_id'] = series_id
+                    if max_size_mb and max_size_mb > 0: params['max_size_mb'] = max_size_mb
+                    rc = requests.get(f"{manager_url}/get_chunk", params=params, headers=get_auth_headers(), timeout=30)
+                    if rc.status_code == 404:
+                        _CHUNK_SUPPORT["ok"] = False
+                        log(worker_id, "Manager has no chunk support — using whole-file mode.")
+                    elif rc.status_code == 401:
+                        log(worker_id, "AUTH FAILED: Worker Secret is invalid or missing.", "CRITICAL")
+                        SHUTDOWN_EVENT.set(); break
+                    elif rc.status_code == 200:
+                        cdata = rc.json()
+                        if cdata.get("status") == "ok" and cdata.get("chunk"):
+                            process_chunk(cdata["chunk"])
+                            continue
+                except Exception:
+                    pass  # chunk fetch failed — fall through to /get_job
+
+            try:
                 params = {'worker_id': worker_id, 'version': WORKER_VERSION}
                 if series_id: params['series_id'] = series_id
                 if max_size_mb and max_size_mb > 0: params['max_size_mb'] = max_size_mb
@@ -2243,7 +2573,7 @@ def run_worker(args):
         WORKER_DETAILS[worker_id] = {"file": "-", "phase": "Starting", "pct": 0, "job_start": 0.0, "jobs_done": 0}
         temp_dir = f"./temp_encode_{base_workername}_{i+1}"
 
-        t = threading.Thread(target=worker_task, args=(worker_id, manager_url, temp_dir, quota_tracker, single_mode, args.series_id, args.watermark, args.max_size_mb, getattr(args, 'local_source', None)))
+        t = threading.Thread(target=worker_task, args=(worker_id, manager_url, temp_dir, quota_tracker, single_mode, args.series_id, args.watermark, args.max_size_mb, getattr(args, 'local_source', None), getattr(args, 'no_chunks', False)))
         t.daemon = True
         t.start()
         threads.append(t)
@@ -2443,5 +2773,8 @@ if __name__ == "__main__":
                         help="Path to the source media directory on this machine. When set and the "
                              "source file exists locally, it is read directly instead of streaming "
                              "over HTTP (useful when this worker runs on the server itself).")
+    parser.add_argument("--no-chunks", action="store_true", default=False,
+                        help="Opt out of chunked encoding: always take whole files instead of "
+                             "time-slices of videos split across multiple workers.")
     args = parser.parse_args()
     run_worker(args)
