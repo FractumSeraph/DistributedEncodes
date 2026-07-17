@@ -400,6 +400,7 @@ Pulls the latest code from git and restarts the service. Run on the manager host
 ## Security Notes
 
 - Set a strong `WORKER_SECRET` and `ADMIN_PASS` in `config.py` before exposing the server publicly.
+- `REQUIRE_WORKER_TOKEN` (default **True**) makes `WORKER_SECRET` an actual gate: worker endpoints now reject requests that present **no** token, not just wrong ones. Regular workers always send the token, so they are unaffected. Set it to `False` only if you intentionally run a fully open, anonymous-worker manager.
 - Put the server behind a reverse proxy (nginx / Caddy) with HTTPS in production.
 - `ADMIN_PASS` is used for HTTP Basic Auth on the `/admin` route. Do not reuse a password you use elsewhere.
 - Workers are validated against a minimum version (`MIN_CLIENT_VERSION` in `manager.py`). Outdated workers are denied jobs until they auto-update.

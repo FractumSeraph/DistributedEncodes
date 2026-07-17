@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.2.0"
+WORKER_VERSION = "3.3.0"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -1669,6 +1669,11 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
         if PAUSE_REQUESTED:
              time.sleep(1); continue
 
+        # Reset per-iteration job id so the catch-all handler below can't
+        # mis-report a failure against the PREVIOUS (already-completed) job
+        # when an error happens before a new job is assigned.
+        job_id = None
+
         try:
             if quota_tracker and quota_tracker.check_cap():
                 wait_sec = quota_tracker.get_wait_time()
@@ -1984,7 +1989,23 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                     elif rc.status_code == 200:
                         cdata = rc.json()
                         if cdata.get("status") == "ok" and cdata.get("chunk"):
-                            process_chunk(cdata["chunk"])
+                            _ch = cdata["chunk"]
+                            try:
+                                process_chunk(_ch)
+                            except Exception as _ce:
+                                # Release the chunk immediately instead of letting
+                                # it sit 'processing' until the 30-min stale sweep
+                                # (which would stall the whole split-video pipeline
+                                # the other threads are converged on).
+                                log(worker_id, f"Chunk processing crashed: {_ce}", "ERROR")
+                                try:
+                                    requests.post(f"{manager_url}/report_chunk", json={
+                                        "job_id": _ch.get("job_id"), "chunk_index": _ch.get("chunk_index"),
+                                        "kind": _ch.get("kind", "video"), "worker_id": worker_id,
+                                        "status": "failed", "error": str(_ce)[:512],
+                                        "version": WORKER_VERSION,
+                                    }, headers=get_auth_headers(), timeout=10)
+                                except Exception: pass
                             continue
                         elif cdata.get("status") == "retry":
                             # Manager is splitting a video right now — wait for
@@ -2036,7 +2057,13 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                 if d is not None:
                     d.update({"file": job['filename'], "phase": "Probe", "pct": 0, "job_start": time.time()})
 
-                local_dst = os.path.join(temp_dir, f"encoded{ENCODING_CONFIG['OUTPUT_EXT']}")
+                # Per-job output filename so a leftover resume checkpoint can
+                # never point at a DIFFERENT job's partial data. Previously every
+                # job in a thread wrote to the same encoded.mp4, so a stale
+                # checkpoint for job A could be resumed against job B's bytes and
+                # uploaded as A — silent content corruption.
+                _dst_safe_id = re.sub(r'[^a-zA-Z0-9_-]', '_', str(job_id))[:80]
+                local_dst = os.path.join(temp_dir, f"encoded_{_dst_safe_id}{ENCODING_CONFIG['OUTPUT_EXT']}")
 
                 # FFmpeg auth header string (format required by libavformat HTTP demuxer)
                 ffmpeg_http_headers = f"X-Worker-Token: {WORKER_SECRET}\r\n"
@@ -2470,7 +2497,8 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
             err_tb = traceback.format_exc()
             log(worker_id, f"Error: {err_str}", "CRITICAL")
             try:
-                if 'job_id' in locals():
+                # Only report against a job actually assigned this iteration.
+                if job_id:
                     post_status("failed", error_msg=err_str)
                     report_error(job_id, "exception", err_str, err_tb)
             except: pass
@@ -2791,7 +2819,18 @@ def run_worker(args):
                 try: _input_src.close()
                 except: pass
 
-    if UPDATE_AVAILABLE: apply_update(manager_url)
+    if UPDATE_AVAILABLE:
+        # Before re-exec'ing into the new version, make sure every worker
+        # thread has actually stopped and its ffmpeg child is dead. Otherwise
+        # a sibling thread's ffmpeg (started with start_new_session=True)
+        # survives the execv and keeps writing its output file while the
+        # restarted worker reuses the same temp dir — a corrupt upload.
+        SHUTDOWN_EVENT.set()
+        for t in threads:
+            t.join(timeout=60)
+        kill_processes()
+        time.sleep(1)  # let the OS reap terminated ffmpeg children
+        apply_update(manager_url)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

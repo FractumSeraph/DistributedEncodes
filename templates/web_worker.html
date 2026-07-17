@@ -217,9 +217,13 @@
     let isRunning = false;
     let worker = null;
     let currentWorkerId = "";
-    
+    let currentJobId = null;   // the job this node is actively encoding, for stop-time release
+
+    // Must be >= manager MIN_CLIENT_VERSION or /get_job returns "Update Required".
+    const WEB_WORKER_VERSION = "3.3.0";
+
     // Track if worker is ready (module initialized)
-    let isWorkerReady = false; 
+    let isWorkerReady = false;
 
     async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -233,6 +237,20 @@
     function stopLoop() {
         isRunning = false;
         log("STOP command received. Finishing current job...", 'err');
+        // Release the in-flight job so it doesn't sit 'processing' until the
+        // manager's ~10-min stale sweep before another worker can take it.
+        if (currentJobId) {
+            const tok = new URLSearchParams(location.search).get('token');
+            try {
+                fetch('/report_status' + (tok ? ('?token=' + encodeURIComponent(tok)) : ''), {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ job_id: currentJobId, worker_id: currentWorkerId,
+                                           status: 'failed', error: 'Browser worker stopped',
+                                           version: WEB_WORKER_VERSION })
+                });
+            } catch (e) { /* best effort */ }
+            currentJobId = null;
+        }
         if (worker) {
             worker.terminate();
             worker = null;
@@ -288,16 +306,28 @@
         
         log(`Worker [${currentWorkerId}] Started. Polling for jobs...`, 'succ');
 
+        // Optional worker token: supply via ?token=... in the page URL when the
+        // manager enforces REQUIRE_WORKER_TOKEN. Kept out of the page source so
+        // the shared secret isn't baked into a public asset.
+        const _urlToken = new URLSearchParams(location.search).get('token');
+        const _authQS = _urlToken ? ('&token=' + encodeURIComponent(_urlToken)) : '';
+
         while (isRunning) {
             try {
-                // A. GET JOB
-                // Request max 256MB initially to be safe? 
-                // The worker has 1GB heap, but overhead matters. 
-                // Let's try 512MB again, hoping separate thread helps.
-                const res = await fetch('/get_job?max_size_mb=512');
+                // A. GET JOB — must send the version param or the manager's
+                // MIN_CLIENT_VERSION gate returns "Update Required".
+                const res = await fetch(`/get_job?max_size_mb=512&version=${encodeURIComponent(WEB_WORKER_VERSION)}${_authQS}`);
                 const data = await res.json();
 
+                if (res.status === 401) {
+                    log("Manager requires a worker token. Append ?token=YOUR_SECRET to this page's URL.", 'err');
+                    await sleep(15000);
+                    continue;
+                }
+
                 if (data.status === 'empty') {
+                    // Distinguish a real empty queue from a version rejection.
+                    if (data.message) log("Manager: " + data.message, 'err');
                     await sleep(10000);
                     continue;
                 }
@@ -305,11 +335,13 @@
                 if (data.status === 'ok') {
                     const job = data.job;
                     job.worker_id = currentWorkerId;
-                    
+                    currentJobId = job.id;
+
                     log(`STARTING JOB: ${job.filename} (${job.id})`, 'sys');
 
                     // Run in worker and wait
                     await runJobInWorker(job);
+                    currentJobId = null;
                     log("Job Cycle Complete.", 'succ');
                     
                     // Optional: Restart worker every few jobs to clear fragmentation?

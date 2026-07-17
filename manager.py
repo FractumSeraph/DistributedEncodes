@@ -84,6 +84,14 @@ try:
     except ImportError:
         CHUNK_DURATION_SEC = 300
 
+    # [SECURITY] When True, worker endpoints require a valid X-Worker-Token
+    # (or ?token=). Requests with NO token are rejected, not waved through.
+    # Regular workers already send the token, so they are unaffected.
+    try:
+        from config import REQUIRE_WORKER_TOKEN
+    except ImportError:
+        REQUIRE_WORKER_TOKEN = True
+
 except ImportError:
     print("[!] Critical Error: config.py not found.")
     exit(1)
@@ -151,15 +159,40 @@ class DatabaseHandler:
                 self.mode = 'disk'
 
     def _load_to_ram(self):
-        """Copies Disk DB to RAM at startup."""
+        """Load the DB into RAM at startup.
+
+        A plain restart (systemd) does NOT clear /dev/shm, so a RAM copy from
+        the previous run can survive and be NEWER than the disk file (the disk
+        sync only runs every 60s). Blindly copying disk->ram would roll back up
+        to a minute of completed jobs and earnings. So: if the surviving RAM
+        file is newer, recover it to disk first instead of overwriting it.
+        """
         with db_lock:
             # Ensure disk file exists to copy
             if not os.path.exists(self.disk_path):
                 open(self.disk_path, 'a').close()
-            
+
+            if (os.path.exists(self.ram_path)
+                    and os.path.getmtime(self.ram_path) > os.path.getmtime(self.disk_path) + 1):
+                print("[!] DB Mode: surviving RAM copy is newer than disk — recovering it to disk.")
+                try:
+                    src = sqlite3.connect(self.ram_path)
+                    dst = sqlite3.connect(self.disk_path)
+                    with dst:
+                        src.backup(dst)
+                    dst.close(); src.close()
+                except Exception as e:
+                    print(f"[!] RAM->disk recovery failed ({e}); keeping RAM copy as-is.")
+                # RAM copy is already the freshest; leave it in place.
+                try:
+                    os.chmod(self.ram_path, 0o666)
+                except Exception:
+                    pass
+                return
+
             # Copy to RAM
             shutil.copy2(self.disk_path, self.ram_path)
-            
+
             # Set permissions
             try:
                 os.chmod(self.ram_path, 0o666)
@@ -296,7 +329,12 @@ def csrf_protect():
         origin = request.headers.get('Origin')
         referer = request.headers.get('Referer')
         target = origin or referer or ""
-        if request.host not in target:
+        # Compare the actual host component, not a substring: a naive
+        # `request.host not in target` passes for evil-<host>.attacker.com
+        # because it merely contains the host as a substring.
+        from urllib.parse import urlparse
+        target_host = urlparse(target).netloc
+        if not target_host or target_host != request.host:
              return jsonify({"status": "error", "message": "CSRF Blocked: Origin Mismatch"}), 403
 
 def check_auth(u, p):
@@ -321,8 +359,15 @@ def requires_worker_auth(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         token = request.headers.get('X-Worker-Token') or request.args.get('token')
-        if token is None: return f(*args, **kwargs)
-        if token != WORKER_SECRET:
+        if token is None:
+            # Previously a missing token was waved through entirely, so the
+            # shared secret gated nothing. When REQUIRE_WORKER_TOKEN is on we
+            # now reject tokenless requests too (regular workers always send
+            # one). Left off => the old open behavior for a fully public setup.
+            if REQUIRE_WORKER_TOKEN:
+                return jsonify({"status": "error", "message": "Worker token required"}), 401
+            return f(*args, **kwargs)
+        if not secrets.compare_digest(str(token), str(WORKER_SECRET)):
             return jsonify({"status": "error", "message": "Unauthorized Worker"}), 401
         return f(*args, **kwargs)
     return decorated
@@ -813,8 +858,21 @@ def _assemble_job(job_id):
         with db_lock:
             conn = db_handler.get_connection()
             try:
-                conn.execute("UPDATE jobs SET status='completed', progress=100, duration=?, worker_id=?, last_updated=? WHERE id=?",
-                             (int(src_dur / 60), f"(chunked x{len(workers)})", datetime.now(), job_id))
+                c = conn.cursor()
+                # Guard: assembly can take up to an hour (ffmpeg concat). If an
+                # admin reset/deleted the job meanwhile (status left 'processing'
+                # + chunked=1), don't resurrect it or move the file over a job
+                # someone re-claimed whole.
+                c.execute("UPDATE jobs SET status='completed', progress=100, duration=?, worker_id=?, last_updated=? "
+                          "WHERE id=? AND status='processing' AND COALESCE(chunked,0)=1",
+                          (int(src_dur / 60), f"(chunked x{len(workers)})", datetime.now(), job_id))
+                if c.rowcount != 1:
+                    conn.commit()
+                    log_event("WARN", "Assembled file discarded: job was reset/taken during assembly.", job_id)
+                    try:
+                        if os.path.exists(save_path): os.remove(save_path)
+                    except Exception: pass
+                    return
                 if warn:
                     conn.execute("UPDATE jobs SET warnings = COALESCE(warnings || ' | ', '') || ? WHERE id=?",
                                  (warn, job_id))
@@ -1095,30 +1153,52 @@ def _scan_and_queue_inner():
         # Commit any remaining files
         if remote_batch:
             process_batch(remote_batch)
-            
+
+    # Folder set may have changed — refresh the cached series list.
+    try:
+        get_series_list(force_refresh=True)
+    except Exception:
+        pass
     print("[*] Scan complete.")
 
-def get_series_list():
-    try:
-        # [FIX] Allow series listing even in hybrid mode
-        if not os.path.exists(SOURCE_DIRECTORY): return [], []
-        
-        folders = sorted([d for d in os.listdir(SOURCE_DIRECTORY) if os.path.isdir(os.path.join(SOURCE_DIRECTORY, d))])
-        folder_set = set(folders)
-        mapping = {}
-        stale_keys = []
-        
-        if os.path.exists('series_names.json'):
-            try:
-                mapping = json.load(open('series_names.json', 'r'))
-                stale_keys = [k for k in mapping if k not in folder_set]
-                if stale_keys:
-                    print(f"[!] series_names.json has {len(stale_keys)} stale key(s): {', '.join(stale_keys[:5])}")
-            except: pass
-            
-        return [{"id": i+1, "folder": f, "name": mapping.get(f, f)} for i, f in enumerate(folders)], stale_keys
-    except:
-        return [], []
+# Cache for get_series_list: it hits the filesystem (a directory listing + a
+# stat per entry + a JSON read), and it was being called on every /get_job and
+# /get_chunk poll that carried a series_id — dozens of listings per second, and
+# painful when SOURCE_DIRECTORY is a network mount. 60s TTL, like _BANNED_CACHE.
+_SERIES_CACHE = None
+_SERIES_CACHE_TIME = 0.0
+_SERIES_CACHE_LOCK = threading.Lock()
+
+def get_series_list(force_refresh=False):
+    global _SERIES_CACHE, _SERIES_CACHE_TIME
+    with _SERIES_CACHE_LOCK:
+        now = time.time()
+        if not force_refresh and _SERIES_CACHE is not None and now - _SERIES_CACHE_TIME < 60:
+            return _SERIES_CACHE
+        try:
+            # [FIX] Allow series listing even in hybrid mode
+            if not os.path.exists(SOURCE_DIRECTORY):
+                _SERIES_CACHE = ([], []); _SERIES_CACHE_TIME = now
+                return _SERIES_CACHE
+
+            folders = sorted([d for d in os.listdir(SOURCE_DIRECTORY) if os.path.isdir(os.path.join(SOURCE_DIRECTORY, d))])
+            folder_set = set(folders)
+            mapping = {}
+            stale_keys = []
+
+            if os.path.exists('series_names.json'):
+                try:
+                    mapping = json.load(open('series_names.json', 'r'))
+                    stale_keys = [k for k in mapping if k not in folder_set]
+                    if stale_keys:
+                        print(f"[!] series_names.json has {len(stale_keys)} stale key(s): {', '.join(stale_keys[:5])}")
+                except: pass
+
+            result = ([{"id": i+1, "folder": f, "name": mapping.get(f, f)} for i, f in enumerate(folders)], stale_keys)
+            _SERIES_CACHE = result; _SERIES_CACHE_TIME = now
+            return result
+        except:
+            return _SERIES_CACHE if _SERIES_CACHE is not None else ([], [])
 
 # ==============================================================================
 # DATABASE INIT
@@ -1196,6 +1276,14 @@ def init_db():
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_chunks_status ON chunks(status)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_chunks_job ON chunks(job_id)")
+        # Composite index for the job-pick query (status + source_type filter,
+        # ORDER BY id) so /get_job and _claim_job_for_split do an index seek
+        # instead of scanning + sorting the whole queued set every poll.
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_jobs_pick ON jobs(status, source_type, id)")
+        # last_updated drives the dashboard history + admin job list sort.
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_jobs_last_updated ON jobs(last_updated)")
+        # id drives the system_logs prune + the LIMIT view.
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_syslogs_id ON system_logs(id)")
 
         # FractumCoin earnings ledger: one row per VERIFIED upload (whole file
         # or video chunk). Durable payout record — unlike the jobs/chunks
@@ -1216,6 +1304,8 @@ def init_db():
         ''')
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_earnings_wallet ON earnings(wallet)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_earnings_worker ON earnings(worker_id)")
+        # timestamp drives the 24h/30d scoreboard filters.
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_earnings_ts ON earnings(timestamp)")
 
         # One-time backfill so historical scoreboard credit carries over into
         # the ledger (wallet unknown for past work — recorded as NULL).
@@ -1628,6 +1718,22 @@ def upload_result():
         duration = 0
     
     if 'file' in request.files and job_id:
+        # Reject stale/misdirected uploads BEFORE touching disk: a job that was
+        # since split into chunks (chunked=1) or already completed must not be
+        # overwritten by a straggler whole-file worker.
+        with db_lock:
+            conn = db_handler.get_connection()
+            try:
+                c = conn.cursor()
+                c.execute("SELECT status, COALESCE(chunked, 0) FROM jobs WHERE id=?", (job_id,))
+                jrow = c.fetchone()
+            finally:
+                conn.close()
+        if jrow is None:
+            return jsonify({"status": "error", "message": "unknown job"}), 404
+        if jrow[1] == 1 or jrow[0] == 'completed':
+            return jsonify({"status": "stale", "message": "Job no longer accepts a whole-file upload"}), 409
+
         new_filename = os.path.splitext(job_id)[0] + ".mp4"
         quarantine_dir = os.path.join("temp_uploads", "quarantine")
         os.makedirs(quarantine_dir, exist_ok=True)
@@ -1640,8 +1746,15 @@ def upload_result():
             os.remove(temp_path)
             with db_lock:
                 conn = db_handler.get_connection()
-                conn.execute("UPDATE jobs SET status='failed', last_updated=? WHERE id=?", (datetime.now(), job_id))
-                conn.commit(); conn.close()
+                try:
+                    # Count the failure so a permanently-broken source doesn't
+                    # loop forever through the new auto-requeue path.
+                    conn.execute("UPDATE jobs SET status='failed', fail_count=COALESCE(fail_count,0)+1, "
+                                 "last_updated=? WHERE id=? AND COALESCE(chunked,0)=0", (datetime.now(), job_id))
+                    conn.execute("UPDATE jobs SET status='permanently_failed' WHERE id=? AND COALESCE(fail_count,0) >= 5", (job_id,))
+                    conn.commit()
+                finally:
+                    conn.close()
             return jsonify({"status": "error", "message": reason}), 400
 
         save_path = os.path.abspath(os.path.join(COMPLETED_DIRECTORY, new_filename))
@@ -1649,15 +1762,17 @@ def upload_result():
              os.remove(temp_path); return jsonify({"status": "error"}), 403
 
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        shutil.move(temp_path, save_path) 
+        shutil.move(temp_path, save_path)
 
         with db_lock:
             conn = db_handler.get_connection()
             try:
                 c = conn.cursor()
+                # Guard chunked=0 again (race: split may have happened during
+                # the encode verify/move) and skip double-credit on re-uploads.
                 c.execute("SELECT status FROM jobs WHERE id=?", (job_id,))
                 prev = c.fetchone()
-                c.execute("UPDATE jobs SET status='completed', progress=100, worker_id=?, last_updated=?, duration=? WHERE id=?",
+                c.execute("UPDATE jobs SET status='completed', progress=100, worker_id=?, last_updated=?, duration=? WHERE id=? AND COALESCE(chunked,0)=0",
                     (worker_id, datetime.now(), duration, job_id))
                 # FractumCoin credit: minutes come from ffprobe of the delivered
                 # file, not the worker's claim. A re-upload to an already
@@ -1935,19 +2050,29 @@ def report_status():
     with db_lock:
         conn = db_handler.get_connection()
         try:
-            # COALESCE(chunked,0)=0 guard: a whole-file worker whose timed-out
-            # job was since split into chunks must not clobber the chunked
-            # job's status/worker (that would stall assignment and assembly).
-            sql = "UPDATE jobs SET status=?, worker_id=?, progress=?, last_updated=? WHERE id=? AND COALESCE(chunked, 0)=0"
-            params = [status, worker_id, d.get('progress',0), datetime.now(), d.get('job_id')]
+            job_id_val = d.get('job_id')
+            # Guards on every update:
+            #  - COALESCE(chunked,0)=0: never touch a job that was split into
+            #    chunks (that would stall assignment/assembly).
+            #  - worker_id=?: only the CURRENT owner may report. A stale worker
+            #    whose job was reassigned/completed can't revert it.
+            #  - status NOT IN terminal: never resurrect a completed or
+            #    permanently_failed job.
+            base_where = ("WHERE id=? AND COALESCE(chunked, 0)=0 AND worker_id=? "
+                          "AND status NOT IN ('completed', 'permanently_failed')")
+            sql = f"UPDATE jobs SET status=?, progress=?, last_updated=? {base_where}"
+            params = [status, d.get('progress', 0), datetime.now(), job_id_val, worker_id]
             if d.get('duration', 0) > 0:
-                sql = "UPDATE jobs SET status=?, worker_id=?, progress=?, last_updated=?, duration=? WHERE id=? AND COALESCE(chunked, 0)=0"
-                params.insert(4, d.get('duration'))
+                sql = f"UPDATE jobs SET status=?, progress=?, last_updated=?, duration=? {base_where}"
+                params.insert(3, d.get('duration'))
             conn.execute(sql, tuple(params))
             if status == 'failed':
-                job_id_val = d.get('job_id')
-                conn.execute("UPDATE jobs SET fail_count = COALESCE(fail_count, 0) + 1 WHERE id=? AND COALESCE(chunked, 0)=0", (job_id_val,))
-                conn.execute("UPDATE jobs SET status='permanently_failed' WHERE id=? AND COALESCE(fail_count, 0) >= 5 AND COALESCE(chunked, 0)=0", (job_id_val,))
+                # Only count the failure if this worker actually owned the job
+                # (the UPDATE above changed the row). Re-read to confirm.
+                conn.execute("UPDATE jobs SET fail_count = COALESCE(fail_count, 0) + 1 "
+                             "WHERE id=? AND COALESCE(chunked, 0)=0 AND worker_id=? AND status='failed'",
+                             (job_id_val, worker_id))
+                conn.execute("UPDATE jobs SET status='permanently_failed' WHERE id=? AND COALESCE(fail_count, 0) >= 5 AND status='failed'", (job_id_val,))
             conn.commit()
         finally:
             conn.close()
@@ -1966,8 +2091,11 @@ def api_stats():
             # the audio helper pass earns 0 so chunked jobs count exactly
             # once). The ledger is append-only, so scores survive retries,
             # archives, and chunk cleanup.
-            earn_filter = (" AND timestamp > datetime('now', '-1 day')" if filter_val == '24h'
-                           else " AND timestamp > datetime('now', '-30 days')" if filter_val == '30d' else "")
+            # timestamps are stored with Python datetime.now() (LOCAL time), so
+            # the window must also be computed in local time — datetime('now')
+            # alone is UTC and would skew the window by the server's offset.
+            earn_filter = (" AND timestamp > datetime('now', 'localtime', '-1 day')" if filter_val == '24h'
+                           else " AND timestamp > datetime('now', 'localtime', '-30 days')" if filter_val == '30d' else "")
             c.execute(f"""
                 SELECT CASE WHEN instr(worker_id, '-') > 0 THEN substr(worker_id, 1, instr(worker_id, '-') - 1) ELSE worker_id END as worker_id,
                        CAST(SUM(minutes) AS INTEGER) as total_minutes,
@@ -2020,11 +2148,23 @@ def api_stats():
 @app.route('/api/all_jobs')
 @requires_auth
 def api_all_jobs():
+    # Bounded + optionally status-filtered: returning every one of thousands of
+    # rows as JSON on each admin refresh serialized megabytes under db_lock.
+    try:
+        limit = min(int(request.args.get('limit', 2000)), 10000)
+    except (ValueError, TypeError):
+        limit = 2000
+    status_filter = request.args.get('status')
     with db_lock:
         conn = db_handler.get_connection(); conn.row_factory = sqlite3.Row
         try:
             c = conn.cursor()
-            c.execute("SELECT id, status, worker_id, worker_version, last_updated, warnings FROM jobs ORDER BY last_updated DESC")
+            if status_filter:
+                c.execute("SELECT id, status, worker_id, worker_version, last_updated, warnings FROM jobs "
+                          "WHERE status=? ORDER BY last_updated DESC LIMIT ?", (status_filter, limit))
+            else:
+                c.execute("SELECT id, status, worker_id, worker_version, last_updated, warnings FROM jobs "
+                          "ORDER BY last_updated DESC LIMIT ?", (limit,))
             jobs = [dict(r) for r in c.fetchall()]
         finally:
             conn.close()
@@ -2243,6 +2383,29 @@ def maintenance_loop():
                     for (jid,) in cursor.fetchall():
                         _requeue_job_whole(conn, jid, "no chunk activity for 6h",
                                            penalize=False, disable_chunking=False)
+
+                    # Auto-requeue transiently-failed jobs (fail_count < 5) after
+                    # a short cooldown. Previously a worker-reported 'failed' left
+                    # the job dead until an admin manually clicked Reset Failed;
+                    # /get_job only serves 'queued'. The fail_count<5 retry design
+                    # was never actually wired up for this path.
+                    failed_cutoff = now - timedelta(minutes=10)
+                    cursor.execute(
+                        "UPDATE jobs SET status='queued', progress=0, worker_id=NULL, started_at=NULL, last_updated=? "
+                        "WHERE status='failed' AND COALESCE(fail_count, 0) < 5 AND COALESCE(chunked, 0)=0 AND last_updated < ?",
+                        (now, failed_cutoff))
+                    if cursor.rowcount > 0:
+                        logs_to_write.append(("INFO", f"Auto-requeued {cursor.rowcount} transiently-failed job(s).", None))
+
+                    # Prune the ever-growing system_logs table (nothing else does).
+                    # Keep the most recent ~50k rows; the id index makes this cheap.
+                    cursor.execute("SELECT MAX(id) FROM system_logs")
+                    _max_log_id = cursor.fetchone()[0]
+                    if _max_log_id and _max_log_id > 50000:
+                        cursor.execute("DELETE FROM system_logs WHERE id < ?", (_max_log_id - 50000,))
+                        if cursor.rowcount > 0:
+                            logs_to_write.append(("INFO", f"Pruned {cursor.rowcount} old system_logs row(s).", None))
+
                     conn.commit()
                 finally:
                     conn.close()

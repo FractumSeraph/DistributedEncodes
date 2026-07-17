@@ -185,8 +185,6 @@ async function processJob(job) {
             '-strict', '-2',
             '-c:s', 'mov_text',
             '-svtav1-params', 'logical-processors=2',
-
-'
             outputPath
         ];
 
