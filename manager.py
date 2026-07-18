@@ -25,7 +25,7 @@ except ImportError:
     exit(1)
 
 # Flask & Extensions
-from flask import Flask, request, jsonify, render_template, send_from_directory, send_file, Response, abort
+from flask import Flask, request, jsonify, render_template, send_from_directory, send_file, Response, abort, after_this_request
 from werkzeug.exceptions import HTTPException
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -83,6 +83,14 @@ try:
         from config import CHUNK_DURATION_SEC
     except ImportError:
         CHUNK_DURATION_SEC = 300
+
+    # [SECURITY] When True, worker endpoints require a valid X-Worker-Token
+    # (or ?token=). Requests with NO token are rejected, not waved through.
+    # Regular workers already send the token, so they are unaffected.
+    try:
+        from config import REQUIRE_WORKER_TOKEN
+    except ImportError:
+        REQUIRE_WORKER_TOKEN = True
 
 except ImportError:
     print("[!] Critical Error: config.py not found.")
@@ -151,15 +159,40 @@ class DatabaseHandler:
                 self.mode = 'disk'
 
     def _load_to_ram(self):
-        """Copies Disk DB to RAM at startup."""
+        """Load the DB into RAM at startup.
+
+        A plain restart (systemd) does NOT clear /dev/shm, so a RAM copy from
+        the previous run can survive and be NEWER than the disk file (the disk
+        sync only runs every 60s). Blindly copying disk->ram would roll back up
+        to a minute of completed jobs and earnings. So: if the surviving RAM
+        file is newer, recover it to disk first instead of overwriting it.
+        """
         with db_lock:
             # Ensure disk file exists to copy
             if not os.path.exists(self.disk_path):
                 open(self.disk_path, 'a').close()
-            
+
+            if (os.path.exists(self.ram_path)
+                    and os.path.getmtime(self.ram_path) > os.path.getmtime(self.disk_path) + 1):
+                print("[!] DB Mode: surviving RAM copy is newer than disk — recovering it to disk.")
+                try:
+                    src = sqlite3.connect(self.ram_path)
+                    dst = sqlite3.connect(self.disk_path)
+                    with dst:
+                        src.backup(dst)
+                    dst.close(); src.close()
+                except Exception as e:
+                    print(f"[!] RAM->disk recovery failed ({e}); keeping RAM copy as-is.")
+                # RAM copy is already the freshest; leave it in place.
+                try:
+                    os.chmod(self.ram_path, 0o666)
+                except Exception:
+                    pass
+                return
+
             # Copy to RAM
             shutil.copy2(self.disk_path, self.ram_path)
-            
+
             # Set permissions
             try:
                 os.chmod(self.ram_path, 0o666)
@@ -296,7 +329,12 @@ def csrf_protect():
         origin = request.headers.get('Origin')
         referer = request.headers.get('Referer')
         target = origin or referer or ""
-        if request.host not in target:
+        # Compare the actual host component, not a substring: a naive
+        # `request.host not in target` passes for evil-<host>.attacker.com
+        # because it merely contains the host as a substring.
+        from urllib.parse import urlparse
+        target_host = urlparse(target).netloc
+        if not target_host or target_host != request.host:
              return jsonify({"status": "error", "message": "CSRF Blocked: Origin Mismatch"}), 403
 
 def check_auth(u, p):
@@ -321,8 +359,15 @@ def requires_worker_auth(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         token = request.headers.get('X-Worker-Token') or request.args.get('token')
-        if token is None: return f(*args, **kwargs)
-        if token != WORKER_SECRET:
+        if token is None:
+            # Previously a missing token was waved through entirely, so the
+            # shared secret gated nothing. When REQUIRE_WORKER_TOKEN is on we
+            # now reject tokenless requests too (regular workers always send
+            # one). Left off => the old open behavior for a fully public setup.
+            if REQUIRE_WORKER_TOKEN:
+                return jsonify({"status": "error", "message": "Worker token required"}), 401
+            return f(*args, **kwargs)
+        if not secrets.compare_digest(str(token), str(WORKER_SECRET)):
             return jsonify({"status": "error", "message": "Unauthorized Worker"}), 401
         return f(*args, **kwargs)
     return decorated
@@ -643,15 +688,19 @@ def _split_claimed_job(job):
         finally:
             conn.close()
 
-def _assign_pending_chunk(worker_id, folder_filter, max_size_mb):
+def _assign_pending_chunk(worker_id, folder_filter, max_size_mb, video_only=False):
     """Hand the oldest pending chunk to a worker. Prioritizes the earliest-started
-    job so the swarm finishes one video before spilling into the next."""
+    job so the swarm finishes one video before spilling into the next.
+    video_only=True (browser workers) skips the whole-file audio chunk, which
+    they can't segment; a native worker encodes the audio track."""
     with db_lock:
         conn = db_handler.get_connection()
         conn.row_factory = sqlite3.Row
         try:
             params = []
             query_parts = ["c.status='pending'", "j.status='processing'", "COALESCE(j.chunked,0)=1"]
+            if video_only:
+                query_parts.append("c.kind='video'")
             if folder_filter:
                 query_parts.append("j.id LIKE ?")
                 params.append(f"{folder_filter}%")
@@ -687,6 +736,11 @@ def _assign_pending_chunk(worker_id, folder_filter, max_size_mb):
             c.execute("UPDATE jobs SET last_updated=? WHERE id=?", (now, chunk['job_id']))
             conn.commit()
             chunk['download_url'] = build_download_url(chunk['job_id'], chunk['source_type'], chunk.pop('source_url'))
+            # Browser workers can't range-stream a multi-GB source, so they fetch
+            # a small pre-cut segment for this chunk instead (see /download_segment).
+            if chunk['kind'] == 'video':
+                chunk['segment_url'] = (f"{SERVER_URL_DISPLAY.rstrip('/')}/download_segment"
+                                        f"?job_id={quote(chunk['job_id'], safe='')}&chunk_index={chunk['chunk_index']}")
             return chunk
         finally:
             conn.close()
@@ -813,8 +867,21 @@ def _assemble_job(job_id):
         with db_lock:
             conn = db_handler.get_connection()
             try:
-                conn.execute("UPDATE jobs SET status='completed', progress=100, duration=?, worker_id=?, last_updated=? WHERE id=?",
-                             (int(src_dur / 60), f"(chunked x{len(workers)})", datetime.now(), job_id))
+                c = conn.cursor()
+                # Guard: assembly can take up to an hour (ffmpeg concat). If an
+                # admin reset/deleted the job meanwhile (status left 'processing'
+                # + chunked=1), don't resurrect it or move the file over a job
+                # someone re-claimed whole.
+                c.execute("UPDATE jobs SET status='completed', progress=100, duration=?, worker_id=?, last_updated=? "
+                          "WHERE id=? AND status='processing' AND COALESCE(chunked,0)=1",
+                          (int(src_dur / 60), f"(chunked x{len(workers)})", datetime.now(), job_id))
+                if c.rowcount != 1:
+                    conn.commit()
+                    log_event("WARN", "Assembled file discarded: job was reset/taken during assembly.", job_id)
+                    try:
+                        if os.path.exists(save_path): os.remove(save_path)
+                    except Exception: pass
+                    return
                 if warn:
                     conn.execute("UPDATE jobs SET warnings = COALESCE(warnings || ' | ', '') || ? WHERE id=?",
                                  (warn, job_id))
@@ -1095,30 +1162,52 @@ def _scan_and_queue_inner():
         # Commit any remaining files
         if remote_batch:
             process_batch(remote_batch)
-            
+
+    # Folder set may have changed — refresh the cached series list.
+    try:
+        get_series_list(force_refresh=True)
+    except Exception:
+        pass
     print("[*] Scan complete.")
 
-def get_series_list():
-    try:
-        # [FIX] Allow series listing even in hybrid mode
-        if not os.path.exists(SOURCE_DIRECTORY): return [], []
-        
-        folders = sorted([d for d in os.listdir(SOURCE_DIRECTORY) if os.path.isdir(os.path.join(SOURCE_DIRECTORY, d))])
-        folder_set = set(folders)
-        mapping = {}
-        stale_keys = []
-        
-        if os.path.exists('series_names.json'):
-            try:
-                mapping = json.load(open('series_names.json', 'r'))
-                stale_keys = [k for k in mapping if k not in folder_set]
-                if stale_keys:
-                    print(f"[!] series_names.json has {len(stale_keys)} stale key(s): {', '.join(stale_keys[:5])}")
-            except: pass
-            
-        return [{"id": i+1, "folder": f, "name": mapping.get(f, f)} for i, f in enumerate(folders)], stale_keys
-    except:
-        return [], []
+# Cache for get_series_list: it hits the filesystem (a directory listing + a
+# stat per entry + a JSON read), and it was being called on every /get_job and
+# /get_chunk poll that carried a series_id — dozens of listings per second, and
+# painful when SOURCE_DIRECTORY is a network mount. 60s TTL, like _BANNED_CACHE.
+_SERIES_CACHE = None
+_SERIES_CACHE_TIME = 0.0
+_SERIES_CACHE_LOCK = threading.Lock()
+
+def get_series_list(force_refresh=False):
+    global _SERIES_CACHE, _SERIES_CACHE_TIME
+    with _SERIES_CACHE_LOCK:
+        now = time.time()
+        if not force_refresh and _SERIES_CACHE is not None and now - _SERIES_CACHE_TIME < 60:
+            return _SERIES_CACHE
+        try:
+            # [FIX] Allow series listing even in hybrid mode
+            if not os.path.exists(SOURCE_DIRECTORY):
+                _SERIES_CACHE = ([], []); _SERIES_CACHE_TIME = now
+                return _SERIES_CACHE
+
+            folders = sorted([d for d in os.listdir(SOURCE_DIRECTORY) if os.path.isdir(os.path.join(SOURCE_DIRECTORY, d))])
+            folder_set = set(folders)
+            mapping = {}
+            stale_keys = []
+
+            if os.path.exists('series_names.json'):
+                try:
+                    mapping = json.load(open('series_names.json', 'r'))
+                    stale_keys = [k for k in mapping if k not in folder_set]
+                    if stale_keys:
+                        print(f"[!] series_names.json has {len(stale_keys)} stale key(s): {', '.join(stale_keys[:5])}")
+                except: pass
+
+            result = ([{"id": i+1, "folder": f, "name": mapping.get(f, f)} for i, f in enumerate(folders)], stale_keys)
+            _SERIES_CACHE = result; _SERIES_CACHE_TIME = now
+            return result
+        except:
+            return _SERIES_CACHE if _SERIES_CACHE is not None else ([], [])
 
 # ==============================================================================
 # DATABASE INIT
@@ -1196,6 +1285,14 @@ def init_db():
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_chunks_status ON chunks(status)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_chunks_job ON chunks(job_id)")
+        # Composite index for the job-pick query (status + source_type filter,
+        # ORDER BY id) so /get_job and _claim_job_for_split do an index seek
+        # instead of scanning + sorting the whole queued set every poll.
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_jobs_pick ON jobs(status, source_type, id)")
+        # last_updated drives the dashboard history + admin job list sort.
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_jobs_last_updated ON jobs(last_updated)")
+        # id drives the system_logs prune + the LIMIT view.
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_syslogs_id ON system_logs(id)")
 
         # FractumCoin earnings ledger: one row per VERIFIED upload (whole file
         # or video chunk). Durable payout record — unlike the jobs/chunks
@@ -1216,6 +1313,8 @@ def init_db():
         ''')
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_earnings_wallet ON earnings(wallet)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_earnings_worker ON earnings(worker_id)")
+        # timestamp drives the 24h/30d scoreboard filters.
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_earnings_ts ON earnings(timestamp)")
 
         # One-time backfill so historical scoreboard credit carries over into
         # the ledger (wallet unknown for past work — recorded as NULL).
@@ -1276,7 +1375,16 @@ def _fast_hash_file(path, nbytes=_HASH_BYTES):
     return h.hexdigest()
 
 @app.route('/')
+@app.route('/dashboard')
 def dashboard(): return render_template('dashboard.html')
+
+@app.route('/web')
+@app.route('/node')
+def web_worker():
+    # In-browser encoder page. The worker token is injected so a volunteer can
+    # just open the page and contribute (same exposure as /install, which by
+    # policy also embeds the secret). Safely embedded via |tojson in the page.
+    return render_template('web_worker.html', worker_token=WORKER_SECRET)
 
 @app.route('/admin')
 @limiter.limit("5 per minute") 
@@ -1446,6 +1554,9 @@ def get_chunk():
     series_id = request.args.get('series_id')
     worker_id = sanitize_input(request.args.get('worker_id'))
     worker_version = sanitize_input(request.args.get('version'))
+    # Browser workers pass video_only=1: they fetch a pre-cut segment per video
+    # chunk and can't handle the whole-file audio chunk.
+    video_only = request.args.get('video_only') in ('1', 'true', 'yes')
 
     if is_worker_banned(worker_id):
         return jsonify({"status": "empty", "message": "Unauthorized"}), 403
@@ -1455,7 +1566,7 @@ def get_chunk():
     try:
         folder_filter = _resolve_folder_filter(series_id)
 
-        chunk = _assign_pending_chunk(worker_id, folder_filter, max_size_mb)
+        chunk = _assign_pending_chunk(worker_id, folder_filter, max_size_mb, video_only=video_only)
         if chunk is None:
             if SPLIT_LOCK.acquire(blocking=False):
                 # No pending chunks anywhere — split the next queued job.
@@ -1467,7 +1578,7 @@ def get_chunk():
                 try:
                     job = _claim_job_for_split(folder_filter, max_size_mb)
                     if job is not None and _split_claimed_job(job):
-                        chunk = _assign_pending_chunk(worker_id, folder_filter, max_size_mb)
+                        chunk = _assign_pending_chunk(worker_id, folder_filter, max_size_mb, video_only=video_only)
                 finally:
                     SPLIT_LOCK.release()
             else:
@@ -1483,6 +1594,114 @@ def get_chunk():
     except Exception as e:
         log_event("ERROR", f"get_chunk failed: {e}")
         return jsonify({"status": "error"}), 500
+
+# Small tail past the chunk end so the segment reliably contains the full
+# [start, start+dur] window after keyframe/rounding effects. With -copyts + -to
+# the end is anchored to an ABSOLUTE timestamp, so this need only cover rounding
+# (not the GOP length — unlike a -t-based cut, which measures from the keyframe).
+_SEGMENT_GUARD_SEC = 2.0
+
+@app.route('/download_segment', methods=['GET'])
+@requires_worker_auth
+def download_segment():
+    """Stream a small, standalone, keyframe-aligned segment covering one video
+    chunk's time range — so a browser worker can encode a chunk of a multi-GB
+    source without downloading the whole file.
+
+    The cut is a lossless stream copy with -copyts, so the segment keeps the
+    source's absolute timestamps: the worker then does an accurate
+    `-ss <start> -t <dur>` seek INSIDE the segment and gets exactly the same
+    [start, start+dur] window a native chunk worker produces — so browser and
+    desktop chunks tile identically at assembly.
+    """
+    job_id = (request.args.get('job_id') or '').strip()
+    try:
+        chunk_index = int(request.args.get('chunk_index'))
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "chunk_index required"}), 400
+    if not job_id:
+        return jsonify({"status": "error", "message": "job_id required"}), 400
+
+    with db_lock:
+        conn = db_handler.get_connection()
+        conn.row_factory = sqlite3.Row
+        try:
+            c = conn.cursor()
+            c.execute("SELECT start_sec, duration_sec FROM chunks WHERE job_id=? AND kind='video' AND chunk_index=?",
+                      (job_id, chunk_index))
+            crow = c.fetchone()
+            c.execute("SELECT source_type, source_url FROM jobs WHERE id=?", (job_id,))
+            jrow = c.fetchone()
+        finally:
+            conn.close()
+    if crow is None or jrow is None:
+        return abort(404)
+
+    start = float(crow['start_sec'] or 0)
+    dur = float(crow['duration_sec'] or 0)
+    if jrow['source_type'] == 'remote':
+        src = build_download_url(job_id, 'remote', jrow['source_url'])
+        src_input = src
+    else:
+        src_input = os.path.join(SOURCE_DIRECTORY, job_id.replace('/', os.sep))
+        if not os.path.isfile(src_input):
+            return abort(404)
+
+    seg_dir = os.path.join("temp_uploads", "segments")
+    os.makedirs(seg_dir, exist_ok=True)
+    seg_path = os.path.join(seg_dir, f"{uuid.uuid4().hex}.mkv")
+
+    # -copyts keeps absolute timestamps; -ss before -i seeks to the keyframe at
+    # or before `start`; -to anchors the end to an ABSOLUTE time so the window is
+    # always covered regardless of GOP length. Matroska handles the copied
+    # stream + preserved timestamps cleanly and streams progressively.
+    input_flags = ['-ss', f"{start:.3f}"]
+    if jrow['source_type'] == 'remote':
+        input_flags = ['-headers', f"X-Worker-Token: {WORKER_SECRET}\r\n"] + input_flags
+    cmd = (['ffmpeg', '-y', '-copyts'] + input_flags +
+           ['-i', src_input, '-to', f"{start + dur + _SEGMENT_GUARD_SEC:.3f}",
+            '-map', '0:v:0', '-c', 'copy', '-f', 'matroska', seg_path])
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if res.returncode != 0 or not os.path.exists(seg_path) or os.path.getsize(seg_path) == 0:
+            try:
+                if os.path.exists(seg_path): os.remove(seg_path)
+            except OSError: pass
+            log_event("WARN", f"Segment extraction failed for chunk {chunk_index} (rc={res.returncode})", job_id)
+            return jsonify({"status": "error", "message": "segment extraction failed"}), 500
+    except Exception as e:
+        try:
+            if os.path.exists(seg_path): os.remove(seg_path)
+        except OSError: pass
+        log_event("WARN", f"Segment extraction error for chunk {chunk_index}: {e}", job_id)
+        return jsonify({"status": "error", "message": "segment extraction error"}), 500
+
+    # The copied segment starts at the keyframe at-or-before `start`, and input
+    # -ss on it is start_time-relative, so the worker must seek by the LEAD
+    # (start - segment_start_time), not by absolute `start`. Probe the header
+    # for that start_time and hand the worker the exact lead + duration.
+    seg_start = 0.0
+    try:
+        pr = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'format=start_time',
+                             '-of', 'default=nw=1:nk=1', seg_path],
+                            capture_output=True, text=True, timeout=30)
+        seg_start = float((pr.stdout or '0').strip() or 0)
+    except Exception:
+        seg_start = 0.0
+    lead = max(0.0, start - seg_start)
+
+    @after_this_request
+    def _cleanup(response):
+        try: os.remove(seg_path)
+        except OSError: pass
+        return response
+
+    resp = send_file(seg_path, mimetype='video/x-matroska', as_attachment=True,
+                     download_name=f"segment_{chunk_index}.mkv")
+    # Worker reads these to run: -ss <lead> -i seg -t <duration>  (accurate seek)
+    resp.headers['X-Segment-Lead'] = f"{lead:.3f}"
+    resp.headers['X-Segment-Duration'] = f"{dur:.3f}"
+    return resp
 
 @app.route('/upload_chunk', methods=['POST'])
 @requires_worker_auth
@@ -1628,6 +1847,22 @@ def upload_result():
         duration = 0
     
     if 'file' in request.files and job_id:
+        # Reject stale/misdirected uploads BEFORE touching disk: a job that was
+        # since split into chunks (chunked=1) or already completed must not be
+        # overwritten by a straggler whole-file worker.
+        with db_lock:
+            conn = db_handler.get_connection()
+            try:
+                c = conn.cursor()
+                c.execute("SELECT status, COALESCE(chunked, 0) FROM jobs WHERE id=?", (job_id,))
+                jrow = c.fetchone()
+            finally:
+                conn.close()
+        if jrow is None:
+            return jsonify({"status": "error", "message": "unknown job"}), 404
+        if jrow[1] == 1 or jrow[0] == 'completed':
+            return jsonify({"status": "stale", "message": "Job no longer accepts a whole-file upload"}), 409
+
         new_filename = os.path.splitext(job_id)[0] + ".mp4"
         quarantine_dir = os.path.join("temp_uploads", "quarantine")
         os.makedirs(quarantine_dir, exist_ok=True)
@@ -1640,8 +1875,15 @@ def upload_result():
             os.remove(temp_path)
             with db_lock:
                 conn = db_handler.get_connection()
-                conn.execute("UPDATE jobs SET status='failed', last_updated=? WHERE id=?", (datetime.now(), job_id))
-                conn.commit(); conn.close()
+                try:
+                    # Count the failure so a permanently-broken source doesn't
+                    # loop forever through the new auto-requeue path.
+                    conn.execute("UPDATE jobs SET status='failed', fail_count=COALESCE(fail_count,0)+1, "
+                                 "last_updated=? WHERE id=? AND COALESCE(chunked,0)=0", (datetime.now(), job_id))
+                    conn.execute("UPDATE jobs SET status='permanently_failed' WHERE id=? AND COALESCE(fail_count,0) >= 5", (job_id,))
+                    conn.commit()
+                finally:
+                    conn.close()
             return jsonify({"status": "error", "message": reason}), 400
 
         save_path = os.path.abspath(os.path.join(COMPLETED_DIRECTORY, new_filename))
@@ -1649,15 +1891,17 @@ def upload_result():
              os.remove(temp_path); return jsonify({"status": "error"}), 403
 
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        shutil.move(temp_path, save_path) 
+        shutil.move(temp_path, save_path)
 
         with db_lock:
             conn = db_handler.get_connection()
             try:
                 c = conn.cursor()
+                # Guard chunked=0 again (race: split may have happened during
+                # the encode verify/move) and skip double-credit on re-uploads.
                 c.execute("SELECT status FROM jobs WHERE id=?", (job_id,))
                 prev = c.fetchone()
-                c.execute("UPDATE jobs SET status='completed', progress=100, worker_id=?, last_updated=?, duration=? WHERE id=?",
+                c.execute("UPDATE jobs SET status='completed', progress=100, worker_id=?, last_updated=?, duration=? WHERE id=? AND COALESCE(chunked,0)=0",
                     (worker_id, datetime.now(), duration, job_id))
                 # FractumCoin credit: minutes come from ffprobe of the delivered
                 # file, not the worker's claim. A re-upload to an already
@@ -1935,19 +2179,29 @@ def report_status():
     with db_lock:
         conn = db_handler.get_connection()
         try:
-            # COALESCE(chunked,0)=0 guard: a whole-file worker whose timed-out
-            # job was since split into chunks must not clobber the chunked
-            # job's status/worker (that would stall assignment and assembly).
-            sql = "UPDATE jobs SET status=?, worker_id=?, progress=?, last_updated=? WHERE id=? AND COALESCE(chunked, 0)=0"
-            params = [status, worker_id, d.get('progress',0), datetime.now(), d.get('job_id')]
+            job_id_val = d.get('job_id')
+            # Guards on every update:
+            #  - COALESCE(chunked,0)=0: never touch a job that was split into
+            #    chunks (that would stall assignment/assembly).
+            #  - worker_id=?: only the CURRENT owner may report. A stale worker
+            #    whose job was reassigned/completed can't revert it.
+            #  - status NOT IN terminal: never resurrect a completed or
+            #    permanently_failed job.
+            base_where = ("WHERE id=? AND COALESCE(chunked, 0)=0 AND worker_id=? "
+                          "AND status NOT IN ('completed', 'permanently_failed')")
+            sql = f"UPDATE jobs SET status=?, progress=?, last_updated=? {base_where}"
+            params = [status, d.get('progress', 0), datetime.now(), job_id_val, worker_id]
             if d.get('duration', 0) > 0:
-                sql = "UPDATE jobs SET status=?, worker_id=?, progress=?, last_updated=?, duration=? WHERE id=? AND COALESCE(chunked, 0)=0"
-                params.insert(4, d.get('duration'))
+                sql = f"UPDATE jobs SET status=?, progress=?, last_updated=?, duration=? {base_where}"
+                params.insert(3, d.get('duration'))
             conn.execute(sql, tuple(params))
             if status == 'failed':
-                job_id_val = d.get('job_id')
-                conn.execute("UPDATE jobs SET fail_count = COALESCE(fail_count, 0) + 1 WHERE id=? AND COALESCE(chunked, 0)=0", (job_id_val,))
-                conn.execute("UPDATE jobs SET status='permanently_failed' WHERE id=? AND COALESCE(fail_count, 0) >= 5 AND COALESCE(chunked, 0)=0", (job_id_val,))
+                # Only count the failure if this worker actually owned the job
+                # (the UPDATE above changed the row). Re-read to confirm.
+                conn.execute("UPDATE jobs SET fail_count = COALESCE(fail_count, 0) + 1 "
+                             "WHERE id=? AND COALESCE(chunked, 0)=0 AND worker_id=? AND status='failed'",
+                             (job_id_val, worker_id))
+                conn.execute("UPDATE jobs SET status='permanently_failed' WHERE id=? AND COALESCE(fail_count, 0) >= 5 AND status='failed'", (job_id_val,))
             conn.commit()
         finally:
             conn.close()
@@ -1966,8 +2220,11 @@ def api_stats():
             # the audio helper pass earns 0 so chunked jobs count exactly
             # once). The ledger is append-only, so scores survive retries,
             # archives, and chunk cleanup.
-            earn_filter = (" AND timestamp > datetime('now', '-1 day')" if filter_val == '24h'
-                           else " AND timestamp > datetime('now', '-30 days')" if filter_val == '30d' else "")
+            # timestamps are stored with Python datetime.now() (LOCAL time), so
+            # the window must also be computed in local time — datetime('now')
+            # alone is UTC and would skew the window by the server's offset.
+            earn_filter = (" AND timestamp > datetime('now', 'localtime', '-1 day')" if filter_val == '24h'
+                           else " AND timestamp > datetime('now', 'localtime', '-30 days')" if filter_val == '30d' else "")
             c.execute(f"""
                 SELECT CASE WHEN instr(worker_id, '-') > 0 THEN substr(worker_id, 1, instr(worker_id, '-') - 1) ELSE worker_id END as worker_id,
                        CAST(SUM(minutes) AS INTEGER) as total_minutes,
@@ -2020,11 +2277,23 @@ def api_stats():
 @app.route('/api/all_jobs')
 @requires_auth
 def api_all_jobs():
+    # Bounded + optionally status-filtered: returning every one of thousands of
+    # rows as JSON on each admin refresh serialized megabytes under db_lock.
+    try:
+        limit = min(int(request.args.get('limit', 2000)), 10000)
+    except (ValueError, TypeError):
+        limit = 2000
+    status_filter = request.args.get('status')
     with db_lock:
         conn = db_handler.get_connection(); conn.row_factory = sqlite3.Row
         try:
             c = conn.cursor()
-            c.execute("SELECT id, status, worker_id, worker_version, last_updated, warnings FROM jobs ORDER BY last_updated DESC")
+            if status_filter:
+                c.execute("SELECT id, status, worker_id, worker_version, last_updated, warnings FROM jobs "
+                          "WHERE status=? ORDER BY last_updated DESC LIMIT ?", (status_filter, limit))
+            else:
+                c.execute("SELECT id, status, worker_id, worker_version, last_updated, warnings FROM jobs "
+                          "ORDER BY last_updated DESC LIMIT ?", (limit,))
             jobs = [dict(r) for r in c.fetchall()]
         finally:
             conn.close()
@@ -2180,20 +2449,23 @@ def handle_exception(e):
     return "Internal Server Error", 500
 
 def sweep_quarantine():
-    """Remove stale files from the quarantine upload directory."""
-    quarantine_dir = os.path.join("temp_uploads", "quarantine")
-    if not os.path.exists(quarantine_dir): return
+    """Remove stale files from the quarantine + segment temp directories."""
     cutoff = time.time() - 3600  # 1 hour
     count = 0
-    for fname in os.listdir(quarantine_dir):
-        fpath = os.path.join(quarantine_dir, fname)
-        try:
-            if os.path.isfile(fpath) and os.path.getmtime(fpath) < cutoff:
-                os.remove(fpath)
-                count += 1
-        except Exception: pass
+    # segment temp files are normally deleted right after send; sweep covers
+    # aborted downloads where after_this_request didn't fire.
+    for sub in ("quarantine", "segments"):
+        d = os.path.join("temp_uploads", sub)
+        if not os.path.exists(d): continue
+        for fname in os.listdir(d):
+            fpath = os.path.join(d, fname)
+            try:
+                if os.path.isfile(fpath) and os.path.getmtime(fpath) < cutoff:
+                    os.remove(fpath)
+                    count += 1
+            except Exception: pass
     if count > 0:
-        print(f"[*] Quarantine sweep: removed {count} stale file(s).")
+        print(f"[*] Temp sweep: removed {count} stale file(s).")
 
 def maintenance_loop():
     while True:
@@ -2243,6 +2515,29 @@ def maintenance_loop():
                     for (jid,) in cursor.fetchall():
                         _requeue_job_whole(conn, jid, "no chunk activity for 6h",
                                            penalize=False, disable_chunking=False)
+
+                    # Auto-requeue transiently-failed jobs (fail_count < 5) after
+                    # a short cooldown. Previously a worker-reported 'failed' left
+                    # the job dead until an admin manually clicked Reset Failed;
+                    # /get_job only serves 'queued'. The fail_count<5 retry design
+                    # was never actually wired up for this path.
+                    failed_cutoff = now - timedelta(minutes=10)
+                    cursor.execute(
+                        "UPDATE jobs SET status='queued', progress=0, worker_id=NULL, started_at=NULL, last_updated=? "
+                        "WHERE status='failed' AND COALESCE(fail_count, 0) < 5 AND COALESCE(chunked, 0)=0 AND last_updated < ?",
+                        (now, failed_cutoff))
+                    if cursor.rowcount > 0:
+                        logs_to_write.append(("INFO", f"Auto-requeued {cursor.rowcount} transiently-failed job(s).", None))
+
+                    # Prune the ever-growing system_logs table (nothing else does).
+                    # Keep the most recent ~50k rows; the id index makes this cheap.
+                    cursor.execute("SELECT MAX(id) FROM system_logs")
+                    _max_log_id = cursor.fetchone()[0]
+                    if _max_log_id and _max_log_id > 50000:
+                        cursor.execute("DELETE FROM system_logs WHERE id < ?", (_max_log_id - 50000,))
+                        if cursor.rowcount > 0:
+                            logs_to_write.append(("INFO", f"Pruned {cursor.rowcount} old system_logs row(s).", None))
+
                     conn.commit()
                 finally:
                     conn.close()

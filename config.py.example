@@ -16,8 +16,15 @@ SERVER_URL_DISPLAY = "https://encode.fractumseraph.net/"
 ADMIN_USER = "admin"
 ADMIN_PASS = "changeme"  # [!] CHANGE THIS!
 # Security Tokens (Generate new random strings for production)
-WORKER_SECRET = "ChangeThisToALongRandomString" 
+WORKER_SECRET = "ChangeThisToALongRandomString"
 SECRET_KEY = "ChangeThisToAnotherRandomString"
+
+# Require workers to present WORKER_SECRET (X-Worker-Token header or ?token=).
+# When True (default), requests with NO token are rejected — previously a
+# missing token was waved through, so the secret gated nothing. Regular
+# workers already send the token, so they are unaffected. Set False only if
+# you intentionally run a fully open, anonymous-worker manager.
+REQUIRE_WORKER_TOKEN = True
 
 # ==============================================================================
 # FILE & DIRECTORY SETTINGS

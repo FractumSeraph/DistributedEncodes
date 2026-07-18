@@ -314,7 +314,9 @@
             const tbodyJobs = document.getElementById('job-list');
             const filteredJobs = jobsData.filter(j => {
                 let statusMatch = false;
-                if (j.status === 'failed' && jobFilters.failed) statusMatch = true;
+                // 'permanently_failed' (fail_count >= 5) must show under the
+                // failed filter too, or such jobs become invisible/unmanageable.
+                if ((j.status === 'failed' || j.status === 'permanently_failed') && jobFilters.failed) statusMatch = true;
                 if (j.status === 'completed' && jobFilters.completed) statusMatch = true;
                 if (j.status === 'queued' && jobFilters.queued) statusMatch = true;
                 if (['processing', 'downloading', 'uploading'].includes(j.status) && jobFilters.processing) statusMatch = true;
@@ -332,13 +334,17 @@
             } else {
                 tbodyJobs.innerHTML = filteredJobs.map(j => {
                     const cleanName = j.id.split('/').pop();
-                    const workerDisplay = j.worker_id ? `<span class="worker-tag" onclick="setSearch('${escapeHTML(j.worker_id)}')">${escapeHTML(j.worker_id)}</span>` : '<span style="color:#444">-</span>';
-                    
-                    let actions = `<button onclick="act('${escapeHTML(j.id)}','delete')" style="border-color:var(--neon-red); color:var(--neon-red)">DEL</button>`;
-                    if (j.status === 'failed' || j.status === 'completed') {
-                        actions = `<button onclick="act('${escapeHTML(j.id)}','retry')" style="border-color:var(--neon-green); color:var(--neon-green)">RETRY</button> ` + actions;
+                    // data-* attributes carry the raw id/worker safely (HTML-escaped
+                    // as attribute text); a delegated listener reads them. Building
+                    // JS strings inside onclick broke on ids containing apostrophes
+                    // (e.g. "it's.mkv") and was an injection vector.
+                    const workerDisplay = j.worker_id ? `<span class="worker-tag" data-search="${escapeHTML(j.worker_id)}">${escapeHTML(j.worker_id)}</span>` : '<span style="color:#444">-</span>';
+
+                    let actions = `<button data-act="delete" data-id="${escapeHTML(j.id)}" style="border-color:var(--neon-red); color:var(--neon-red)">DEL</button>`;
+                    if (j.status === 'failed' || j.status === 'permanently_failed' || j.status === 'completed') {
+                        actions = `<button data-act="retry" data-id="${escapeHTML(j.id)}" style="border-color:var(--neon-green); color:var(--neon-green)">RETRY</button> ` + actions;
                     }
-                    actions += ` <button onclick="downloadLog('${escapeHTML(j.id)}')" style="border-color:#555; color:#888; font-size:0.75em;">LOG</button>`;
+                    actions += ` <button data-act="log" data-id="${escapeHTML(j.id)}" style="border-color:#555; color:#888; font-size:0.75em;">LOG</button>`;
 
                     // NEW: Build warning badge
                     let warningBadge = "";
@@ -388,6 +394,19 @@
             document.getElementById('searchInput').value = val;
             applyFilters();
         }
+
+        // Delegated handler for job-row buttons/tags. Attached once to the
+        // persistent tbody, so it survives the innerHTML rebuilds in applyFilters.
+        document.getElementById('job-list').addEventListener('click', (e) => {
+            const btn = e.target.closest('[data-act]');
+            if (btn) {
+                if (btn.dataset.act === 'log') downloadLog(btn.dataset.id);
+                else act(btn.dataset.id, btn.dataset.act);
+                return;
+            }
+            const tag = e.target.closest('[data-search]');
+            if (tag) setSearch(tag.dataset.search);
+        });
 
         function act(id, action) {
             let msg = `${action.toUpperCase()} job?`;

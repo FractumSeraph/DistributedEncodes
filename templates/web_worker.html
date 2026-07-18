@@ -184,7 +184,7 @@
     <div class="dashboard-container">
         <div class="header-container">
             <div class="header-title-group">
-                <a href="/dashboard" class="back-link">&lt;&lt; BACK TO DASHBOARD</a>
+                <a href="/" class="back-link">&lt;&lt; BACK TO DASHBOARD</a>
                 <h1>// BROWSER_NODE_CONTROLLER</h1>
             </div>
         </div>
@@ -200,6 +200,19 @@
                     <label>WORKER_NAME:</label>
                     <input type="text" id="workerName" value="WebNode" style="width: 200px;">
                 </div>
+                <div>
+                    <label>WALLET (optional):</label>
+                    <input type="text" id="wallet" value="" placeholder="FractumCoin address" style="width: 220px;">
+                </div>
+                <div>
+                    <label title="Browser encoding is memory-limited. Larger files may crash the tab.">MAX SOURCE MB:</label>
+                    <input type="text" id="maxSizeMb" value="150" style="width: 80px;">
+                </div>
+            </div>
+            <div style="color: var(--text-dim); font-size: 0.8em; margin-bottom: 15px;">
+                In-browser AV1 encoding runs a full FFmpeg (SVT-AV1) in WebAssembly. It only
+                takes small source files (the manager filters by MAX SOURCE MB) and is slower
+                than a native worker. Keep this tab focused for best performance.
             </div>
             <div>
                 <button id="btnStart" class="btn-control" onclick="startLoop()">[ EXECUTE ]</button>
@@ -217,9 +230,20 @@
     let isRunning = false;
     let worker = null;
     let currentWorkerId = "";
-    
+    let currentJobId = null;   // the whole-file job this node is encoding, for stop-time release
+    let currentChunk = null;   // {job_id, chunk_index} of an in-flight chunk, for release + heartbeat
+
+    // Must be >= manager MIN_CLIENT_VERSION or /get_job returns "Update Required".
+    const WEB_WORKER_VERSION = "3.3.0";
+
+    // Worker token: injected by the manager (/web) so the page authenticates
+    // out of the box; ?token= in the URL overrides. Empty only if the manager
+    // couldn't inject it (e.g. page opened as a static file).
+    const WORKER_TOKEN = (new URLSearchParams(location.search).get('token'))
+                         || {{ worker_token | tojson }};
+
     // Track if worker is ready (module initialized)
-    let isWorkerReady = false; 
+    let isWorkerReady = false;
 
     async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -233,12 +257,68 @@
     function stopLoop() {
         isRunning = false;
         log("STOP command received. Finishing current job...", 'err');
+        // Release the in-flight job so it doesn't sit 'processing' until the
+        // manager's ~10-min stale sweep before another worker can take it.
+        if (currentJobId) {
+            try {
+                fetch('/report_status' + (WORKER_TOKEN ? ('?token=' + encodeURIComponent(WORKER_TOKEN)) : ''), {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ job_id: currentJobId, worker_id: currentWorkerId,
+                                           status: 'failed', error: 'Browser worker stopped',
+                                           version: WEB_WORKER_VERSION })
+                });
+            } catch (e) { /* best effort */ }
+            currentJobId = null;
+        }
+        // Release an in-flight chunk so the manager reassigns it promptly.
+        if (currentChunk) {
+            try {
+                fetch('/report_chunk' + (WORKER_TOKEN ? ('?token=' + encodeURIComponent(WORKER_TOKEN)) : ''), {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ job_id: currentChunk.job_id, chunk_index: currentChunk.chunk_index,
+                                           kind: 'video', worker_id: currentWorkerId,
+                                           status: 'abandoned', version: WEB_WORKER_VERSION })
+                });
+            } catch (e) { /* best effort */ }
+            currentChunk = null;
+        }
         if (worker) {
             worker.terminate();
             worker = null;
             log("Worker terminated immediately.", 'err');
             toggleButtons(false);
         }
+    }
+
+    // While a chunk encodes (wasm callMain blocks the Worker thread), the page
+    // thread stays free — send periodic heartbeats so the manager's 30-min
+    // stale-chunk sweep never reassigns a chunk we're slowly but actively
+    // encoding. Returns a stop() function.
+    function startChunkHeartbeat(jobId, chunkIndex) {
+        const id = setInterval(() => {
+            fetch('/report_chunk' + (WORKER_TOKEN ? ('?token=' + encodeURIComponent(WORKER_TOKEN)) : ''), {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ job_id: jobId, chunk_index: chunkIndex, kind: 'video',
+                                       worker_id: currentWorkerId, status: 'processing',
+                                       progress: 0, version: WEB_WORKER_VERSION })
+            }).catch(() => {});
+        }, 15000);
+        return () => clearInterval(id);
+    }
+
+    function runChunkInWorker(chunk) {
+        return new Promise((resolve, reject) => {
+            if (!worker) { reject(new Error("Worker not initialized")); return; }
+            const stopHb = startChunkHeartbeat(chunk.job_id, chunk.chunk_index);
+            worker.onmessage = (e) => {
+                const msg = e.data;
+                if (msg.type === 'log') log(msg.msg, msg.level);
+                else if (msg.type === 'chunk_done' || msg.type === 'chunk_stale') { stopHb(); resolve(); }
+                else if (msg.type === 'chunk_error') { stopHb(); reject(new Error(msg.msg)); }
+            };
+            worker.onerror = (e) => { stopHb(); worker = null; reject(new Error("Worker Crashed: " + e.message)); };
+            worker.postMessage({type: 'run_chunk', chunk: chunk});
+        });
     }
 
     async function initWorker() {
@@ -270,10 +350,16 @@
         });
     }
 
+    let currentWallet = "";
+    let currentMaxSizeMb = 150;
+
     async function startLoop() {
         const user = document.getElementById('username').value.trim() || "Anonymous";
         const node = document.getElementById('workerName').value.trim() || "WebNode";
-        const runId = Math.floor(Date.now() / 1000); 
+        currentWallet = document.getElementById('wallet').value.trim();
+        const mb = parseInt(document.getElementById('maxSizeMb').value, 10);
+        currentMaxSizeMb = (Number.isFinite(mb) && mb > 0) ? mb : 150;
+        const runId = Math.floor(Date.now() / 1000);
         currentWorkerId = `${user}-${node}-${runId}-1`;
 
         try {
@@ -288,16 +374,46 @@
         
         log(`Worker [${currentWorkerId}] Started. Polling for jobs...`, 'succ');
 
+        const _authQS = WORKER_TOKEN ? ('&token=' + encodeURIComponent(WORKER_TOKEN)) : '';
+
         while (isRunning) {
             try {
-                // A. GET JOB
-                // Request max 256MB initially to be safe? 
-                // The worker has 1GB heap, but overhead matters. 
-                // Let's try 512MB again, hoping separate thread helps.
-                const res = await fetch('/get_job?max_size_mb=512');
+                // A. CHUNK FIRST — take a slice of a large video via a pre-cut
+                // segment (video_only: browsers can't do the whole-file audio
+                // chunk). This is how browser nodes help on multi-GB sources.
+                const cres = await fetch(`/get_chunk?video_only=1&max_size_mb=${currentMaxSizeMb}&version=${encodeURIComponent(WEB_WORKER_VERSION)}${_authQS}`);
+                if (cres.status === 200) {
+                    const cdata = await cres.json();
+                    if (cdata.status === 'ok' && cdata.chunk) {
+                        const ch = cdata.chunk;
+                        ch.worker_id = currentWorkerId;
+                        ch.wallet = currentWallet;
+                        ch.token = WORKER_TOKEN;
+                        currentChunk = { job_id: ch.job_id, chunk_index: ch.chunk_index };
+                        log(`CHUNK ${ch.chunk_index} of ${ch.filename}`, 'sys');
+                        await runChunkInWorker(ch);
+                        currentChunk = null;
+                        log("Chunk complete.", 'succ');
+                        continue;
+                    }
+                    if (cdata.status === 'retry') { await sleep((cdata.wait || 3) * 1000); continue; }
+                    // status 'empty' / chunking disabled → fall through to /get_job
+                }
+
+                // B. GET JOB (whole small files) — must send the version param or
+                // the manager's MIN_CLIENT_VERSION gate returns "Update Required".
+                const res = await fetch(`/get_job?max_size_mb=${currentMaxSizeMb}&version=${encodeURIComponent(WEB_WORKER_VERSION)}${_authQS}`);
                 const data = await res.json();
 
+                if (res.status === 401) {
+                    log("Manager rejected the worker token. Open this page via the manager's /web URL, or append ?token=YOUR_SECRET.", 'err');
+                    await sleep(15000);
+                    continue;
+                }
+
                 if (data.status === 'empty') {
+                    // Distinguish a real empty queue from a version rejection.
+                    if (data.message) log("Manager: " + data.message, 'err');
                     await sleep(10000);
                     continue;
                 }
@@ -305,13 +421,17 @@
                 if (data.status === 'ok') {
                     const job = data.job;
                     job.worker_id = currentWorkerId;
-                    
+                    job.wallet = currentWallet;
+                    job.token = WORKER_TOKEN;
+                    currentJobId = job.id;
+
                     log(`STARTING JOB: ${job.filename} (${job.id})`, 'sys');
 
                     // Run in worker and wait
                     await runJobInWorker(job);
+                    currentJobId = null;
                     log("Job Cycle Complete.", 'succ');
-                    
+
                     // Optional: Restart worker every few jobs to clear fragmentation?
                     // For now, let's keep it running unless it crashes.
                 }
