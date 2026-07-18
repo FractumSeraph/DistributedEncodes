@@ -9,12 +9,18 @@ Run from the same directory as config.py (like the other utility scripts):
     python3 find_truncated.py                 # detect + report only (safe)
     python3 find_truncated.py --requeue       # also reset the bad ones to 'queued'
     python3 find_truncated.py --local-only    # skip probing remote sources (faster)
+    python3 find_truncated.py --include-missing  # also re-encode jobs with no file
 
 Detection: compares the completed .mp4's duration against the source duration
 (taken from the job's stored source_duration_sec when present, otherwise probed
-with ffprobe). A job is flagged when the output is shorter than the source by
-more than the tolerance (default 5% + 10s), or when its completed file is
-missing entirely. Minor rounding differences are ignored.
+with ffprobe). A job is flagged as TRUNCATED when the output is shorter than the
+source by more than the tolerance (default 5% + 10s). Minor rounding differences
+are ignored.
+
+Missing output files are reported separately and, by DEFAULT, are treated as
+informational only — outputs are routinely moved off-server to archive/storage,
+so a missing file is expected, not a defect. Pass --include-missing to also
+re-encode those (only do this if you know the outputs are truly gone).
 
 Nothing is changed unless you pass --requeue.
 """
@@ -69,9 +75,14 @@ def source_target(job_id, source_type, source_url):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--requeue', action='store_true',
-                    help="Reset flagged jobs to 'queued' so they re-encode.")
+                    help="Reset TRUNCATED jobs to 'queued' so they re-encode.")
     ap.add_argument('--local-only', action='store_true',
                     help="Skip jobs whose source is remote (don't probe over HTTP).")
+    ap.add_argument('--include-missing', action='store_true',
+                    help="Also treat completed jobs with NO output file on disk as "
+                         "needing re-encode. OFF by default, because outputs are "
+                         "normally moved off-server for storage — a missing file is "
+                         "expected, not a defect.")
     ap.add_argument('--tolerance-pct', type=float, default=5.0,
                     help="Allowed shortfall as %% of source duration (default 5).")
     ap.add_argument('--min-tolerance', type=float, default=10.0,
@@ -131,7 +142,11 @@ def main():
         for jid, o, s in truncated:
             print(f"      {o/60:6.1f}m / {s/60:6.1f}m   {jid}")
     if missing_output:
-        print(f"\n[!] {len(missing_output)} completed job(s) with NO output file on disk:")
+        tag = "[!]" if args.include_missing else "[-]"
+        note = ("" if args.include_missing
+                else "  (not on server — likely moved to archive/storage; "
+                     "NOT counted as needing re-encode)")
+        print(f"\n{tag} {len(missing_output)} completed job(s) with NO output file on disk:{note}")
         for jid in missing_output:
             print(f"      {jid}")
     if missing_source:
@@ -141,8 +156,13 @@ def main():
     if skipped_remote:
         print(f"\n[-] {skipped_remote} remote job(s) skipped (--local-only).")
 
-    to_fix = [t[0] for t in truncated] + missing_output
+    to_fix = [t[0] for t in truncated]
+    if args.include_missing:
+        to_fix += missing_output
     print(f"\n[*] {len(to_fix)} job(s) need re-encoding.")
+    if missing_output and not args.include_missing:
+        print(f"    ({len(missing_output)} missing-output job(s) NOT included — "
+              f"pass --include-missing if those really need re-encoding.)")
 
     if not to_fix:
         conn.close()

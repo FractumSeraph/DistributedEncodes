@@ -388,13 +388,18 @@ python3 reset_series.py "ShowName"
 
 ### `find_truncated.py`
 Finds completed jobs whose encoded output is much shorter than its source —
-truncated encodes that were accepted before the upload length-check existed
-(and jobs marked completed with no output file on disk):
+truncated encodes that were accepted before the upload length-check existed:
 ```bash
-python3 find_truncated.py              # detect + report only (safe)
-python3 find_truncated.py --requeue    # also reset the bad ones to 'queued'
-python3 find_truncated.py --local-only # skip probing remote sources
+python3 find_truncated.py                # detect + report only (safe)
+python3 find_truncated.py --requeue      # also reset the truncated ones to 'queued'
+python3 find_truncated.py --local-only   # skip probing remote sources
+python3 find_truncated.py --include-missing  # also re-encode jobs with no output file
 ```
+> **Missing outputs are informational by default.** Because finished encodes are
+> routinely moved off-server to archive/storage, a completed job with no file on
+> disk is *expected*, not a defect — those are listed separately and **not**
+> counted as needing re-encode. Only add `--include-missing` if you know those
+> outputs are truly gone and must be regenerated.
 > **RAM mode:** detection is always safe to run, but `--requeue` writes to the
 > disk DB, which a running RAM-mode manager overwrites on its next sync — stop
 > the manager before `--requeue` and start it again after (it reloads the newer
