@@ -230,7 +230,8 @@
     let isRunning = false;
     let worker = null;
     let currentWorkerId = "";
-    let currentJobId = null;   // the job this node is actively encoding, for stop-time release
+    let currentJobId = null;   // the whole-file job this node is encoding, for stop-time release
+    let currentChunk = null;   // {job_id, chunk_index} of an in-flight chunk, for release + heartbeat
 
     // Must be >= manager MIN_CLIENT_VERSION or /get_job returns "Update Required".
     const WEB_WORKER_VERSION = "3.3.0";
@@ -269,12 +270,55 @@
             } catch (e) { /* best effort */ }
             currentJobId = null;
         }
+        // Release an in-flight chunk so the manager reassigns it promptly.
+        if (currentChunk) {
+            try {
+                fetch('/report_chunk' + (WORKER_TOKEN ? ('?token=' + encodeURIComponent(WORKER_TOKEN)) : ''), {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ job_id: currentChunk.job_id, chunk_index: currentChunk.chunk_index,
+                                           kind: 'video', worker_id: currentWorkerId,
+                                           status: 'abandoned', version: WEB_WORKER_VERSION })
+                });
+            } catch (e) { /* best effort */ }
+            currentChunk = null;
+        }
         if (worker) {
             worker.terminate();
             worker = null;
             log("Worker terminated immediately.", 'err');
             toggleButtons(false);
         }
+    }
+
+    // While a chunk encodes (wasm callMain blocks the Worker thread), the page
+    // thread stays free — send periodic heartbeats so the manager's 30-min
+    // stale-chunk sweep never reassigns a chunk we're slowly but actively
+    // encoding. Returns a stop() function.
+    function startChunkHeartbeat(jobId, chunkIndex) {
+        const id = setInterval(() => {
+            fetch('/report_chunk' + (WORKER_TOKEN ? ('?token=' + encodeURIComponent(WORKER_TOKEN)) : ''), {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ job_id: jobId, chunk_index: chunkIndex, kind: 'video',
+                                       worker_id: currentWorkerId, status: 'processing',
+                                       progress: 0, version: WEB_WORKER_VERSION })
+            }).catch(() => {});
+        }, 15000);
+        return () => clearInterval(id);
+    }
+
+    function runChunkInWorker(chunk) {
+        return new Promise((resolve, reject) => {
+            if (!worker) { reject(new Error("Worker not initialized")); return; }
+            const stopHb = startChunkHeartbeat(chunk.job_id, chunk.chunk_index);
+            worker.onmessage = (e) => {
+                const msg = e.data;
+                if (msg.type === 'log') log(msg.msg, msg.level);
+                else if (msg.type === 'chunk_done' || msg.type === 'chunk_stale') { stopHb(); resolve(); }
+                else if (msg.type === 'chunk_error') { stopHb(); reject(new Error(msg.msg)); }
+            };
+            worker.onerror = (e) => { stopHb(); worker = null; reject(new Error("Worker Crashed: " + e.message)); };
+            worker.postMessage({type: 'run_chunk', chunk: chunk});
+        });
     }
 
     async function initWorker() {
@@ -334,9 +378,30 @@
 
         while (isRunning) {
             try {
-                // A. GET JOB — must send the version param or the manager's
-                // MIN_CLIENT_VERSION gate returns "Update Required". max_size_mb
-                // keeps the browser from being handed a file too big for wasm.
+                // A. CHUNK FIRST — take a slice of a large video via a pre-cut
+                // segment (video_only: browsers can't do the whole-file audio
+                // chunk). This is how browser nodes help on multi-GB sources.
+                const cres = await fetch(`/get_chunk?video_only=1&max_size_mb=${currentMaxSizeMb}&version=${encodeURIComponent(WEB_WORKER_VERSION)}${_authQS}`);
+                if (cres.status === 200) {
+                    const cdata = await cres.json();
+                    if (cdata.status === 'ok' && cdata.chunk) {
+                        const ch = cdata.chunk;
+                        ch.worker_id = currentWorkerId;
+                        ch.wallet = currentWallet;
+                        ch.token = WORKER_TOKEN;
+                        currentChunk = { job_id: ch.job_id, chunk_index: ch.chunk_index };
+                        log(`CHUNK ${ch.chunk_index} of ${ch.filename}`, 'sys');
+                        await runChunkInWorker(ch);
+                        currentChunk = null;
+                        log("Chunk complete.", 'succ');
+                        continue;
+                    }
+                    if (cdata.status === 'retry') { await sleep((cdata.wait || 3) * 1000); continue; }
+                    // status 'empty' / chunking disabled → fall through to /get_job
+                }
+
+                // B. GET JOB (whole small files) — must send the version param or
+                // the manager's MIN_CLIENT_VERSION gate returns "Update Required".
                 const res = await fetch(`/get_job?max_size_mb=${currentMaxSizeMb}&version=${encodeURIComponent(WEB_WORKER_VERSION)}${_authQS}`);
                 const data = await res.json();
 
@@ -366,7 +431,7 @@
                     await runJobInWorker(job);
                     currentJobId = null;
                     log("Job Cycle Complete.", 'succ');
-                    
+
                     // Optional: Restart worker every few jobs to clear fragmentation?
                     // For now, let's keep it running unless it crashes.
                 }

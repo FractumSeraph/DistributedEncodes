@@ -25,7 +25,7 @@ except ImportError:
     exit(1)
 
 # Flask & Extensions
-from flask import Flask, request, jsonify, render_template, send_from_directory, send_file, Response, abort
+from flask import Flask, request, jsonify, render_template, send_from_directory, send_file, Response, abort, after_this_request
 from werkzeug.exceptions import HTTPException
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -688,15 +688,19 @@ def _split_claimed_job(job):
         finally:
             conn.close()
 
-def _assign_pending_chunk(worker_id, folder_filter, max_size_mb):
+def _assign_pending_chunk(worker_id, folder_filter, max_size_mb, video_only=False):
     """Hand the oldest pending chunk to a worker. Prioritizes the earliest-started
-    job so the swarm finishes one video before spilling into the next."""
+    job so the swarm finishes one video before spilling into the next.
+    video_only=True (browser workers) skips the whole-file audio chunk, which
+    they can't segment; a native worker encodes the audio track."""
     with db_lock:
         conn = db_handler.get_connection()
         conn.row_factory = sqlite3.Row
         try:
             params = []
             query_parts = ["c.status='pending'", "j.status='processing'", "COALESCE(j.chunked,0)=1"]
+            if video_only:
+                query_parts.append("c.kind='video'")
             if folder_filter:
                 query_parts.append("j.id LIKE ?")
                 params.append(f"{folder_filter}%")
@@ -732,6 +736,11 @@ def _assign_pending_chunk(worker_id, folder_filter, max_size_mb):
             c.execute("UPDATE jobs SET last_updated=? WHERE id=?", (now, chunk['job_id']))
             conn.commit()
             chunk['download_url'] = build_download_url(chunk['job_id'], chunk['source_type'], chunk.pop('source_url'))
+            # Browser workers can't range-stream a multi-GB source, so they fetch
+            # a small pre-cut segment for this chunk instead (see /download_segment).
+            if chunk['kind'] == 'video':
+                chunk['segment_url'] = (f"{SERVER_URL_DISPLAY.rstrip('/')}/download_segment"
+                                        f"?job_id={quote(chunk['job_id'], safe='')}&chunk_index={chunk['chunk_index']}")
             return chunk
         finally:
             conn.close()
@@ -1545,6 +1554,9 @@ def get_chunk():
     series_id = request.args.get('series_id')
     worker_id = sanitize_input(request.args.get('worker_id'))
     worker_version = sanitize_input(request.args.get('version'))
+    # Browser workers pass video_only=1: they fetch a pre-cut segment per video
+    # chunk and can't handle the whole-file audio chunk.
+    video_only = request.args.get('video_only') in ('1', 'true', 'yes')
 
     if is_worker_banned(worker_id):
         return jsonify({"status": "empty", "message": "Unauthorized"}), 403
@@ -1554,7 +1566,7 @@ def get_chunk():
     try:
         folder_filter = _resolve_folder_filter(series_id)
 
-        chunk = _assign_pending_chunk(worker_id, folder_filter, max_size_mb)
+        chunk = _assign_pending_chunk(worker_id, folder_filter, max_size_mb, video_only=video_only)
         if chunk is None:
             if SPLIT_LOCK.acquire(blocking=False):
                 # No pending chunks anywhere — split the next queued job.
@@ -1566,7 +1578,7 @@ def get_chunk():
                 try:
                     job = _claim_job_for_split(folder_filter, max_size_mb)
                     if job is not None and _split_claimed_job(job):
-                        chunk = _assign_pending_chunk(worker_id, folder_filter, max_size_mb)
+                        chunk = _assign_pending_chunk(worker_id, folder_filter, max_size_mb, video_only=video_only)
                 finally:
                     SPLIT_LOCK.release()
             else:
@@ -1582,6 +1594,114 @@ def get_chunk():
     except Exception as e:
         log_event("ERROR", f"get_chunk failed: {e}")
         return jsonify({"status": "error"}), 500
+
+# Small tail past the chunk end so the segment reliably contains the full
+# [start, start+dur] window after keyframe/rounding effects. With -copyts + -to
+# the end is anchored to an ABSOLUTE timestamp, so this need only cover rounding
+# (not the GOP length — unlike a -t-based cut, which measures from the keyframe).
+_SEGMENT_GUARD_SEC = 2.0
+
+@app.route('/download_segment', methods=['GET'])
+@requires_worker_auth
+def download_segment():
+    """Stream a small, standalone, keyframe-aligned segment covering one video
+    chunk's time range — so a browser worker can encode a chunk of a multi-GB
+    source without downloading the whole file.
+
+    The cut is a lossless stream copy with -copyts, so the segment keeps the
+    source's absolute timestamps: the worker then does an accurate
+    `-ss <start> -t <dur>` seek INSIDE the segment and gets exactly the same
+    [start, start+dur] window a native chunk worker produces — so browser and
+    desktop chunks tile identically at assembly.
+    """
+    job_id = (request.args.get('job_id') or '').strip()
+    try:
+        chunk_index = int(request.args.get('chunk_index'))
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "chunk_index required"}), 400
+    if not job_id:
+        return jsonify({"status": "error", "message": "job_id required"}), 400
+
+    with db_lock:
+        conn = db_handler.get_connection()
+        conn.row_factory = sqlite3.Row
+        try:
+            c = conn.cursor()
+            c.execute("SELECT start_sec, duration_sec FROM chunks WHERE job_id=? AND kind='video' AND chunk_index=?",
+                      (job_id, chunk_index))
+            crow = c.fetchone()
+            c.execute("SELECT source_type, source_url FROM jobs WHERE id=?", (job_id,))
+            jrow = c.fetchone()
+        finally:
+            conn.close()
+    if crow is None or jrow is None:
+        return abort(404)
+
+    start = float(crow['start_sec'] or 0)
+    dur = float(crow['duration_sec'] or 0)
+    if jrow['source_type'] == 'remote':
+        src = build_download_url(job_id, 'remote', jrow['source_url'])
+        src_input = src
+    else:
+        src_input = os.path.join(SOURCE_DIRECTORY, job_id.replace('/', os.sep))
+        if not os.path.isfile(src_input):
+            return abort(404)
+
+    seg_dir = os.path.join("temp_uploads", "segments")
+    os.makedirs(seg_dir, exist_ok=True)
+    seg_path = os.path.join(seg_dir, f"{uuid.uuid4().hex}.mkv")
+
+    # -copyts keeps absolute timestamps; -ss before -i seeks to the keyframe at
+    # or before `start`; -to anchors the end to an ABSOLUTE time so the window is
+    # always covered regardless of GOP length. Matroska handles the copied
+    # stream + preserved timestamps cleanly and streams progressively.
+    input_flags = ['-ss', f"{start:.3f}"]
+    if jrow['source_type'] == 'remote':
+        input_flags = ['-headers', f"X-Worker-Token: {WORKER_SECRET}\r\n"] + input_flags
+    cmd = (['ffmpeg', '-y', '-copyts'] + input_flags +
+           ['-i', src_input, '-to', f"{start + dur + _SEGMENT_GUARD_SEC:.3f}",
+            '-map', '0:v:0', '-c', 'copy', '-f', 'matroska', seg_path])
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if res.returncode != 0 or not os.path.exists(seg_path) or os.path.getsize(seg_path) == 0:
+            try:
+                if os.path.exists(seg_path): os.remove(seg_path)
+            except OSError: pass
+            log_event("WARN", f"Segment extraction failed for chunk {chunk_index} (rc={res.returncode})", job_id)
+            return jsonify({"status": "error", "message": "segment extraction failed"}), 500
+    except Exception as e:
+        try:
+            if os.path.exists(seg_path): os.remove(seg_path)
+        except OSError: pass
+        log_event("WARN", f"Segment extraction error for chunk {chunk_index}: {e}", job_id)
+        return jsonify({"status": "error", "message": "segment extraction error"}), 500
+
+    # The copied segment starts at the keyframe at-or-before `start`, and input
+    # -ss on it is start_time-relative, so the worker must seek by the LEAD
+    # (start - segment_start_time), not by absolute `start`. Probe the header
+    # for that start_time and hand the worker the exact lead + duration.
+    seg_start = 0.0
+    try:
+        pr = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'format=start_time',
+                             '-of', 'default=nw=1:nk=1', seg_path],
+                            capture_output=True, text=True, timeout=30)
+        seg_start = float((pr.stdout or '0').strip() or 0)
+    except Exception:
+        seg_start = 0.0
+    lead = max(0.0, start - seg_start)
+
+    @after_this_request
+    def _cleanup(response):
+        try: os.remove(seg_path)
+        except OSError: pass
+        return response
+
+    resp = send_file(seg_path, mimetype='video/x-matroska', as_attachment=True,
+                     download_name=f"segment_{chunk_index}.mkv")
+    # Worker reads these to run: -ss <lead> -i seg -t <duration>  (accurate seek)
+    resp.headers['X-Segment-Lead'] = f"{lead:.3f}"
+    resp.headers['X-Segment-Duration'] = f"{dur:.3f}"
+    return resp
 
 @app.route('/upload_chunk', methods=['POST'])
 @requires_worker_auth
@@ -2329,20 +2449,23 @@ def handle_exception(e):
     return "Internal Server Error", 500
 
 def sweep_quarantine():
-    """Remove stale files from the quarantine upload directory."""
-    quarantine_dir = os.path.join("temp_uploads", "quarantine")
-    if not os.path.exists(quarantine_dir): return
+    """Remove stale files from the quarantine + segment temp directories."""
     cutoff = time.time() - 3600  # 1 hour
     count = 0
-    for fname in os.listdir(quarantine_dir):
-        fpath = os.path.join(quarantine_dir, fname)
-        try:
-            if os.path.isfile(fpath) and os.path.getmtime(fpath) < cutoff:
-                os.remove(fpath)
-                count += 1
-        except Exception: pass
+    # segment temp files are normally deleted right after send; sweep covers
+    # aborted downloads where after_this_request didn't fire.
+    for sub in ("quarantine", "segments"):
+        d = os.path.join("temp_uploads", sub)
+        if not os.path.exists(d): continue
+        for fname in os.listdir(d):
+            fpath = os.path.join(d, fname)
+            try:
+                if os.path.isfile(fpath) and os.path.getmtime(fpath) < cutoff:
+                    os.remove(fpath)
+                    count += 1
+            except Exception: pass
     if count > 0:
-        print(f"[*] Quarantine sweep: removed {count} stale file(s).")
+        print(f"[*] Temp sweep: removed {count} stale file(s).")
 
 def maintenance_loop():
     while True:

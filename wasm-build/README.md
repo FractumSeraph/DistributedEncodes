@@ -74,10 +74,13 @@ between versions. If a `docker build` fails, it's almost certainly one of these:
 ## Memory reality (why this only takes small files)
 
 The build is 32-bit (`--arch=x86_32`), so the whole process is capped near 2 GB
-usable, and `--disable-network` means the page must load the entire source into
-memory before encoding. That's why the browser worker is limited to small files
-(the `/web` page's "MAX SOURCE MB" control, default 150). Making it handle the
-multi-GB sources would require **manager-side segmentation** — serving small,
-independently-decodable pieces to the browser rather than whole files. See the
-project discussion / ask the maintainer before building that; it's an additive
-manager feature, not a wasm rebuild.
+usable, and `--disable-network` means the page must load its input into memory
+before encoding.
+
+For **whole-file** browser jobs that limits you to small sources (the `/web`
+page's "MAX SOURCE MB", default 150). For **large** sources, the browser worker
+uses **server-side segmentation** (implemented): it takes one chunk at a time
+and downloads only that chunk's small pre-cut segment via `/download_segment`,
+so it never loads a multi-GB file. See the "Server-side segmentation" section in
+the main README. That means a newer wasm doesn't need memory64 to help on big
+files — segmentation already keeps each piece small.

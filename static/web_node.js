@@ -117,11 +117,94 @@ self.onmessage = async function(e) {
         return; // Don't pass job messages to Emscripten
     }
 
+    // Chunk of a large video: encode one time-slice from a pre-cut segment.
+    if (msg && msg.type === 'run_chunk') {
+        try {
+            await processChunk(msg.chunk);
+        } catch (err) {
+            postMessage({type: 'chunk_error', msg: err.toString()});
+        }
+        return;
+    }
+
     // Pass everything else (e.g. Pthread messages) to Emscripten
     if (emscriptenOnMessage) {
         emscriptenOnMessage(e);
     }
 };
+
+// Encode one video chunk of a large source. The manager streams a small,
+// keyframe-aligned segment (with an accurate lead offset in the response
+// headers); we seek into it and encode exactly [start, start+dur], matching
+// what a native chunk worker produces so assembly tiles perfectly.
+async function processChunk(chunk) {
+    const FS = self.Module.FS || self.FS;
+    const callMain = self.Module.callMain || self.callMain;
+    if (!FS || !callMain) throw new Error(`FFmpeg primitives missing. FS:${!!FS} callMain:${!!callMain}`);
+
+    const segPath = "/tmp/seg_" + Date.now() + ".mkv";
+    const outPath = "/tmp/cout_" + Date.now() + ".mp4";
+    const crf = (chunk.content_profile === 'live_action') ? '57' : '63';
+
+    postMessage({type: 'log', level: 'sys', msg: `Chunk ${chunk.chunk_index} of ${chunk.filename}: downloading segment...`});
+    try {
+        const headers = chunk.token ? { 'X-Worker-Token': chunk.token } : {};
+        const resp = await fetch(chunk.segment_url, { headers });
+        if (!resp.ok) throw new Error("Segment download failed: " + resp.status);
+        // Accurate inner seek offset + duration come from the manager.
+        const lead = parseFloat(resp.headers.get('X-Segment-Lead') || '0') || 0;
+        const dur  = parseFloat(resp.headers.get('X-Segment-Duration') || String(chunk.duration_sec)) || chunk.duration_sec;
+
+        const data = new Uint8Array(await resp.arrayBuffer());
+        try { FS.mkdir('/tmp'); } catch(e) {}
+        FS.writeFile(segPath, data);
+        postMessage({type: 'log', level: 'sys', msg: `Segment ${data.length} bytes; encoding [lead=${lead.toFixed(2)}s dur=${dur.toFixed(2)}s]...`});
+
+        // Same targets as the native chunk path: video-only, SVT-AV1 preset 2,
+        // CRF (profile-aware), 480p, timestamps re-zeroed for clean concat.
+        const args = [
+            '-threads', '1', '-v', 'verbose',
+            '-ss', lead.toFixed(3), '-i', segPath, '-t', dur.toFixed(3),
+            '-map', '0:v:0', '-an', '-sn',
+            '-c:v', 'libsvtav1', '-preset', '2', '-crf', crf,
+            '-pix_fmt', 'yuv420p',
+            '-svtav1-params', 'tune=0:lp=1',
+            '-vf', 'setpts=PTS-STARTPTS,scale=-2:480',
+            '-movflags', '+faststart',
+            outPath
+        ];
+        currentOutputPath = outPath;
+        const ffmpegPromise = new Promise((resolve, reject) => { self.resolveJob = resolve; self.rejectJob = reject; });
+        callMain(args);
+        await ffmpegPromise;
+
+        let exists = false;
+        try { FS.stat(outPath); exists = true; } catch(e) {}
+        if (!exists) throw new Error("FFmpeg produced no chunk output.");
+        const outData = FS.readFile(outPath);
+        const blob = new Blob([outData], { type: 'video/mp4' });
+
+        postMessage({type: 'log', level: 'sys', msg: `Uploading chunk (${outData.length} bytes)...`});
+        const fd = new FormData();
+        fd.append('job_id', chunk.job_id);
+        fd.append('worker_id', chunk.worker_id);
+        fd.append('kind', 'video');
+        fd.append('chunk_index', chunk.chunk_index);
+        if (chunk.wallet) fd.append('wallet', chunk.wallet);
+        fd.append('file', blob, `chunk_${chunk.chunk_index}.mp4`);
+        const up = await fetch('/upload_chunk', {
+            method: 'POST', body: fd,
+            headers: chunk.token ? { 'X-Worker-Token': chunk.token } : {}
+        });
+        if (up.status === 409) { postMessage({type: 'chunk_stale'}); return; }
+        if (!up.ok) throw new Error("Chunk upload failed: " + up.status);
+        postMessage({type: 'chunk_done'});
+    } finally {
+        currentOutputPath = null;
+        try { FS.unlink(segPath); } catch(e) {}
+        try { FS.unlink(outPath); } catch(e) {}
+    }
+}
 
 async function processJob(job) {
     // FS and callMain might be on Module or global scope depending on Emscripten build options

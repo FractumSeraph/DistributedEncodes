@@ -321,6 +321,17 @@ By default the manager splits long videos into ~5-minute **chunks** so that mult
 - Old workers and the browser-based web worker keep using `/get_job` untouched.
 - Watermarks (`--watermark`) are skipped on chunks so the final video is consistent.
 
+### Server-side segmentation (browser workers on big files)
+
+Browser workers can't range-stream a multi-GB source (32-bit WebAssembly, and the wasm has no network), so they'd otherwise be limited to small whole files. Segmentation fixes that:
+
+- A browser node calls `/get_chunk?video_only=1` and is assigned one of the job's existing video chunks (same plan the desktop workers use — nothing about the boundaries changes).
+- It fetches that chunk's bytes from **`/download_segment`**, which stream-copies (`-c copy`, no re-encode) just a small, keyframe-aligned segment covering the chunk's time range and returns it with `X-Segment-Lead` / `X-Segment-Duration` headers.
+- The browser seeks by the lead and encodes exactly `[start, start+dur]` — identical to what a native chunk worker produces — then uploads via `/upload_chunk`.
+- The whole-file **audio** chunk is skipped by browser nodes (`video_only`); a native worker encodes it. The manager assembles as usual.
+
+So a browser volunteer only ever downloads ~one chunk's worth of data (e.g. ~80 MB for a 5-min slice of a 2 GB file), never the whole source. Boundaries come from the single per-job chunk plan, so browser and desktop chunks tile identically.
+
 **Config** (`config.py`, both optional):
 
 ```python
@@ -350,7 +361,9 @@ Workers can attach a FractumCoin wallet address with `--wallet ADDR` (or `&walle
 Volunteers can encode small files directly in their browser — no Python, no FFmpeg install. The manager serves an in-browser node at **`/web`** (linked from the dashboard) that runs a purpose-built FFmpeg WebAssembly bundle with **SVT-AV1 + Opus** compiled in, using the same targets as the native worker (preset 2, CRF 63, 480p, mono Opus).
 
 - The page authenticates automatically (the worker token is injected server-side).
-- It only accepts small source files — set **MAX SOURCE MB** on the page (default 150). Browser encoding is memory-bound (32-bit WebAssembly), so large files can crash the tab; the manager filters jobs by that size.
+- **Big files, too:** browser nodes take chunks of large videos via *server-side segmentation* — the manager stream-copies just the piece for one chunk into a small standalone file and sends that, so the browser never downloads a multi-GB source. See "Server-side segmentation" below.
+- Whole-file browser jobs still accept only small sources — set **MAX SOURCE MB** on the page (default 150). Browser encoding is memory-bound (32-bit WebAssembly), so large *whole* files can crash the tab; the manager filters jobs by that size.
+- **Rebuilding the WASM:** the FFmpeg→WebAssembly bundle (SVT-AV1 + Opus) is rebuilt reproducibly with the Docker recipe in [`wasm-build/`](wasm-build/README.md) — use it to compile a newer AV1.
 - Threads require cross-origin isolation; the manager already sends the needed `Cross-Origin-Opener-Policy` / `Cross-Origin-Embedder-Policy` headers, and the `.wasm` is served with the correct `application/wasm` type.
 - Subtitles are dropped in the browser (no `ffprobe` in the wasm build to filter subtitle types safely); output is video + Opus audio.
 - A `WALLET` field on the page credits FractumCoin earnings just like the native `--wallet` flag.
