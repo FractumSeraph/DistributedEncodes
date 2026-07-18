@@ -1430,8 +1430,67 @@ python3 worker.py --username "{u}" --workername "{w}" --jobs {j} --manager "{SER
     return Response(script, mimetype='text/x-shellscript')
 
 @app.route('/download_source/<path:filename>')
-def download_source(filename): 
+def download_source(filename):
     return send_from_directory(SOURCE_DIRECTORY, filename, as_attachment=True)
+
+@app.route('/download_media')
+@requires_worker_auth
+def download_media():
+    """Same-origin source download for the browser worker. The /web page is
+    cross-origin isolated (COEP: require-corp), so it CANNOT fetch a remote
+    source directly — the browser blocks it with a NetworkError. This proxies
+    the source through the manager (which has no such restriction): local files
+    are served from disk, remote files are streamed through. Only used for
+    whole-file browser jobs (chunk workers use /download_segment)."""
+    job_id = (request.args.get('job_id') or '').strip()
+    if not job_id:
+        return abort(400)
+    with db_lock:
+        conn = db_handler.get_connection()
+        conn.row_factory = sqlite3.Row
+        try:
+            c = conn.cursor()
+            c.execute("SELECT source_type, source_url FROM jobs WHERE id=?", (job_id,))
+            row = c.fetchone()
+        finally:
+            conn.close()
+    if row is None:
+        return abort(404)
+
+    if row['source_type'] != 'remote':
+        # Local file: reuse the safe directory sender (blocks path traversal).
+        return send_from_directory(SOURCE_DIRECTORY, job_id, as_attachment=True)
+
+    # Remote: stream it through the manager so the browser sees a same-origin
+    # response. The manager fetches server-side (no COEP), forwarding the token.
+    remote_url = build_download_url(job_id, 'remote', row['source_url'])
+    if not remote_url:
+        return abort(404)
+    try:
+        upstream = requests.get(remote_url,
+                                headers={'User-Agent': 'FractumManager/1.0',
+                                         'X-Worker-Token': WORKER_SECRET},
+                                stream=True, timeout=60)
+    except requests.exceptions.RequestException as e:
+        log_event("WARN", f"download_media proxy failed: {e}", job_id)
+        return abort(502)
+    if upstream.status_code != 200:
+        upstream.close()
+        return abort(upstream.status_code if upstream.status_code >= 400 else 502)
+
+    from flask import stream_with_context
+    def _gen():
+        try:
+            for block in upstream.iter_content(chunk_size=1024 * 256):
+                yield block
+        finally:
+            upstream.close()
+    headers = {}
+    if upstream.headers.get('Content-Length'):
+        headers['Content-Length'] = upstream.headers['Content-Length']
+    return Response(stream_with_context(_gen()),
+                    content_type=upstream.headers.get('Content-Type', 'application/octet-stream'),
+                    headers=headers)
 
 @app.route('/get_job', methods=['GET'])
 @requires_worker_auth
