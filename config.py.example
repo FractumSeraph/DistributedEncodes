@@ -73,7 +73,13 @@ CHUNKED_ENCODING = True
 
 # Target length of each video chunk in seconds (minimum 60).
 # Shorter = more parallelism, slightly more coordination overhead.
-CHUNK_DURATION_SEC = 300
+# NOTE for browser (WASM) workers: they can only take chunks short enough to
+# fit the 32-bit WebAssembly heap — a long chunk (e.g. 300s of 1080p) traps
+# the wasm ("unreachable executed"). Browser nodes advertise a MAX CHUNK SEC
+# (default 120) and are only handed chunks at or under it; native workers take
+# any length. If you want browser volunteers to help on big videos, keep this
+# at/below their MAX CHUNK SEC (120 is a safe starting point).
+CHUNK_DURATION_SEC = 120
 
 # ==============================================================================
 # RATE LIMITING

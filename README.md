@@ -329,8 +329,9 @@ Browser workers can't range-stream a multi-GB source (32-bit WebAssembly, and th
 - It fetches that chunk's bytes from **`/download_segment`**, which stream-copies (`-c copy`, no re-encode) just a small, keyframe-aligned segment covering the chunk's time range and returns it with `X-Segment-Lead` / `X-Segment-Duration` headers.
 - The browser seeks by the lead and encodes exactly `[start, start+dur]` — identical to what a native chunk worker produces — then uploads via `/upload_chunk`.
 - The whole-file **audio** chunk is skipped by browser nodes (`video_only`); a native worker encodes it. The manager assembles as usual.
+- **Memory limit:** a browser node advertises a **MAX CHUNK SEC** (default 120) and is only handed chunks at or under that length. Long chunks (e.g. 300s of 1080p) exhaust the 32-bit WebAssembly heap and trap it (`unreachable executed`), so this cap keeps browser encodes from crashing. Native workers take any length. For browser volunteers to get work, keep `CHUNK_DURATION_SEC` at or below their MAX CHUNK SEC.
 
-So a browser volunteer only ever downloads ~one chunk's worth of data (e.g. ~80 MB for a 5-min slice of a 2 GB file), never the whole source. Boundaries come from the single per-job chunk plan, so browser and desktop chunks tile identically.
+So a browser volunteer only ever downloads ~one chunk's worth of data (e.g. ~30 MB for a 2-min slice of a 2 GB file), never the whole source. Boundaries come from the single per-job chunk plan, so browser and desktop chunks tile identically.
 
 **Config** (`config.py`, both optional):
 

@@ -688,11 +688,15 @@ def _split_claimed_job(job):
         finally:
             conn.close()
 
-def _assign_pending_chunk(worker_id, folder_filter, max_size_mb, video_only=False):
+def _assign_pending_chunk(worker_id, folder_filter, max_size_mb, video_only=False, max_chunk_sec=None):
     """Hand the oldest pending chunk to a worker. Prioritizes the earliest-started
     job so the swarm finishes one video before spilling into the next.
     video_only=True (browser workers) skips the whole-file audio chunk, which
-    they can't segment; a native worker encodes the audio track."""
+    they can't segment; a native worker encodes the audio track.
+    max_chunk_sec caps the chunk LENGTH a worker will accept — browser (wasm)
+    workers set this so they are never handed a chunk too long to hold in the
+    32-bit heap (which traps as 'unreachable executed'); native workers leave it
+    unset and take any length."""
     with db_lock:
         conn = db_handler.get_connection()
         conn.row_factory = sqlite3.Row
@@ -701,6 +705,12 @@ def _assign_pending_chunk(worker_id, folder_filter, max_size_mb, video_only=Fals
             query_parts = ["c.status='pending'", "j.status='processing'", "COALESCE(j.chunked,0)=1"]
             if video_only:
                 query_parts.append("c.kind='video'")
+            if max_chunk_sec:
+                try:
+                    query_parts.append("c.duration_sec <= ?")
+                    params.append(float(max_chunk_sec))
+                except (TypeError, ValueError):
+                    pass
             if folder_filter:
                 query_parts.append("j.id LIKE ?")
                 params.append(f"{folder_filter}%")
@@ -1614,8 +1624,11 @@ def get_chunk():
     worker_id = sanitize_input(request.args.get('worker_id'))
     worker_version = sanitize_input(request.args.get('version'))
     # Browser workers pass video_only=1: they fetch a pre-cut segment per video
-    # chunk and can't handle the whole-file audio chunk.
+    # chunk and can't handle the whole-file audio chunk. max_chunk_sec caps the
+    # chunk length they'll accept so the 32-bit wasm doesn't OOM/trap on a long
+    # chunk; native workers omit it.
     video_only = request.args.get('video_only') in ('1', 'true', 'yes')
+    max_chunk_sec = request.args.get('max_chunk_sec')
 
     if is_worker_banned(worker_id):
         return jsonify({"status": "empty", "message": "Unauthorized"}), 403
@@ -1625,7 +1638,7 @@ def get_chunk():
     try:
         folder_filter = _resolve_folder_filter(series_id)
 
-        chunk = _assign_pending_chunk(worker_id, folder_filter, max_size_mb, video_only=video_only)
+        chunk = _assign_pending_chunk(worker_id, folder_filter, max_size_mb, video_only=video_only, max_chunk_sec=max_chunk_sec)
         if chunk is None:
             if SPLIT_LOCK.acquire(blocking=False):
                 # No pending chunks anywhere — split the next queued job.
@@ -1637,7 +1650,7 @@ def get_chunk():
                 try:
                     job = _claim_job_for_split(folder_filter, max_size_mb)
                     if job is not None and _split_claimed_job(job):
-                        chunk = _assign_pending_chunk(worker_id, folder_filter, max_size_mb, video_only=video_only)
+                        chunk = _assign_pending_chunk(worker_id, folder_filter, max_size_mb, video_only=video_only, max_chunk_sec=max_chunk_sec)
                 finally:
                     SPLIT_LOCK.release()
             else:
