@@ -191,8 +191,13 @@ class QuotaTracker:
     def _save(self):
         today = datetime.now().strftime("%Y-%m-%d")
         try:
-            with open(self.filename, 'w') as f:
+            # Atomic write (temp + rename) so a concurrent reader — e.g. another
+            # worker process sharing this --workername, or check_cap() mid-write —
+            # never sees a half-written file and mis-parses it as "under quota".
+            tmp = f"{self.filename}.{os.getpid()}.tmp"
+            with open(tmp, 'w') as f:
                 json.dump({"date": today, "bytes": self.current_usage}, f)
+            os.replace(tmp, self.filename)
         except: pass
 
     def check_cap(self):
@@ -792,6 +797,19 @@ def signal_handler(sig, frame):
                 sys.stdout.write('\n\n[!] PAUSE REQUESTED (Stopping gracefully...)\n')
                 sys.stdout.flush()
             except: pass
+        else:
+            # Second Ctrl+C while already pausing = force abort, as the pause
+            # menu advertises. A custom SIGINT handler means readline never
+            # raises KeyboardInterrupt, so abort here directly. os._exit is
+            # abrupt by design (that's what "force" means); ffmpeg children are
+            # killed first.
+            try: kill_processes()
+            except: pass
+            try:
+                sys.stdout.write('\n[!] Force abort.\n')
+                sys.stdout.flush()
+            except: pass
+            os._exit(1)
 
 def toggle_processes(suspend=True):
     if platform.system() == 'Windows':
@@ -952,6 +970,24 @@ def get_seconds(t):
         h = int(parts[0]); m = int(parts[1]); s = float(parts[2])
         return h*3600 + m*60 + s
     except: return 0
+
+# ==============================================================================
+# ENCODE HEARTBEAT
+# ==============================================================================
+
+def _start_heartbeat(fn, interval=30):
+    """Run fn() every `interval` seconds on a daemon thread until the returned
+    Event is set. Used to keep sending status to the manager even while the
+    encode loop is blocked in readline() (e.g. ffmpeg SIGSTOP'd during a pause),
+    so a long pause doesn't get the job/chunk reassigned. Extra posts are
+    harmless; the loop's own 10s posts continue when it's running."""
+    stop = threading.Event()
+    def _run():
+        while not stop.wait(interval):
+            try: fn()
+            except Exception: pass
+    threading.Thread(target=_run, daemon=True).start()
+    return stop
 
 # ==============================================================================
 # RESUME / PARTIAL ENCODE HELPERS
@@ -2330,6 +2366,13 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
 
                     with PROC_LOCK: ACTIVE_PROCS[worker_id] = proc
 
+                    # Independent heartbeat: keeps the manager updated even while
+                    # this loop is blocked in readline() with a SIGSTOP'd ffmpeg
+                    # (a pause), so a long pause doesn't get the job reassigned.
+                    _hb = {"pct": 0}
+                    _hb_stop = _start_heartbeat(
+                        lambda: post_status("paused" if PAUSE_REQUESTED else "processing", _hb["pct"]))
+
                     raw_log_path = os.path.join(temp_dir, "encode.log")
                     with open(raw_log_path, 'w', encoding='utf-8') as raw_log:
                         while True:
@@ -2355,6 +2398,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                                     curr_sec = get_seconds(time_str)
                                     pct = min(100, int((curr_sec/total_sec)*100))
                                     last_enc_pct = pct
+                                    _hb["pct"] = pct
 
                                     if single_mode: print_progress(worker_id, curr_sec, total_sec, prefix='Enc')
                                     else: update_status(f"Enc {pct}%")
@@ -2365,6 +2409,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                                         last_hb = last_rep
                                 except: pass
 
+                    _hb_stop.set()
                     with PROC_LOCK:
                         if worker_id in ACTIVE_PROCS: del ACTIVE_PROCS[worker_id]
 

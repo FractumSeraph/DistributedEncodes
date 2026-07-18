@@ -24,7 +24,19 @@ SECRET_KEY = "ChangeThisToAnotherRandomString"
 # missing token was waved through, so the secret gated nothing. Regular
 # workers already send the token, so they are unaffected. Set False only if
 # you intentionally run a fully open, anonymous-worker manager.
+# This also gates /download_source (the raw source library).
 REQUIRE_WORKER_TOKEN = True
+
+# ==============================================================================
+# DATABASE BACKUPS
+# ==============================================================================
+# The database is the single source of truth for the whole queue and the
+# FractumCoin earnings ledger, so it is backed up on a schedule (consistent
+# SQLite backup, safe while live). Keeps the newest DB_BACKUP_RETENTION copies.
+DB_BACKUP_ENABLED = True
+DB_BACKUP_DIR = "db_backups"
+DB_BACKUP_INTERVAL_HOURS = 12
+DB_BACKUP_RETENTION = 10
 
 # ==============================================================================
 # FILE & DIRECTORY SETTINGS
