@@ -223,9 +223,14 @@ async function processJob(job) {
     postMessage({type: 'log', level: 'sys', msg: `Worker processing: ${job.filename}`});
 
     try {
-        // 1. Download
-        postMessage({type: 'log', level: 'sys', msg: "Downloading source..."});
-        const resp = await fetch(job.download_url);
+        // 1. Download — ALWAYS via the manager (same-origin). The /web page is
+        // cross-origin isolated (COEP: require-corp), so fetching a remote
+        // source directly (job.download_url can point off-origin) fails with a
+        // NetworkError. /download_media proxies remote sources and serves local
+        // ones, so the browser always sees a same-origin response.
+        postMessage({type: 'log', level: 'sys', msg: "Downloading source (via manager)..."});
+        const mediaUrl = '/download_media?job_id=' + encodeURIComponent(job.id);
+        const resp = await fetch(mediaUrl, { headers: job.token ? { 'X-Worker-Token': job.token } : {} });
         if (!resp.ok) throw new Error("Download failed: " + resp.status);
         
         const buf = await resp.arrayBuffer();
