@@ -386,6 +386,21 @@ Resets all jobs matching a series name back to `queued` so they re-encode:
 python3 reset_series.py "ShowName"
 ```
 
+### `find_truncated.py`
+Finds completed jobs whose encoded output is much shorter than its source —
+truncated encodes that were accepted before the upload length-check existed
+(and jobs marked completed with no output file on disk):
+```bash
+python3 find_truncated.py              # detect + report only (safe)
+python3 find_truncated.py --requeue    # also reset the bad ones to 'queued'
+python3 find_truncated.py --local-only # skip probing remote sources
+```
+> **RAM mode:** detection is always safe to run, but `--requeue` writes to the
+> disk DB, which a running RAM-mode manager overwrites on its next sync — stop
+> the manager before `--requeue` and start it again after (it reloads the newer
+> disk copy), or re-queue the listed jobs from the admin panel instead. The
+> script warns and asks for confirmation when it detects RAM mode.
+
 ### `update.sh` / `update.ps1`
 Pulls the latest code from git and restarts the service. Run on the manager host.
 
