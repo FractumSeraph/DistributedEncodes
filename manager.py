@@ -1,6 +1,7 @@
 import os
 import time
 import threading
+import contextlib
 import sqlite3
 import subprocess
 import json
@@ -92,6 +93,25 @@ try:
     except ImportError:
         REQUIRE_WORKER_TOKEN = True
 
+    # Periodic timestamped backups of the job/earnings database, so a
+    # corruption or bad disk write doesn't wipe the whole queue.
+    try:
+        from config import DB_BACKUP_ENABLED
+    except ImportError:
+        DB_BACKUP_ENABLED = True
+    try:
+        from config import DB_BACKUP_DIR
+    except ImportError:
+        DB_BACKUP_DIR = "db_backups"
+    try:
+        from config import DB_BACKUP_INTERVAL_HOURS
+    except ImportError:
+        DB_BACKUP_INTERVAL_HOURS = 12
+    try:
+        from config import DB_BACKUP_RETENTION
+    except ImportError:
+        DB_BACKUP_RETENTION = 10
+
 except ImportError:
     print("[!] Critical Error: config.py not found.")
     exit(1)
@@ -118,6 +138,14 @@ limiter = Limiter(
 )
 
 db_lock = threading.RLock()
+
+def read_lock():
+    """Lock context for READ-ONLY DB access. With WAL enabled, SQLite allows
+    concurrent readers alongside a writer, so pure reads don't need the global
+    write lock — this keeps dashboard/worker polling from serializing behind
+    every writer. Falls back to the real lock when WAL is off (network-share
+    setups) where concurrent access would otherwise hit 'database is locked'."""
+    return contextlib.nullcontext() if USE_WAL_MODE else db_lock
 
 # --- Chunked encoding state ---
 CHUNK_STORE_DIR = os.path.abspath("chunk_store")   # uploaded chunk files live here until assembly
@@ -241,6 +269,45 @@ class DatabaseHandler:
 
 # Initialize the Handler
 db_handler = DatabaseHandler(DB_FILE, DB_MODE)
+
+def backup_database():
+    """Write a consistent, timestamped copy of the DB to DB_BACKUP_DIR using the
+    SQLite backup API (safe while the DB is live), then prune to the newest
+    DB_BACKUP_RETENTION copies. The DB is the single source of truth for the
+    whole queue + earnings ledger, so this guards against corruption/disk loss."""
+    if not DB_BACKUP_ENABLED:
+        return
+    try:
+        os.makedirs(DB_BACKUP_DIR, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base = os.path.basename(db_handler.disk_path)
+        dest_path = os.path.join(DB_BACKUP_DIR, f"{base}.{stamp}.bak")
+        src = sqlite3.connect(db_handler.active_db_path)
+        dst = sqlite3.connect(dest_path)
+        try:
+            with dst:
+                src.backup(dst)
+        finally:
+            dst.close(); src.close()
+        # Prune: keep the newest RETENTION backups for this base name.
+        backups = sorted(
+            [f for f in os.listdir(DB_BACKUP_DIR)
+             if f.startswith(base + ".") and f.endswith(".bak")])
+        excess = len(backups) - max(1, int(DB_BACKUP_RETENTION))
+        for old in backups[:max(0, excess)]:
+            try: os.remove(os.path.join(DB_BACKUP_DIR, old))
+            except OSError: pass
+        print(f"[*] DB backup written: {dest_path}")
+    except Exception as e:
+        print(f"[!] DB backup failed: {e}")
+
+def _backup_loop():
+    interval = max(1, int(DB_BACKUP_INTERVAL_HOURS)) * 3600
+    # Take one shortly after startup, then on the configured interval.
+    time.sleep(120)
+    while True:
+        backup_database()
+        time.sleep(interval)
 
 # ==============================================================================
 # LOGGING
@@ -414,6 +481,34 @@ def _chunk_dir(job_id):
     safe = re.sub(r'[^a-zA-Z0-9_.-]', '_', job_id)[:60]
     tag = hashlib.md5(job_id.encode('utf-8', 'replace')).hexdigest()[:10]
     return os.path.join(CHUNK_STORE_DIR, f"{safe}_{tag}")
+
+def _get_or_probe_source_duration(job_id, source_type, source_url, cached_dur):
+    """Return the source video's duration in seconds, using the stored value if
+    present, otherwise probing the source once and caching it on the job row.
+    Returns 0.0 if it can't be determined (callers then skip the length check)."""
+    try:
+        if cached_dur and float(cached_dur) > 0:
+            return float(cached_dur)
+    except (TypeError, ValueError):
+        pass
+    if source_type == 'remote':
+        src = build_download_url(job_id, 'remote', source_url)
+    else:
+        src = os.path.join(SOURCE_DIRECTORY, job_id.replace('/', os.sep))
+        if not os.path.isfile(src):
+            return 0.0
+    probe = _probe_media(src, timeout=60) if src else None
+    dur = probe['duration'] if probe else 0.0
+    if dur > 0:
+        with db_lock:
+            conn = db_handler.get_connection()
+            try:
+                conn.execute("UPDATE jobs SET source_duration_sec=? WHERE id=? AND source_duration_sec IS NULL",
+                             (dur, job_id))
+                conn.commit()
+            finally:
+                conn.close()
+    return dur
 
 def _parse_rate(rate_str):
     """Parse an ffprobe frame-rate fraction like '24000/1001' into a float."""
@@ -1187,6 +1282,26 @@ def _scan_and_queue_inner():
 _SERIES_CACHE = None
 _SERIES_CACHE_TIME = 0.0
 _SERIES_CACHE_LOCK = threading.Lock()
+_SERIES_IDS_FILE = 'series_ids.json'
+
+def _load_series_ids():
+    """folder -> stable integer id, persisted across runs so that adding or
+    removing a source folder never renumbers the others."""
+    try:
+        with open(_SERIES_IDS_FILE, 'r') as f:
+            data = json.load(f)
+        return {k: int(v) for k, v in data.items() if str(v).isdigit()}
+    except Exception:
+        return {}
+
+def _save_series_ids(id_map):
+    tmp = _SERIES_IDS_FILE + '.tmp'
+    try:
+        with open(tmp, 'w') as f:
+            json.dump(id_map, f, indent=2)
+        os.replace(tmp, _SERIES_IDS_FILE)
+    except Exception as e:
+        print(f"[!] Could not persist {_SERIES_IDS_FILE}: {e}")
 
 def get_series_list(force_refresh=False):
     global _SERIES_CACHE, _SERIES_CACHE_TIME
@@ -1213,7 +1328,25 @@ def get_series_list(force_refresh=False):
                         print(f"[!] series_names.json has {len(stale_keys)} stale key(s): {', '.join(stale_keys[:5])}")
                 except: pass
 
-            result = ([{"id": i+1, "folder": f, "name": mapping.get(f, f)} for i, f in enumerate(folders)], stale_keys)
+            # Stable IDs: reuse each folder's persisted id; assign the next free
+            # id to any new folder. IDs are never reused or renumbered, so a
+            # worker pinned with --series-id keeps pointing at the same show even
+            # when other folders are added or removed.
+            id_map = _load_series_ids()
+            changed = False
+            next_id = (max(id_map.values()) + 1) if id_map else 1
+            for f in folders:
+                if f not in id_map:
+                    id_map[f] = next_id
+                    next_id += 1
+                    changed = True
+            if changed:
+                _save_series_ids(id_map)
+
+            series = sorted(
+                [{"id": id_map[f], "folder": f, "name": mapping.get(f, f)} for f in folders],
+                key=lambda s: s["id"])
+            result = (series, stale_keys)
             _SERIES_CACHE = result; _SERIES_CACHE_TIME = now
             return result
         except:
@@ -1440,7 +1573,12 @@ python3 worker.py --username "{u}" --workername "{w}" --jobs {j} --manager "{SER
     return Response(script, mimetype='text/x-shellscript')
 
 @app.route('/download_source/<path:filename>')
+@requires_worker_auth
 def download_source(filename):
+    # Worker-auth gated: previously anyone could download the entire raw source
+    # library. Workers stream it via ffmpeg with the X-Worker-Token header; the
+    # browser uses the /download_media proxy. (No-op when REQUIRE_WORKER_TOKEN
+    # is off, preserving a deliberately open deployment.)
     return send_from_directory(SOURCE_DIRECTORY, filename, as_attachment=True)
 
 @app.route('/download_media')
@@ -1926,7 +2064,7 @@ def upload_result():
             conn = db_handler.get_connection()
             try:
                 c = conn.cursor()
-                c.execute("SELECT status, COALESCE(chunked, 0) FROM jobs WHERE id=?", (job_id,))
+                c.execute("SELECT status, COALESCE(chunked, 0), source_type, source_url, source_duration_sec FROM jobs WHERE id=?", (job_id,))
                 jrow = c.fetchone()
             finally:
                 conn.close()
@@ -1934,6 +2072,7 @@ def upload_result():
             return jsonify({"status": "error", "message": "unknown job"}), 404
         if jrow[1] == 1 or jrow[0] == 'completed':
             return jsonify({"status": "stale", "message": "Job no longer accepts a whole-file upload"}), 409
+        _src_type, _src_url, _src_dur = jrow[2], jrow[3], jrow[4]
 
         new_filename = os.path.splitext(job_id)[0] + ".mp4"
         quarantine_dir = os.path.join("temp_uploads", "quarantine")
@@ -1942,6 +2081,23 @@ def upload_result():
         request.files['file'].save(temp_path)
 
         is_valid, reason, verified_dur = verify_upload(temp_path)
+
+        # Length check: a valid-but-TRUNCATED encode (ffmpeg died near the end
+        # yet exited 0, a resume glitch, etc.) passes the codec/height check but
+        # is missing footage. Compare the delivered duration against the source
+        # and reject shortfalls. (The chunk path already does this per chunk;
+        # this closes the same gap for whole-file uploads.)
+        if is_valid and verified_dur > 0:
+            src_dur = _get_or_probe_source_duration(job_id, _src_type, _src_url, _src_dur)
+            if src_dur and src_dur > 0:
+                # Generous tolerance (5% + 10s floor) so encoder rounding / a
+                # dropped final frame never false-rejects a good encode; it only
+                # catches gross truncation (e.g. half the video missing).
+                tolerance = max(10.0, src_dur * 0.05)
+                if verified_dur < src_dur - tolerance:
+                    is_valid = False
+                    reason = f"Truncated encode ({verified_dur:.0f}s vs source {src_dur:.0f}s)"
+
         if not is_valid:
             log_event("WARN", f"Security: Upload rejected ({reason})", job_id)
             os.remove(temp_path)
@@ -2105,7 +2261,7 @@ def api_error_reports():
     except (ValueError, TypeError):
         limit = 200
 
-    with db_lock:
+    with read_lock():
         conn = db_handler.get_connection()
         conn.row_factory = sqlite3.Row
         try:
@@ -2142,7 +2298,7 @@ def job_status():
     job_id = (request.args.get('job_id', '') or '').strip()
     if not job_id:
         return jsonify({"status": "error", "message": "job_id required"}), 400
-    with db_lock:
+    with read_lock():
         conn = db_handler.get_connection()
         conn.row_factory = sqlite3.Row
         try:
@@ -2283,7 +2439,7 @@ def report_status():
 def api_stats():
     filter_val = request.args.get('filter')
 
-    with db_lock:
+    with read_lock():
         conn = db_handler.get_connection(); conn.row_factory = sqlite3.Row
         try:
             c = conn.cursor()
@@ -2356,7 +2512,7 @@ def api_all_jobs():
     except (ValueError, TypeError):
         limit = 2000
     status_filter = request.args.get('status')
-    with db_lock:
+    with read_lock():
         conn = db_handler.get_connection(); conn.row_factory = sqlite3.Row
         try:
             c = conn.cursor()
@@ -2380,7 +2536,7 @@ def api_earnings():
         limit = min(int(request.args.get('limit', 100)), 1000)
     except (ValueError, TypeError):
         limit = 100
-    with db_lock:
+    with read_lock():
         conn = db_handler.get_connection(); conn.row_factory = sqlite3.Row
         try:
             c = conn.cursor()
@@ -2409,7 +2565,7 @@ def get_logs():
         limit = min(int(request.args.get('limit', 100)), 1000)
     except (ValueError, TypeError):
         limit = 100
-    with db_lock:
+    with read_lock():
         conn = db_handler.get_connection(); conn.row_factory = sqlite3.Row
         try:
             c = conn.cursor()
@@ -2640,8 +2796,10 @@ init_db()
 # Sweep stale quarantine files from any previous crash
 sweep_quarantine()
 # FIXED: Run startup scan in thread to allow Gunicorn to bind immediately
-threading.Thread(target=scan_and_queue, daemon=True).start() 
+threading.Thread(target=scan_and_queue, daemon=True).start()
 threading.Thread(target=maintenance_loop, daemon=True).start()
+if DB_BACKUP_ENABLED:
+    threading.Thread(target=_backup_loop, daemon=True).start()
 print(f"[*] Manager initialized and ready. (Service URL: {SERVER_URL_DISPLAY})")
 
 if __name__ == '__main__':
