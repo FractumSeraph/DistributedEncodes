@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.3.0"
+WORKER_VERSION = "3.4.0"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -1493,41 +1493,62 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
             prog_total = dur_sec
         else:
             # Audio + subtitles for the whole file, encoded once.
-            update_status("Probing")
-            probe_data = None
-            for _pa in range(3):
-                try:
-                    cmd_probe = ([FFPROBE_CMD] if _is_local else [FFPROBE_CMD, '-headers', ffmpeg_http_headers]) + \
-                                ['-v', 'quiet', '-print_format', 'json', '-show_streams', '-show_format', dl_url]
-                    res = subprocess.run(cmd_probe, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                         encoding='utf-8', errors='replace', timeout=60)
-                    probe_data = json.loads(res.stdout)
-                    break
-                except Exception as _pe:
-                    if _pa < 2:
-                        time.sleep(5 * (_pa + 1))
-                    else:
-                        log(worker_id, f"Chunk probe failed: {_pe}", "ERROR")
-            if probe_data is None:
-                report_chunk("failed", error_msg="FFprobe failed after 3 attempts")
-                return
-
             audio_index = None; subtitle_indices = []; audio_channels = 2
-            audio_streams = [s for s in probe_data.get('streams', []) if s['codec_type'] == 'audio']
-            if audio_streams:
-                audio_index = audio_streams[0]['index']
-                for s in audio_streams:
-                    if s.get('tags', {}).get('language', '').lower() in ['eng', 'en', 'english']:
-                        audio_index = s['index']; break
-                for s in audio_streams:
-                    if s['index'] == audio_index:
-                        try: audio_channels = int(s.get('channels', 2))
-                        except: pass
+            # The manager may have handed us the source's stream layout (from its
+            # own probe), letting us skip probing over HTTP — the slowest and most
+            # failure-prone step on constrained workers (e.g. a Pi range-streaming
+            # a large MKV). Fall back to probing when it's absent or malformed.
+            _cmeta = chunk.get('stream_meta') if isinstance(chunk, dict) else None
+            _used_meta = False
+            if _cmeta and (_cmeta.get('audio_index') is not None or _cmeta.get('subtitle_indices')):
+                try:
+                    _ai = _cmeta.get('audio_index')
+                    audio_index = int(_ai) if _ai is not None else None
+                    subtitle_indices = [int(x) for x in (_cmeta.get('subtitle_indices') or [])]
+                    _mac = _cmeta.get('audio_channels')
+                    audio_channels = int(_mac) if _mac else 2
+                    _used_meta = True
+                    log(worker_id, "Using stream info from manager; skipping probe.")
+                except (TypeError, ValueError) as _cme:
+                    log(worker_id, f"Bad stream_meta from manager ({_cme}); probing locally.", "WARN")
+                    _used_meta = False
+
+            if not _used_meta:
+                update_status("Probing")
+                probe_data = None
+                for _pa in range(3):
+                    try:
+                        cmd_probe = ([FFPROBE_CMD] if _is_local else [FFPROBE_CMD, '-headers', ffmpeg_http_headers]) + \
+                                    ['-v', 'quiet', '-print_format', 'json', '-show_streams', '-show_format', dl_url]
+                        res = subprocess.run(cmd_probe, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                             encoding='utf-8', errors='replace', timeout=60)
+                        probe_data = json.loads(res.stdout)
                         break
-            for s in probe_data.get('streams', []):
-                if s['codec_type'] == 'subtitle':
-                    if s.get('codec_name', '').lower() in ['subrip', 'ass', 'webvtt', 'mov_text', 'text', 'srt', 'ssa']:
-                        subtitle_indices.append(s['index'])
+                    except Exception as _pe:
+                        if _pa < 2:
+                            time.sleep(5 * (_pa + 1))
+                        else:
+                            log(worker_id, f"Chunk probe failed: {_pe}", "ERROR")
+                if probe_data is None:
+                    report_chunk("failed", error_msg="FFprobe failed after 3 attempts")
+                    return
+
+                audio_streams = [s for s in probe_data.get('streams', []) if s['codec_type'] == 'audio']
+                if audio_streams:
+                    audio_index = audio_streams[0]['index']
+                    for s in audio_streams:
+                        if s.get('tags', {}).get('language', '').lower() in ['eng', 'en', 'english']:
+                            audio_index = s['index']; break
+                    for s in audio_streams:
+                        if s['index'] == audio_index:
+                            try: audio_channels = int(s.get('channels', 2))
+                            except: pass
+                            break
+                for s in probe_data.get('streams', []):
+                    if s['codec_type'] == 'subtitle':
+                        if s.get('codec_name', '').lower() in ['subrip', 'ass', 'webvtt', 'mov_text', 'text', 'srt', 'ssa']:
+                            subtitle_indices.append(s['index'])
+
             if audio_index is None and not subtitle_indices:
                 report_chunk("failed", error_msg="No audio or subtitle streams found")
                 return
@@ -2176,9 +2197,33 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                         # "pending" or "error" → server has no hash yet, proceed normally
                 # -------------------------------------------------------
 
-                update_status("Probing")
                 total_sec = 0; total_min = 0; audio_index = 0; subtitle_indices = []
-                for _probe_attempt in range(3):
+                meta_audio_channels = None
+                # If the manager already probed the source it hands us the stream
+                # layout, letting us skip the probe entirely — the slowest and
+                # most failure-prone step on constrained workers (e.g. a Pi
+                # range-streaming a large MKV over HTTP). Fall back to probing
+                # ourselves when it's absent (older manager / never chunk-probed).
+                _smeta = job.get('stream_meta') if isinstance(job, dict) else None
+                if _smeta and (_smeta.get('audio_index') is not None or _smeta.get('subtitle_indices')):
+                    try:
+                        total_sec = float(_smeta.get('duration') or 0)
+                        total_min = int(total_sec / 60)
+                        _ai = _smeta.get('audio_index')
+                        audio_index = int(_ai) if _ai is not None else 0
+                        subtitle_indices = [int(x) for x in (_smeta.get('subtitle_indices') or [])]
+                        _mac = _smeta.get('audio_channels')
+                        meta_audio_channels = int(_mac) if _mac else None
+                        probe_data = {"from_manager": True}
+                        log(worker_id, "Using stream info from manager; skipping probe.")
+                    except (TypeError, ValueError) as _sme:
+                        log(worker_id, f"Bad stream_meta from manager ({_sme}); probing locally.", "WARN")
+                        _smeta = None
+                else:
+                    _smeta = None
+                if not _smeta:
+                    update_status("Probing")
+                for _probe_attempt in ([] if _smeta else range(3)):
                     try:
                         if _is_local:
                             cmd_probe = [FFPROBE_CMD,
@@ -2259,12 +2304,15 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                 
                 # Robust Audio Downmixing (Prevents crashes on corrupt streams claiming 40+ channels)
                 audio_channels = 2 # Default assumption
-                try:
-                    for s in probe_data.get('streams', []):
-                        if s['index'] == audio_index:
-                            audio_channels = int(s.get('channels', 2))
-                            break
-                except: pass
+                if meta_audio_channels is not None:
+                    audio_channels = meta_audio_channels
+                else:
+                    try:
+                        for s in probe_data.get('streams', []):
+                            if s['index'] == audio_index:
+                                audio_channels = int(s.get('channels', 2))
+                                break
+                    except: pass
 
                 # AUDIO FILTER FIX (MONO + DIALOGUE FOCUS)
                 audio_filter = "aresample=async=1" 

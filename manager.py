@@ -542,6 +542,26 @@ def _probe_media(src, timeout=60):
         has_subs = any(s.get('codec_type') == 'subtitle'
                        and s.get('codec_name', '').lower() in sub_codecs
                        for s in streams)
+
+        # Pick the exact audio track and subtitle tracks a worker would choose,
+        # so the worker can be handed this layout and skip its own (slow, over
+        # HTTP) probe. This MUST mirror the worker's selection logic verbatim.
+        audio_index = None; audio_channels = 2; subtitle_indices = []
+        audio_streams = [s for s in streams if s.get('codec_type') == 'audio']
+        if audio_streams:
+            audio_index = audio_streams[0].get('index')
+            for s in audio_streams:
+                if s.get('tags', {}).get('language', '').lower() in ('eng', 'en', 'english'):
+                    audio_index = s.get('index'); break
+            for s in audio_streams:
+                if s.get('index') == audio_index:
+                    try: audio_channels = int(s.get('channels', 2))
+                    except (TypeError, ValueError): audio_channels = 2
+                    break
+        for s in streams:
+            if (s.get('codec_type') == 'subtitle'
+                    and s.get('codec_name', '').lower() in sub_codecs):
+                subtitle_indices.append(s.get('index'))
         audio_start = None
         first_audio = next((s for s in streams if s.get('codec_type') == 'audio'), None)
         if first_audio is not None:
@@ -564,8 +584,26 @@ def _probe_media(src, timeout=60):
             "duration": dur, "has_audio": has_audio, "has_subs": has_subs,
             "fps": fps, "start_time": start_time, "cfr": is_cfr,
             "format_start": format_start, "audio_start": audio_start,
+            "audio_index": audio_index, "audio_channels": audio_channels,
+            "subtitle_indices": subtitle_indices,
         }
     except Exception:
+        return None
+
+
+def _stream_meta_json(probe):
+    """Build the compact stream-layout blob handed to workers so they can skip
+    their own probe. Returns a JSON string, or None if the probe is unusable."""
+    if not probe:
+        return None
+    try:
+        return json.dumps({
+            "duration": probe.get("duration") or 0,
+            "audio_index": probe.get("audio_index"),
+            "audio_channels": probe.get("audio_channels") or 2,
+            "subtitle_indices": probe.get("subtitle_indices") or [],
+        })
+    except (TypeError, ValueError):
         return None
 
 def _plan_chunks(duration_sec, fps, start_time=0.0):
@@ -746,10 +784,14 @@ def _split_claimed_job(job):
                 # Too short / VFR / unprobeable: hand it back for whole-file
                 # encoding. Guarded so we don't clobber the job if an admin
                 # reset it (and a worker re-claimed it) while we were probing.
+                # Still record the stream layout when we have it, so the
+                # whole-file worker can skip its own probe.
                 c.execute("UPDATE jobs SET status='queued', worker_id=NULL, started_at=NULL, "
-                          "chunkable=0, source_duration_sec=?, last_updated=? "
+                          "chunkable=0, source_duration_sec=?, stream_meta=COALESCE(stream_meta, ?), "
+                          "last_updated=? "
                           "WHERE id=? AND status='processing' AND worker_id='(chunking)'",
-                          (probe['duration'] if probe else None, datetime.now(), job_id))
+                          (probe['duration'] if probe else None, _stream_meta_json(probe),
+                           datetime.now(), job_id))
                 conn.commit()
                 return False
 
@@ -760,9 +802,10 @@ def _split_claimed_job(job):
             # whole-file worker via /get_job after such a reset) may have taken
             # the job while the probe ran. If the claim is gone, walk away.
             c.execute("UPDATE jobs SET chunked=1, chunkable=1, source_duration_sec=?, total_chunks=?, "
+                      "stream_meta=COALESCE(stream_meta, ?), "
                       "progress=0, worker_id='(chunked)', last_updated=? "
                       "WHERE id=? AND status='processing' AND worker_id='(chunking)'",
-                      (duration, total, now, job_id))
+                      (duration, total, _stream_meta_json(probe), now, job_id))
             if c.rowcount != 1:
                 conn.commit()
                 log_event("WARN", "Split abandoned: job was taken by someone else during the probe.", job_id)
@@ -816,7 +859,7 @@ def _assign_pending_chunk(worker_id, folder_filter, max_size_mb, video_only=Fals
                 params.append(int(max_size_mb) * 1024 * 1024)
             sql = ("SELECT c.rowid AS chunk_rowid, c.job_id, c.kind, c.chunk_index, c.start_sec, c.duration_sec, "
                    "j.filename, j.file_size, j.source_type, j.source_url, j.content_profile, "
-                   "j.source_duration_sec, j.total_chunks "
+                   "j.source_duration_sec, j.total_chunks, j.stream_meta "
                    "FROM chunks c JOIN jobs j ON j.id = c.job_id "
                    f"WHERE {' AND '.join(query_parts)} "
                    "ORDER BY j.started_at ASC, CASE WHEN c.kind='audio' THEN 0 ELSE 1 END, c.chunk_index ASC "
@@ -827,6 +870,13 @@ def _assign_pending_chunk(worker_id, folder_filter, max_size_mb, video_only=Fals
             if row is None:
                 return None
             chunk = dict(row)
+            # Only the audio chunk probes the source; hand it the pre-computed
+            # stream layout so it can skip that probe. Video chunks don't need
+            # it — drop it to keep the payload small.
+            _sm = chunk.pop('stream_meta', None)
+            if chunk['kind'] == 'audio' and _sm:
+                try: chunk['stream_meta'] = json.loads(_sm)
+                except (TypeError, ValueError): pass
             # The final video chunk encodes to EOF instead of using -t.
             # Computed as a separate single-row query so the assignment scan
             # doesn't pay a correlated subquery per candidate row.
@@ -1406,6 +1456,13 @@ def init_db():
         except sqlite3.OperationalError: pass
         try: cursor.execute("ALTER TABLE jobs ADD COLUMN total_chunks INTEGER DEFAULT 0")
         except sqlite3.OperationalError: pass
+        # [ADDED] stream_meta: JSON blob of the source's stream layout (chosen
+        # audio track, channel count, subtitle track indices, duration) captured
+        # when the manager probes the source. Handed to workers so they can skip
+        # their own probe — the slowest, most fragile step on constrained nodes
+        # (e.g. a Raspberry Pi range-streaming a large MKV over HTTP).
+        try: cursor.execute("ALTER TABLE jobs ADD COLUMN stream_meta TEXT")
+        except sqlite3.OperationalError: pass
 
         # Chunk work-items for split jobs.  kind = 'video' (a time range) or
         # 'audio' (full-length audio + subtitles, encoded once by one worker).
@@ -1707,7 +1764,7 @@ def get_job():
                             params.append(f"{folder_filter}%")
                         
                         # [ADDED] content_profile to SELECT query
-                        sql = f"SELECT id, filename, file_size, source_type, source_url, content_profile, source_hash FROM jobs WHERE {' AND '.join(query_parts)} ORDER BY id ASC LIMIT 1"
+                        sql = f"SELECT id, filename, file_size, source_type, source_url, content_profile, source_hash, stream_meta FROM jobs WHERE {' AND '.join(query_parts)} ORDER BY id ASC LIMIT 1"
                         c.execute(sql, tuple(params)); row = c.fetchone()
                         if row: job = dict(row); break
                 
@@ -1730,6 +1787,12 @@ def get_job():
         # Never reveal the hash to the worker — workers must submit their own
         # computed hash blind so they cannot cheat by echoing the known value.
         job.pop('source_hash', None)
+        # Parse the pre-computed stream layout (if the source was already probed
+        # during a chunk-split attempt) so the worker can skip its own probe.
+        _sm = job.pop('stream_meta', None)
+        if _sm:
+            try: job['stream_meta'] = json.loads(_sm)
+            except (TypeError, ValueError): pass
         if needs_hash:
             _src_path = os.path.join(SOURCE_DIRECTORY, job['id'].replace('/', os.sep))
             _computed = _fast_hash_file(_src_path)

@@ -313,6 +313,8 @@ By default the manager splits long videos into ~5-minute **chunks** so that mult
 
 **Quality / size impact:** effectively none. Encoding is CRF-based (constant quality, not bitrate-targeted), so per-chunk encoding produces the same quality as a single pass. The only overhead is one extra keyframe at each chunk boundary — SVT-AV1 already places keyframes every few seconds, so the size difference is negligible. The final concat is a bit-exact stream copy.
 
+**Probe once, reuse everywhere:** when the manager probes a source (to plan the split), it records the stream layout — the chosen audio track, its channel count, and any subtitle tracks — on the job. Workers are then handed that layout with their chunk/job and **skip their own `ffprobe`**. This matters most on constrained nodes: a Raspberry Pi range-streaming a large MKV over HTTP could otherwise sit on "Probe" for minutes (and, for MKVs whose index sits at the end of the file, occasionally time out and retry). Workers still fall back to probing themselves if the manager hasn't recorded a layout yet (older manager, or a job that never went through a split attempt). Fully backward compatible — the field is additive and ignored by old workers.
+
 **Fallbacks & safety:**
 
 - Videos shorter than ~1.5× the chunk length, VFR sources, and sources whose audio/video streams start at different offsets are encoded whole via the classic path.
