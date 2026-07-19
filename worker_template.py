@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.3.0"
+WORKER_VERSION = "3.4.0"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -1459,7 +1459,10 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
             '-reconnect', '1', '-reconnect_streamed', '1',
             '-reconnect_delay_max', '60', '-reconnect_on_network_error', '1',
         ]
-        out_path = os.path.join(temp_dir, f"chunk_out{ENCODING_CONFIG['OUTPUT_EXT']}")
+        # Per-chunk output name: a leaked/killed ffmpeg from a previous chunk
+        # must never share an output path with the current one.
+        _co_safe = re.sub(r'[^a-zA-Z0-9_-]', '_', f"{job_id}_{kind}_{idx}")[:80]
+        out_path = os.path.join(temp_dir, f"chunk_out_{_co_safe}{ENCODING_CONFIG['OUTPUT_EXT']}")
         raw_log_path = os.path.join(temp_dir, "chunk_encode.log")
         gz_log_path = os.path.join(temp_dir, "chunk_encode.log.gz")
 
@@ -1493,41 +1496,68 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
             prog_total = dur_sec
         else:
             # Audio + subtitles for the whole file, encoded once.
-            update_status("Probing")
-            probe_data = None
-            for _pa in range(3):
-                try:
-                    cmd_probe = ([FFPROBE_CMD] if _is_local else [FFPROBE_CMD, '-headers', ffmpeg_http_headers]) + \
-                                ['-v', 'quiet', '-print_format', 'json', '-show_streams', '-show_format', dl_url]
-                    res = subprocess.run(cmd_probe, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                         encoding='utf-8', errors='replace', timeout=60)
-                    probe_data = json.loads(res.stdout)
-                    break
-                except Exception as _pe:
-                    if _pa < 2:
-                        time.sleep(5 * (_pa + 1))
-                    else:
-                        log(worker_id, f"Chunk probe failed: {_pe}", "ERROR")
-            if probe_data is None:
-                report_chunk("failed", error_msg="FFprobe failed after 3 attempts")
-                return
-
             audio_index = None; subtitle_indices = []; audio_channels = 2
-            audio_streams = [s for s in probe_data.get('streams', []) if s['codec_type'] == 'audio']
-            if audio_streams:
-                audio_index = audio_streams[0]['index']
-                for s in audio_streams:
-                    if s.get('tags', {}).get('language', '').lower() in ['eng', 'en', 'english']:
-                        audio_index = s['index']; break
-                for s in audio_streams:
-                    if s['index'] == audio_index:
-                        try: audio_channels = int(s.get('channels', 2))
-                        except: pass
+            # The manager may have handed us the source's stream layout (from its
+            # own probe), letting us skip probing over HTTP — the slowest and most
+            # failure-prone step on constrained workers (e.g. a Pi range-streaming
+            # a large MKV). Fall back to probing when it's absent or malformed.
+            _cmeta = chunk.get('stream_meta') if isinstance(chunk, dict) else None
+            _used_meta = False
+            if _cmeta:
+                try:
+                    _ai = _cmeta.get('audio_index')
+                    _mac = int(_cmeta.get('audio_channels') or 0)
+                    _si = [int(x) for x in (_cmeta.get('subtitle_indices') or [])]
+                    # Usable only when complete: an audio track needs its channel
+                    # count (it selects the mono downmix formula — guessing 2 on
+                    # a 5.1 source would bury the dialogue), and a subs-only
+                    # source needs at least one subtitle index.
+                    if (_ai is not None and _mac >= 1) or (_ai is None and _si):
+                        audio_index = int(_ai) if _ai is not None else None
+                        subtitle_indices = _si
+                        audio_channels = _mac if _mac >= 1 else 2
+                        _used_meta = True
+                        log(worker_id, "Using stream info from manager; skipping probe.")
+                except (TypeError, ValueError) as _cme:
+                    log(worker_id, f"Bad stream_meta from manager ({_cme}); probing locally.", "WARN")
+                    _used_meta = False
+
+            if not _used_meta:
+                update_status("Probing")
+                probe_data = None
+                for _pa in range(3):
+                    try:
+                        cmd_probe = ([FFPROBE_CMD] if _is_local else [FFPROBE_CMD, '-headers', ffmpeg_http_headers]) + \
+                                    ['-v', 'quiet', '-print_format', 'json', '-show_streams', '-show_format', dl_url]
+                        res = subprocess.run(cmd_probe, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                             encoding='utf-8', errors='replace', timeout=60)
+                        probe_data = json.loads(res.stdout)
                         break
-            for s in probe_data.get('streams', []):
-                if s['codec_type'] == 'subtitle':
-                    if s.get('codec_name', '').lower() in ['subrip', 'ass', 'webvtt', 'mov_text', 'text', 'srt', 'ssa']:
-                        subtitle_indices.append(s['index'])
+                    except Exception as _pe:
+                        if _pa < 2:
+                            time.sleep(5 * (_pa + 1))
+                        else:
+                            log(worker_id, f"Chunk probe failed: {_pe}", "ERROR")
+                if probe_data is None:
+                    report_chunk("failed", error_msg="FFprobe failed after 3 attempts")
+                    return
+
+                audio_streams = [s for s in probe_data.get('streams', []) if s['codec_type'] == 'audio']
+                if audio_streams:
+                    audio_index = audio_streams[0]['index']
+                    for s in audio_streams:
+                        if s.get('tags', {}).get('language', '').lower() in ['eng', 'en', 'english']:
+                            audio_index = s['index']; break
+                    for s in audio_streams:
+                        if s['index'] == audio_index:
+                            try: audio_channels = int(s.get('channels', 2))
+                            except: pass
+                            break
+                for s in probe_data.get('streams', []):
+                    if s['codec_type'] == 'subtitle':
+                        if s.get('codec_name', '').lower() in ['subrip', 'ass', 'webvtt', 'mov_text', 'text', 'srt', 'ssa']:
+                            subtitle_indices.append(s['index'])
+
             if audio_index is None and not subtitle_indices:
                 report_chunk("failed", error_msg="No audio or subtitle streams found")
                 return
@@ -1579,32 +1609,40 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
 
             last_rep = 0; last_pct = 0; last_hb = time.time()
             log_buffer = []
-            with open(raw_log_path, 'w', encoding='utf-8') as raw_log:
-                while True:
-                    if PAUSE_REQUESTED:
-                        if time.time() - last_hb > 30:
-                            report_chunk("processing", last_pct)
-                            last_hb = time.time()
-                        time.sleep(0.2)
-                        continue
-                    line = proc.stdout.readline()
-                    if line:
-                        log_buffer.append(line); log_buffer = log_buffer[-50:]
-                        raw_log.write(line); raw_log.flush()
-                    if not line and proc.poll() is not None: break
-                    if "out_time=" in line and "N/A" not in line and prog_total > 0:
-                        try:
-                            curr_sec = get_seconds(line.split('=')[1].strip())
-                            pct = min(100, int((curr_sec / prog_total) * 100))
-                            last_pct = pct
-                            if single_mode: print_progress(worker_id, curr_sec, prog_total, prefix='Enc')
-                            else: update_status(f"Enc {pct}%")
-                            if time.time() - last_rep > 10:
-                                report_chunk("processing", pct)
-                                last_rep = time.time(); last_hb = last_rep
-                        except: pass
-            with PROC_LOCK:
-                if worker_id in ACTIVE_PROCS: del ACTIVE_PROCS[worker_id]
+            # try/finally: an exception mid-loop (e.g. disk-full on the log
+            # write) must still deregister and kill ffmpeg — a leaked encoder
+            # blocks forever on a full stdout pipe once nobody reads it.
+            try:
+                with open(raw_log_path, 'w', encoding='utf-8') as raw_log:
+                    while True:
+                        if PAUSE_REQUESTED:
+                            if time.time() - last_hb > 30:
+                                report_chunk("processing", last_pct)
+                                last_hb = time.time()
+                            time.sleep(0.2)
+                            continue
+                        line = proc.stdout.readline()
+                        if line:
+                            log_buffer.append(line); log_buffer = log_buffer[-50:]
+                            raw_log.write(line); raw_log.flush()
+                        if not line and proc.poll() is not None: break
+                        if "out_time=" in line and "N/A" not in line and prog_total > 0:
+                            try:
+                                curr_sec = get_seconds(line.split('=')[1].strip())
+                                pct = min(100, int((curr_sec / prog_total) * 100))
+                                last_pct = pct
+                                if single_mode: print_progress(worker_id, curr_sec, prog_total, prefix='Enc')
+                                else: update_status(f"Enc {pct}%")
+                                if time.time() - last_rep > 10:
+                                    report_chunk("processing", pct)
+                                    last_rep = time.time(); last_hb = last_rep
+                            except: pass
+            finally:
+                with PROC_LOCK:
+                    if worker_id in ACTIVE_PROCS: del ACTIVE_PROCS[worker_id]
+                if proc.poll() is None:
+                    try: proc.kill()
+                    except Exception: pass
             if proc.returncode == 0 or SHUTDOWN_EVENT.is_set(): break
 
         def upload_chunk_log():
@@ -1652,7 +1690,10 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
         upload_ok = False
         upload_final = False  # 409/400: manager already resolved this chunk, don't re-report
         for up_attempt in range(3):
-            if SHUTDOWN_EVENT.is_set(): break
+            # Graceful drain ("Finish") must still deliver a finished encode —
+            # only the RETRIES are skipped on shutdown, so a dead network can't
+            # stall the exit for minutes.
+            if SHUTDOWN_EVENT.is_set() and up_attempt > 0: break
             try:
                 with open(out_path, 'rb') as f:
                     r = requests.post(f"{manager_url}/upload_chunk",
@@ -1965,7 +2006,10 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                 update_status("Up 0%")
                 _r_up_ok = False
                 for _r_up_att in range(3):
-                    if SHUTDOWN_EVENT.is_set(): break
+                    # A merged resume file is finished work — deliver it even
+                    # during a graceful drain (only retries are skipped), since
+                    # the cleanup below deletes it either way.
+                    if SHUTDOWN_EVENT.is_set() and _r_up_att > 0: break
                     try:
                         with open(_r_partial, 'rb') as _r_f:
                             _r_resp = requests.post(
@@ -2000,6 +2044,10 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                     try:
                         if os.path.exists(_fp): os.remove(_fp)
                     except: pass
+                # The resumed job is finished (one way or the other) — clear the
+                # id so a later pre-assignment exception can't be mis-reported
+                # against it (same guarantee as the per-iteration reset above).
+                job_id = None
             # ========================================================
 
             if check_version(manager_url):
@@ -2176,10 +2224,45 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                         # "pending" or "error" → server has no hash yet, proceed normally
                 # -------------------------------------------------------
 
-                update_status("Probing")
                 total_sec = 0; total_min = 0; audio_index = 0; subtitle_indices = []
-                for _probe_attempt in range(3):
+                meta_audio_channels = None
+                # Reset every job: a stale probe_data surviving from the previous
+                # loop iteration must never satisfy the failure check below.
+                probe_data = None
+                # If the manager already probed the source it hands us the stream
+                # layout, letting us skip the probe entirely — the slowest and
+                # most failure-prone step on constrained workers (e.g. a Pi
+                # range-streaming a large MKV over HTTP). The shortcut needs the
+                # FULL layout (duration, a real audio track AND its channel
+                # count) because the whole-file command always maps audio and
+                # picks the downmix formula from the channel count — a partial
+                # blob must fall back to probing, not silently degrade.
+                _smeta = job.get('stream_meta') if isinstance(job, dict) else None
+                if _smeta:
                     try:
+                        _s_dur = float(_smeta.get('duration') or 0)
+                        _ai = _smeta.get('audio_index')
+                        _mac = int(_smeta.get('audio_channels') or 0)
+                        if _s_dur > 0 and _ai is not None and _mac >= 1:
+                            total_sec = _s_dur; total_min = int(total_sec / 60)
+                            audio_index = int(_ai)
+                            subtitle_indices = [int(x) for x in (_smeta.get('subtitle_indices') or [])]
+                            meta_audio_channels = _mac
+                            probe_data = {"from_manager": True}
+                            log(worker_id, "Using stream info from manager; skipping probe.")
+                        else:
+                            _smeta = None  # incomplete blob → probe normally
+                    except (TypeError, ValueError) as _sme:
+                        log(worker_id, f"Bad stream_meta from manager ({_sme}); probing locally.", "WARN")
+                        _smeta = None
+                if probe_data is None:
+                    update_status("Probing")
+                for _probe_attempt in ([] if probe_data else range(3)):
+                    try:
+                        # Start each attempt clean so a partially-parsed failure
+                        # can't leave duplicate subtitle maps or a half-set state.
+                        probe_data = None
+                        audio_index = 0; subtitle_indices = []
                         if _is_local:
                             cmd_probe = [FFPROBE_CMD,
                                 '-v', 'quiet', '-print_format', 'json', '-show_streams', '-show_format', dl_url]
@@ -2188,20 +2271,21 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                                 '-headers', ffmpeg_http_headers,
                                 '-v', 'quiet', '-print_format', 'json', '-show_streams', '-show_format', dl_url]
                         res = subprocess.run(cmd_probe, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf-8', errors='replace', timeout=60)
-                        probe_data = json.loads(res.stdout)
-                        dur = probe_data.get('format', {}).get('duration')
+                        _pd = json.loads(res.stdout)
+                        dur = _pd.get('format', {}).get('duration')
                         if dur: total_sec = float(dur); total_min = int(total_sec / 60)
 
-                        audio_streams = [s for s in probe_data.get('streams', []) if s['codec_type'] == 'audio']
+                        audio_streams = [s for s in _pd.get('streams', []) if s['codec_type'] == 'audio']
                         if audio_streams:
                             audio_index = audio_streams[0]['index']
                             for s in audio_streams:
                                 if s.get('tags', {}).get('language', '').lower() in ['eng', 'en', 'english']:
                                     audio_index = s['index']; break
-                        for s in probe_data.get('streams', []):
+                        for s in _pd.get('streams', []):
                             if s['codec_type'] == 'subtitle':
                                 if s.get('codec_name', '').lower() in ['subrip', 'ass', 'webvtt', 'mov_text', 'text', 'srt', 'ssa']:
                                     subtitle_indices.append(s['index'])
+                        probe_data = _pd  # only assigned once fully parsed
                         break  # probe succeeded
                     except Exception as _probe_err:
                         if _probe_attempt < 2:
@@ -2210,7 +2294,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                         else:
                             log(worker_id, f"Probe failed after 3 attempts: {_probe_err}. Skipping job.", "ERROR")
 
-                if 'probe_data' not in locals():
+                if probe_data is None:
                     post_status("failed", error_msg="FFprobe failed after 3 attempts")
                     report_error(job_id, "probe_failure", "FFprobe failed after 3 attempts")
                     continue
@@ -2259,12 +2343,15 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                 
                 # Robust Audio Downmixing (Prevents crashes on corrupt streams claiming 40+ channels)
                 audio_channels = 2 # Default assumption
-                try:
-                    for s in probe_data.get('streams', []):
-                        if s['index'] == audio_index:
-                            audio_channels = int(s.get('channels', 2))
-                            break
-                except: pass
+                if meta_audio_channels is not None:
+                    audio_channels = meta_audio_channels
+                else:
+                    try:
+                        for s in probe_data.get('streams', []):
+                            if s['index'] == audio_index:
+                                audio_channels = int(s.get('channels', 2))
+                                break
+                    except: pass
 
                 # AUDIO FILTER FIX (MONO + DIALOGUE FOCUS)
                 audio_filter = "aresample=async=1" 
@@ -2339,6 +2426,8 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                 })
 
                 proc = None; enc_time = 0
+                log_buffer = []  # defined before the loop: a pre-first-attempt
+                                 # shutdown must not NameError the failure dump
                 for _enc_attempt in range(3):
                     if SHUTDOWN_EVENT.is_set(): break
                     if _enc_attempt > 0:
@@ -2374,44 +2463,54 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                         lambda: post_status("paused" if PAUSE_REQUESTED else "processing", _hb["pct"]))
 
                     raw_log_path = os.path.join(temp_dir, "encode.log")
-                    with open(raw_log_path, 'w', encoding='utf-8') as raw_log:
-                        while True:
-                            if PAUSE_REQUESTED:
-                                _now = time.time()
-                                if _now - last_hb > 30:
-                                    post_status("paused", last_enc_pct)
-                                    last_hb = _now
-                                time.sleep(0.2)
-                                continue
+                    # try/finally: an exception mid-loop (e.g. disk-full on the
+                    # log write) must still stop the heartbeat thread — which
+                    # would otherwise post "processing" forever, contradicting
+                    # the "failed" status the outer handler reports — and must
+                    # kill ffmpeg, which would otherwise block on a full pipe
+                    # once nobody reads its stdout.
+                    try:
+                        with open(raw_log_path, 'w', encoding='utf-8') as raw_log:
+                            while True:
+                                if PAUSE_REQUESTED:
+                                    _now = time.time()
+                                    if _now - last_hb > 30:
+                                        post_status("paused", last_enc_pct)
+                                        last_hb = _now
+                                    time.sleep(0.2)
+                                    continue
 
-                            line = proc.stdout.readline()
-                            if line:
-                                log_buffer.append(line); log_buffer = log_buffer[-50:]
-                                raw_log.write(line)
-                                raw_log.flush()
+                                line = proc.stdout.readline()
+                                if line:
+                                    log_buffer.append(line); log_buffer = log_buffer[-50:]
+                                    raw_log.write(line)
+                                    raw_log.flush()
 
-                            if not line and proc.poll() is not None: break
+                                if not line and proc.poll() is not None: break
 
-                            if "out_time=" in line and "N/A" not in line and total_sec > 0:
-                                try:
-                                    time_str = line.split('=')[1].strip()
-                                    curr_sec = get_seconds(time_str)
-                                    pct = min(100, int((curr_sec/total_sec)*100))
-                                    last_enc_pct = pct
-                                    _hb["pct"] = pct
+                                if "out_time=" in line and "N/A" not in line and total_sec > 0:
+                                    try:
+                                        time_str = line.split('=')[1].strip()
+                                        curr_sec = get_seconds(time_str)
+                                        pct = min(100, int((curr_sec/total_sec)*100))
+                                        last_enc_pct = pct
+                                        _hb["pct"] = pct
 
-                                    if single_mode: print_progress(worker_id, curr_sec, total_sec, prefix='Enc')
-                                    else: update_status(f"Enc {pct}%")
+                                        if single_mode: print_progress(worker_id, curr_sec, total_sec, prefix='Enc')
+                                        else: update_status(f"Enc {pct}%")
 
-                                    if time.time() - last_rep > 10:
-                                        post_status("processing", pct)
-                                        last_rep = time.time()
-                                        last_hb = last_rep
-                                except: pass
-
-                    _hb_stop.set()
-                    with PROC_LOCK:
-                        if worker_id in ACTIVE_PROCS: del ACTIVE_PROCS[worker_id]
+                                        if time.time() - last_rep > 10:
+                                            post_status("processing", pct)
+                                            last_rep = time.time()
+                                            last_hb = last_rep
+                                    except: pass
+                    finally:
+                        _hb_stop.set()
+                        with PROC_LOCK:
+                            if worker_id in ACTIVE_PROCS: del ACTIVE_PROCS[worker_id]
+                        if proc.poll() is None:
+                            try: proc.kill()
+                            except Exception: pass
 
                     enc_time = time.time() - start_enc
                     if proc.returncode == 0 or SHUTDOWN_EVENT.is_set(): break
@@ -2471,6 +2570,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
 
                     # RETRY LOOP for Uploads
                     upload_success = False
+                    upload_final = False  # 409/400: manager already resolved the job — don't re-send or re-report
                     for up_attempt in range(3):
                         try:
                             with ProgressFileReader(local_dst, upload_cb) as f:
@@ -2483,8 +2583,23 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                                 if r.status_code == 200:
                                     upload_success = True
                                     break
+                                elif r.status_code == 409:
+                                    # Job was reset/chunked/completed elsewhere while we
+                                    # encoded — the manager no longer wants this file.
+                                    log(worker_id, "Job no longer accepts a whole-file upload (reassigned). Dropping.", "WARN")
+                                    upload_final = True; break
+                                elif r.status_code == 400:
+                                    # Failed manager-side verification; the manager has
+                                    # already registered the failure. Re-sending the
+                                    # same file twice more can't change the verdict.
+                                    _msg = ""
+                                    try: _msg = r.json().get('message', '')
+                                    except: pass
+                                    log(worker_id, f"Upload rejected by manager: {_msg}", "WARN")
+                                    upload_final = True; break
                                 else:
                                     log(worker_id, f"Upload rejected by server: {r.status_code}", "WARN")
+                                    time.sleep(10)
                         except Exception as e:
                             log(worker_id, f"Upload attempt {up_attempt+1} failed/timed out: {e}", "WARN")
                             time.sleep(10) # Wait 10s before retry
@@ -2504,6 +2619,12 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                             _done_chk = os.path.join(temp_dir, f"{_RESUME_CHK_PREFIX}{re.sub(r'[^a-zA-Z0-9_-]', '_', str(job_id))}.json")
                             if os.path.exists(_done_chk): os.remove(_done_chk)
                         except: pass
+                        upload_encode_log()
+                    elif upload_final:
+                        # Manager already resolved the job (409/400) — its state
+                        # is authoritative; a "failed" report here would clobber it.
+                        d = WORKER_DETAILS.get(worker_id)
+                        if d is not None: d["phase"] = "Done"
                         upload_encode_log()
                     else:
                         d = WORKER_DETAILS.get(worker_id)

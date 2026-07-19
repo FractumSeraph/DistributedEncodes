@@ -132,6 +132,12 @@ def main():
             continue
 
         out_dur = probe_duration(out_path)
+        if out_dur <= 0:
+            # ffprobe failed on the OUTPUT (missing ffprobe, timeout, ...).
+            # That's "couldn't check", not "truncated" — flagging it would
+            # re-queue perfectly good encodes en masse.
+            undetermined.append(job_id)
+            continue
         tolerance = max(args.min_tolerance, src_dur * args.tolerance_pct / 100.0)
         if out_dur < src_dur - tolerance:
             truncated.append((job_id, out_dur, src_dur))
@@ -150,9 +156,13 @@ def main():
         for jid in missing_output:
             print(f"      {jid}")
     if missing_source:
-        print(f"\n[-] {len(missing_source)} job(s) whose source is gone (can't verify/re-encode): {len(missing_source)}")
+        print(f"\n[-] {len(missing_source)} job(s) whose source is gone (can't verify/re-encode):")
+        for jid in missing_source:
+            print(f"      {jid}")
     if undetermined:
-        print(f"\n[-] {len(undetermined)} job(s) whose source duration couldn't be determined (skipped).")
+        print(f"\n[-] {len(undetermined)} job(s) whose duration couldn't be determined (skipped):")
+        for jid in undetermined:
+            print(f"      {jid}")
     if skipped_remote:
         print(f"\n[-] {skipped_remote} remote job(s) skipped (--local-only).")
 

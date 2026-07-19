@@ -92,9 +92,3 @@ CHUNKED_ENCODING = True
 # any length. If you want browser volunteers to help on big videos, keep this
 # at/below their MAX CHUNK SEC (120 is a safe starting point).
 CHUNK_DURATION_SEC = 120
-
-# ==============================================================================
-# RATE LIMITING
-# ==============================================================================
-# Limits how many jobs a single IP can TAKE per hour.
-RATE_LIMIT_JOBS_PER_HOUR = 15

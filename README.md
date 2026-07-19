@@ -302,7 +302,7 @@ The manager detects a `live_action` content profile and tells the worker to redu
 
 ## Chunked Encoding (many workers, one video)
 
-By default the manager splits long videos into ~5-minute **chunks** so that multiple workers — or multiple cores on one machine via `--jobs N` — encode a *single* video in parallel, instead of each worker grabbing a different video. The swarm finishes one file at a time.
+By default the manager splits long videos into **chunks** of at most `CHUNK_DURATION_SEC` seconds (the shipped config uses 120s) so that multiple workers — or multiple cores on one machine via `--jobs N` — encode a *single* video in parallel, instead of each worker grabbing a different video. The swarm finishes one file at a time.
 
 **How it works:**
 
@@ -313,12 +313,14 @@ By default the manager splits long videos into ~5-minute **chunks** so that mult
 
 **Quality / size impact:** effectively none. Encoding is CRF-based (constant quality, not bitrate-targeted), so per-chunk encoding produces the same quality as a single pass. The only overhead is one extra keyframe at each chunk boundary — SVT-AV1 already places keyframes every few seconds, so the size difference is negligible. The final concat is a bit-exact stream copy.
 
+**Probe once, reuse everywhere:** when the manager probes a source (to plan the split), it records the stream layout — the chosen audio track, its channel count, and any subtitle tracks — on the job. Workers are then handed that layout with their chunk/job and **skip their own `ffprobe`**. This matters most on constrained nodes: a Raspberry Pi range-streaming a large MKV over HTTP could otherwise sit on "Probe" for minutes (and, for MKVs whose index sits at the end of the file, occasionally time out and retry). Workers still fall back to probing themselves if the manager hasn't recorded a layout yet (older manager, or a job that never went through a split attempt). Fully backward compatible — the field is additive and ignored by old workers.
+
 **Fallbacks & safety:**
 
 - Videos shorter than ~1.5× the chunk length, VFR sources, and sources whose audio/video streams start at different offsets are encoded whole via the classic path.
 - If a chunk fails 3 times, or assembly fails, the job automatically falls back to whole-file encoding.
 - Chunks with no heartbeat for 30 minutes are handed to another worker; completed chunks are never lost when a worker dies (only the in-flight chunk is redone). If a split job sees no chunk activity at all for 6 hours (e.g. every chunk-capable worker left), it is returned to the normal queue without penalty.
-- Old workers and the browser-based web worker keep using `/get_job` untouched.
+- Old workers keep using `/get_job` untouched. The browser worker takes video chunks too (via pre-cut segments — see below), and falls back to `/get_job` for small whole files.
 - Watermarks (`--watermark`) are skipped on chunks so the final video is consistent.
 
 ### Server-side segmentation (browser workers on big files)
@@ -337,7 +339,7 @@ So a browser volunteer only ever downloads ~one chunk's worth of data (e.g. ~30 
 
 ```python
 CHUNKED_ENCODING = True     # set False to disable splitting entirely
-CHUNK_DURATION_SEC = 300    # target chunk length in seconds
+CHUNK_DURATION_SEC = 120    # maximum chunk length in seconds (no chunk exceeds this)
 ```
 
 > **Note:** the manager temporarily stores uploaded chunks in `chunk_store/` until assembly — keep roughly one encoded video's worth of free disk per active chunked job.
