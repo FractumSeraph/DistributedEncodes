@@ -1,4 +1,5 @@
 import os
+import math
 import time
 import threading
 import contextlib
@@ -200,10 +201,21 @@ class DatabaseHandler:
             if not os.path.exists(self.disk_path):
                 open(self.disk_path, 'a').close()
 
-            if (os.path.exists(self.ram_path)
-                    and os.path.getmtime(self.ram_path) > os.path.getmtime(self.disk_path) + 1):
+            # In WAL mode the newest commits live in the -wal sidecar, not the
+            # main file — after an unclean shutdown the RAM .db's mtime can look
+            # stale while its -wal holds minutes of newer work. Consider both.
+            ram_wal = self.ram_path + '-wal'
+            ram_mtime = 0.0
+            if os.path.exists(self.ram_path):
+                ram_mtime = os.path.getmtime(self.ram_path)
+                if os.path.exists(ram_wal):
+                    ram_mtime = max(ram_mtime, os.path.getmtime(ram_wal))
+
+            if ram_mtime > os.path.getmtime(self.disk_path) + 1:
                 print("[!] DB Mode: surviving RAM copy is newer than disk — recovering it to disk.")
                 try:
+                    # Opening the RAM DB replays its -wal, so the backup below
+                    # captures those newest commits too.
                     src = sqlite3.connect(self.ram_path)
                     dst = sqlite3.connect(self.disk_path)
                     with dst:
@@ -218,7 +230,14 @@ class DatabaseHandler:
                     pass
                 return
 
-            # Copy to RAM
+            # Copy to RAM. Any stale WAL sidecars from a previous run MUST go
+            # first: SQLite would replay old -wal frames against the replaced
+            # database file — a documented corruption vector.
+            for _side in (ram_wal, self.ram_path + '-shm'):
+                try:
+                    if os.path.exists(_side): os.remove(_side)
+                except OSError as e:
+                    print(f"[!] Could not remove stale sidecar {_side}: {e}")
             shutil.copy2(self.disk_path, self.ram_path)
 
             # Set permissions
@@ -617,7 +636,11 @@ def _plan_chunks(duration_sec, fps, start_time=0.0):
         return None
     if duration_sec < CHUNK_DURATION_SEC * 1.5:
         return None
-    n = max(2, int(round(duration_sec / CHUNK_DURATION_SEC)))
+    # Ceil, not round: no chunk may exceed CHUNK_DURATION_SEC. Browser (wasm)
+    # workers advertise a max chunk length and are only handed chunks at or
+    # under it — with round(), a 290s video split at target 120 produced two
+    # 145s chunks that NO default browser could take, wedging the job.
+    n = max(2, math.ceil(duration_sec / CHUNK_DURATION_SEC))
     n = min(n, 400)
     target = duration_sec / n
     bounds = [0.0]
@@ -633,6 +656,24 @@ def _plan_chunks(duration_sec, fps, start_time=0.0):
             return None  # degenerate plan (absurd fps/duration metadata)
         ranges.append((start, round(end - start, 5)))
     return ranges
+
+def _pending_chunks_exist(folder_filter):
+    """True when any split job still has pending chunks, IGNORING per-worker
+    capability filters (video_only / max_chunk_sec). Used to distinguish a
+    genuinely empty chunk pool from 'chunks exist but this worker can't take
+    them' — the latter must NOT trigger splitting another queued job."""
+    with db_lock:
+        conn = db_handler.get_connection()
+        try:
+            q = ("SELECT 1 FROM chunks c JOIN jobs j ON j.id = c.job_id "
+                 "WHERE c.status='pending' AND j.status='processing' AND COALESCE(j.chunked,0)=1")
+            params = []
+            if folder_filter:
+                q += " AND j.id LIKE ?"
+                params.append(f"{folder_filter}%")
+            return conn.execute(q + " LIMIT 1", params).fetchone() is not None
+        finally:
+            conn.close()
 
 def _resolve_folder_filter(series_id):
     """Map a numeric series_id to its folder prefix, or None."""
@@ -787,8 +828,8 @@ def _split_claimed_job(job):
                 # Still record the stream layout when we have it, so the
                 # whole-file worker can skip its own probe.
                 c.execute("UPDATE jobs SET status='queued', worker_id=NULL, started_at=NULL, "
-                          "chunkable=0, source_duration_sec=?, stream_meta=COALESCE(stream_meta, ?), "
-                          "last_updated=? "
+                          "chunkable=0, source_duration_sec=COALESCE(source_duration_sec, ?), "
+                          "stream_meta=COALESCE(stream_meta, ?), last_updated=? "
                           "WHERE id=? AND status='processing' AND worker_id='(chunking)'",
                           (probe['duration'] if probe else None, _stream_meta_json(probe),
                            datetime.now(), job_id))
@@ -845,10 +886,13 @@ def _assign_pending_chunk(worker_id, folder_filter, max_size_mb, video_only=Fals
                 query_parts.append("c.kind='video'")
             if max_chunk_sec:
                 try:
-                    query_parts.append("c.duration_sec <= ?")
-                    params.append(float(max_chunk_sec))
+                    _mcs = float(max_chunk_sec)
                 except (TypeError, ValueError):
-                    pass
+                    pass  # malformed value: ignore the cap entirely — appending
+                          # the clause before converting left an unbound '?'
+                else:
+                    query_parts.append("c.duration_sec <= ?")
+                    params.append(_mcs)
             if folder_filter:
                 query_parts.append("j.id LIKE ?")
                 params.append(f"{folder_filter}%")
@@ -894,7 +938,14 @@ def _assign_pending_chunk(worker_id, folder_filter, max_size_mb, video_only=Fals
             # Browser workers can't range-stream a multi-GB source, so they fetch
             # a small pre-cut segment for this chunk instead (see /download_segment).
             if chunk['kind'] == 'video':
-                chunk['segment_url'] = (f"{SERVER_URL_DISPLAY.rstrip('/')}/download_segment"
+                # Relative URL, NOT SERVER_URL_DISPLAY: the /web page may be
+                # opened via LAN IP/localhost while the display URL is the
+                # public domain — an absolute URL there is cross-origin, which
+                # the page's COEP (require-corp) blocks and whose custom
+                # X-Worker-Token header would force an unanswered CORS
+                # preflight. The whole-file path already uses a relative
+                # /download_media for exactly this reason.
+                chunk['segment_url'] = (f"/download_segment"
                                         f"?job_id={quote(chunk['job_id'], safe='')}&chunk_index={chunk['chunk_index']}")
             return chunk
         finally:
@@ -1840,6 +1891,13 @@ def get_chunk():
         folder_filter = _resolve_folder_filter(series_id)
 
         chunk = _assign_pending_chunk(worker_id, folder_filter, max_size_mb, video_only=video_only, max_chunk_sec=max_chunk_sec)
+        if chunk is None and max_chunk_sec and _pending_chunks_exist(folder_filter):
+            # Chunks ARE pending — this capped worker just can't take any of
+            # them. Splitting another queued job here would convert one more
+            # job to 'processing' per poll (its chunks equally untakeable),
+            # eventually wedging the whole queue behind the 6-hour backstop.
+            # Let the worker fall back to /get_job instead.
+            return jsonify({"status": "empty"})
         if chunk is None:
             if SPLIT_LOCK.acquire(blocking=False):
                 # No pending chunks anywhere — split the next queued job.
@@ -2196,8 +2254,12 @@ def upload_result():
                     (worker_id, datetime.now(), duration, job_id))
                 # FractumCoin credit: minutes come from ffprobe of the delivered
                 # file, not the worker's claim. A re-upload to an already
-                # completed job (stale worker) earns nothing twice.
-                if prev is not None and prev[0] != 'completed':
+                # completed job (stale worker) earns nothing twice, and the
+                # rowcount guard stops a credit when the UPDATE matched nothing
+                # (job was reset+re-split to chunked during the slow verify —
+                # the chunk workers earn per chunk; crediting the straggler too
+                # would be a double payout).
+                if c.rowcount == 1 and prev is not None and prev[0] != 'completed':
                     _record_earning(conn, wallet, worker_id, job_id, 'full', None, verified_dur / 60.0)
                 conn.commit()
             finally:
@@ -2213,7 +2275,12 @@ def upload_result():
 @app.route('/upload_log', methods=['POST'])
 @requires_worker_auth
 def receive_log():
-    MAX_LOG_BYTES = 50 * 1024 * 1024  # 50 MB hard cap
+    MAX_LOG_BYTES = 50 * 1024 * 1024      # 50 MB hard cap (compressed)
+    MAX_LOG_TEXT  = 16 * 1024 * 1024      # decompressed text we'll scan — the
+                                          # cheat markers all appear early; an
+                                          # unbounded read of a gzip bomb (50 MB
+                                          # of zeros → multi-GB string) would
+                                          # OOM the single gunicorn worker
     if request.content_length and request.content_length > MAX_LOG_BYTES:
         return jsonify({"status": "error", "message": "Log file exceeds 50 MB limit"}), 413
 
@@ -2233,7 +2300,16 @@ def receive_log():
         safe_name = re.sub(r'[^a-zA-Z0-9_.-]', '_', job_id)
         log_path = os.path.join(log_dir, f"{safe_name}.log.gz")
         request.files['log_file'].save(log_path)
-        
+
+        # Re-check on disk: content_length is absent on chunked transfers, so
+        # the header check above can be bypassed.
+        try:
+            if os.path.getsize(log_path) > MAX_LOG_BYTES:
+                os.remove(log_path)
+                return jsonify({"status": "error", "message": "Log file exceeds 50 MB limit"}), 413
+        except OSError:
+            pass
+
         warnings = []
         # Audio chunks contain no video encoder — the video cheat checks below
         # would false-positive on them.
@@ -2241,7 +2317,8 @@ def receive_log():
         try:
             if not is_audio_chunk_log:
                 with gzip.open(log_path, 'rt', encoding='utf-8', errors='ignore') as f:
-                    log_content = f.read().lower()
+                    # Bounded read: never inflate more than MAX_LOG_TEXT into RAM.
+                    log_content = f.read(MAX_LOG_TEXT).lower()
 
                     # 1. Check for GPU Encoders (Safely)
                     mapping_block = re.search(r'stream mapping:(.*?)(?:press \[|output #)', log_content, re.DOTALL)

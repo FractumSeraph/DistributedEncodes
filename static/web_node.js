@@ -162,13 +162,16 @@ async function processChunk(chunk) {
 
         // Same targets as the native chunk path: video-only, SVT-AV1 preset 2,
         // CRF (profile-aware), 480p, timestamps re-zeroed for clean concat.
+        // lp=1 only limits encoder threading (browser memory), it does not
+        // change the bitstream — no tune override, so browser chunks match
+        // native chunks (SVT default tune) when tiled into one video.
         const args = [
             '-threads', '1', '-v', 'verbose',
             '-ss', lead.toFixed(3), '-i', segPath, '-t', dur.toFixed(3),
             '-map', '0:v:0', '-an', '-sn',
             '-c:v', 'libsvtav1', '-preset', '2', '-crf', crf,
             '-pix_fmt', 'yuv420p',
-            '-svtav1-params', 'tune=0:lp=1',
+            '-svtav1-params', 'lp=1',
             '-vf', 'setpts=PTS-STARTPTS,scale=-2:480',
             '-movflags', '+faststart',
             outPath
@@ -256,14 +259,21 @@ async function processJob(job) {
         postMessage({type: 'log', level: 'sys', msg: "Starting FFmpeg..."});
         
         // STRICT ENCODING CONFIGURATION
-        // Matches the manager's verified target: SVT-AV1 preset 2 / CRF 63, 480p,
-        // mono Opus. Notes specific to the browser build:
+        // Matches the manager's verified target: SVT-AV1 preset 2 / CRF 63
+        // (57 for the live_action profile, same as native workers), 480p,
+        // mono Opus 24k. Notes specific to the browser build:
         //  - This wasm has --disable-ffprobe, so we can't inspect streams. We map
         //    the first video + first (optional) audio explicitly and drop
         //    subtitles (-sn): blindly transcoding an unknown subtitle codec to
         //    mov_text is a common hard-failure, and bitmap subs can't convert.
-        //  - A single -svtav1-params: the previous two flags silently overrode
-        //    each other (only the last applied). lp=1 keeps browser memory down.
+        //  - lp=1 keeps browser memory down (native workers pass no
+        //    -svtav1-params; lp only limits threading, not the bitstream).
+        //  - '-c:a opus' + '-strict -2' is FFmpeg's built-in encoder: the
+        //    DEPLOYED wasm was configured without --enable-libopus, so libopus
+        //    isn't available. The wasm-build/ Dockerfile DOES enable it — after
+        //    a rebuild, switch this to '-c:a libopus' (and drop -strict) for
+        //    parity with native workers.
+        const crf = (job.content_profile === 'live_action') ? '57' : '63';
         const args = [
             '-threads', '1',
             '-v', 'verbose',
@@ -273,13 +283,12 @@ async function processJob(job) {
             '-sn',
             '-c:v', 'libsvtav1',
             '-preset', '2',
-            '-crf', '63',
-            '-g', '240',
+            '-crf', crf,
             '-pix_fmt', 'yuv420p',
-            '-svtav1-params', 'tune=0:lp=1',
+            '-svtav1-params', 'lp=1',
             '-vf', 'scale=-2:480',
             '-c:a', 'opus',
-            '-b:a', '12k',
+            '-b:a', '24k',
             '-ac', '1',
             '-strict', '-2',
             outputPath

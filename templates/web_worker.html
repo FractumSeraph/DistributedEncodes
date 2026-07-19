@@ -238,7 +238,7 @@
     let currentChunk = null;   // {job_id, chunk_index} of an in-flight chunk, for release + heartbeat
 
     // Must be >= manager MIN_CLIENT_VERSION or /get_job returns "Update Required".
-    const WEB_WORKER_VERSION = "3.3.0";
+    const WEB_WORKER_VERSION = "3.4.0";
 
     // Worker token: injected by the manager (/web) so the page authenticates
     // out of the box; ?token= in the URL overrides. Empty only if the manager
@@ -261,8 +261,8 @@
     function stopLoop() {
         isRunning = false;
         log("STOP command received. Finishing current job...", 'err');
-        // Release the in-flight job so it doesn't sit 'processing' until the
-        // manager's ~10-min stale sweep before another worker can take it.
+        // Release the in-flight job immediately so it doesn't sit 'processing'
+        // until the manager's dead-job timeout before another worker takes it.
         if (currentJobId) {
             try {
                 fetch('/report_status' + (WORKER_TOKEN ? ('?token=' + encodeURIComponent(WORKER_TOKEN)) : ''), {
@@ -307,6 +307,21 @@
                                        progress: 0, version: WEB_WORKER_VERSION })
             }).catch(() => {});
         }, 15000);
+        return () => clearInterval(id);
+    }
+
+    // Same idea for whole-file jobs: without heartbeats a slow multi-hour
+    // browser encode would hit the manager's dead-job timeout and get
+    // requeued (and encoded twice). Returns a stop() function.
+    function startJobHeartbeat(jobId) {
+        const id = setInterval(() => {
+            fetch('/report_status' + (WORKER_TOKEN ? ('?token=' + encodeURIComponent(WORKER_TOKEN)) : ''), {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ job_id: jobId, worker_id: currentWorkerId,
+                                       status: 'processing', progress: 0,
+                                       version: WEB_WORKER_VERSION })
+            }).catch(() => {});
+        }, 30000);
         return () => clearInterval(id);
     }
 
@@ -388,7 +403,10 @@
                 // A. CHUNK FIRST — take a slice of a large video via a pre-cut
                 // segment (video_only: browsers can't do the whole-file audio
                 // chunk). This is how browser nodes help on multi-GB sources.
-                const cres = await fetch(`/get_chunk?video_only=1&max_size_mb=${currentMaxSizeMb}&max_chunk_sec=${currentMaxChunkSec}&version=${encodeURIComponent(WEB_WORKER_VERSION)}${_authQS}`);
+                // worker_id MUST be sent: assignments recorded with a NULL
+                // worker_id can never be released by our stop/failure reports
+                // (the manager's ownership guards are `AND worker_id=?`).
+                const cres = await fetch(`/get_chunk?video_only=1&worker_id=${encodeURIComponent(currentWorkerId)}&max_size_mb=${currentMaxSizeMb}&max_chunk_sec=${currentMaxChunkSec}&version=${encodeURIComponent(WEB_WORKER_VERSION)}${_authQS}`);
                 if (cres.status === 200) {
                     const cdata = await cres.json();
                     if (cdata.status === 'ok' && cdata.chunk) {
@@ -409,7 +427,7 @@
 
                 // B. GET JOB (whole small files) — must send the version param or
                 // the manager's MIN_CLIENT_VERSION gate returns "Update Required".
-                const res = await fetch(`/get_job?max_size_mb=${currentMaxSizeMb}&version=${encodeURIComponent(WEB_WORKER_VERSION)}${_authQS}`);
+                const res = await fetch(`/get_job?worker_id=${encodeURIComponent(currentWorkerId)}&max_size_mb=${currentMaxSizeMb}&version=${encodeURIComponent(WEB_WORKER_VERSION)}${_authQS}`);
                 const data = await res.json();
 
                 if (res.status === 401) {
@@ -445,8 +463,34 @@
 
             } catch (e) {
                 log("LOOP ERROR: " + e.message, 'err');
+                // Report the failure so the manager releases the work NOW and
+                // counts the strike (3 chunk failures → whole-file fallback) —
+                // silence would leave it assigned until the 30-min/4-h sweeps.
+                if (currentChunk) {
+                    try {
+                        fetch('/report_chunk' + (WORKER_TOKEN ? ('?token=' + encodeURIComponent(WORKER_TOKEN)) : ''), {
+                            method: 'POST', headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({ job_id: currentChunk.job_id, chunk_index: currentChunk.chunk_index,
+                                                   kind: 'video', worker_id: currentWorkerId,
+                                                   status: 'failed', error: String(e.message || e).slice(0, 500),
+                                                   version: WEB_WORKER_VERSION })
+                        });
+                    } catch (re) { /* best effort */ }
+                    currentChunk = null;
+                }
+                if (currentJobId) {
+                    try {
+                        fetch('/report_status' + (WORKER_TOKEN ? ('?token=' + encodeURIComponent(WORKER_TOKEN)) : ''), {
+                            method: 'POST', headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({ job_id: currentJobId, worker_id: currentWorkerId,
+                                                   status: 'failed', error: String(e.message || e).slice(0, 500),
+                                                   version: WEB_WORKER_VERSION })
+                        });
+                    } catch (re) { /* best effort */ }
+                    currentJobId = null;
+                }
                 // If the error implies worker crash, restart it
-                if (worker === null) { 
+                if (worker === null) {
                     log("Worker seems dead. Restarting...", 'err');
                     try { await initWorker(); } catch(err) { isRunning = false; }
                 }
@@ -465,24 +509,24 @@
                 return;
             }
 
-            // Define temporary handler for this job
-            const originalOnMsg = worker.onmessage;
-            
+            const stopHb = startJobHeartbeat(job.id);
+
             worker.onmessage = (e) => {
                 const msg = e.data;
                 if (msg.type === 'log') {
                     log(msg.msg, msg.level);
                 } else if (msg.type === 'done') {
-                    // Restore original handler (for logs/ready) or just keep it?
-                    // Re-init handles logging generally.
+                    stopHb();
                     resolve();
                 } else if (msg.type === 'error') {
+                    stopHb();
                     reject(new Error(msg.msg));
                 }
             };
-            
+
             // If worker crashes/terminates during job
             worker.onerror = (e) => {
+                stopHb();
                 reject(new Error("Worker Crashed: " + e.message));
                 worker = null; // Mark as dead
             };
