@@ -543,7 +543,13 @@ def _probe_media(src, timeout=60):
     or None on failure."""
     try:
         cmd = ['ffprobe', '-v', 'error', '-print_format', 'json',
-               '-show_streams', '-show_format', src]
+               '-show_streams', '-show_format']
+        # Remote sources may sit behind an edge/WAF rule that blocks any
+        # request without the worker token (bot protection on an otherwise
+        # open directory) — authenticate exactly like the workers do.
+        if WORKER_SECRET and isinstance(src, str) and src.startswith(('http://', 'https://')):
+            cmd += ['-headers', f'X-Worker-Token: {WORKER_SECRET}\r\n']
+        cmd.append(src)
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         if res.returncode != 0:
             return None
@@ -1171,6 +1177,11 @@ def scan_remote_http(url, prefix="", depth=0, known_ids=None):
     if depth > 10: return # Prevent infinite recursion
 
     headers = {'User-Agent': 'FractumManager/1.0'}
+    # Send the worker token like every other consumer of the remote source, so
+    # an edge/WAF rule on that host ("no token → block") can shut out scraper
+    # bots without breaking the scan.
+    if WORKER_SECRET:
+        headers['X-Worker-Token'] = WORKER_SECRET
     
     # Retry Loop & Increased Timeout
     r = None
