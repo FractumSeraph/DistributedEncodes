@@ -238,7 +238,7 @@
     let currentChunk = null;   // {job_id, chunk_index} of an in-flight chunk, for release + heartbeat
 
     // Must be >= manager MIN_CLIENT_VERSION or /get_job returns "Update Required".
-    const WEB_WORKER_VERSION = "3.4.0";
+    const WEB_WORKER_VERSION = "3.4.1";
 
     // Worker token: injected by the manager (/web) so the page authenticates
     // out of the box; ?token= in the URL overrides. Empty only if the manager

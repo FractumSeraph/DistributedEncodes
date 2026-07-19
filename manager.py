@@ -595,7 +595,7 @@ def _probe_media(src, timeout=60):
 
         # Frame-rate info of the first video stream — chunk boundaries must be
         # snapped to the frame grid, which is only well-defined for CFR sources.
-        fps = 0.0; start_time = 0.0; is_cfr = False
+        fps = 0.0; start_time = 0.0; is_cfr = False; fps_rational = None
         video = next((s for s in streams if s.get('codec_type') == 'video'), None)
         if video:
             r_rate = _parse_rate(video.get('r_frame_rate', '0/1'))
@@ -603,11 +603,17 @@ def _probe_media(src, timeout=60):
             try: start_time = float(video.get('start_time') or 0)
             except (TypeError, ValueError): start_time = 0.0
             fps = r_rate
+            # Exact fraction (e.g. "24000/1001") — handed to chunk workers so
+            # they can pin the encoder time base (see stream_meta 'fps').
+            _rr = str(video.get('r_frame_rate') or '')
+            if re.fullmatch(r'[1-9]\d*/[1-9]\d*', _rr):
+                fps_rational = _rr
             # CFR when the container's average rate agrees with the nominal rate
             is_cfr = (r_rate > 0 and avg_rate > 0 and abs(r_rate - avg_rate) / r_rate < 0.005)
         return {
             "duration": dur, "has_audio": has_audio, "has_subs": has_subs,
             "fps": fps, "start_time": start_time, "cfr": is_cfr,
+            "fps_rational": fps_rational,
             "format_start": format_start, "audio_start": audio_start,
             "audio_index": audio_index, "audio_channels": audio_channels,
             "subtitle_indices": subtitle_indices,
@@ -627,6 +633,12 @@ def _stream_meta_json(probe):
             "audio_index": probe.get("audio_index"),
             "audio_channels": probe.get("audio_channels") or 2,
             "subtitle_indices": probe.get("subtitle_indices") or [],
+            # Exact frame rate fraction ("24000/1001"). Chunk workers pin the
+            # encoder time base with it: ffmpeg 7.x doesn't propagate a frame
+            # rate through setpts with -fps_mode passthrough, so libsvtav1
+            # falls back to 1/time_base (1000 fps on MKV) and refuses to start
+            # ("The maximum allowed frame rate is 240 fps").
+            "fps": probe.get("fps_rational"),
         })
     except (TypeError, ValueError):
         return None
@@ -809,7 +821,11 @@ def _split_claimed_job(job):
     # workers give up waiting after ~30s.
     probe = _probe_media(src, timeout=20) if src else None
     ranges = None
-    if probe and probe['cfr']:
+    if probe and probe['fps'] > 240:
+        # SVT-AV1 caps at 240 fps — a "faster" rate is broken container
+        # metadata, and the frame-grid boundary math would be wrong anyway.
+        log_event("INFO", f"Frame rate {probe['fps']:.0f} fps out of range — encoding whole.", job_id)
+    elif probe and probe['cfr']:
         # Streams that don't share a common start offset (e.g. broadcast
         # captures where audio leads video) can't be sliced on the video
         # frame grid without shifting A/V sync — encode those whole.
@@ -921,11 +937,17 @@ def _assign_pending_chunk(worker_id, folder_filter, max_size_mb, video_only=Fals
                 return None
             chunk = dict(row)
             # Only the audio chunk probes the source; hand it the pre-computed
-            # stream layout so it can skip that probe. Video chunks don't need
-            # it — drop it to keep the payload small.
+            # stream layout so it can skip that probe. Video chunks only need
+            # the frame rate (they pin the encoder time base with it) — drop
+            # the rest to keep the payload small.
             _sm = chunk.pop('stream_meta', None)
-            if chunk['kind'] == 'audio' and _sm:
-                try: chunk['stream_meta'] = json.loads(_sm)
+            if _sm:
+                try:
+                    _sm_parsed = json.loads(_sm)
+                    if chunk['kind'] == 'audio':
+                        chunk['stream_meta'] = _sm_parsed
+                    elif _sm_parsed.get('fps'):
+                        chunk['fps'] = _sm_parsed['fps']
                 except (TypeError, ValueError): pass
             # The final video chunk encodes to EOF instead of using -t.
             # Computed as a separate single-row query so the assignment scan

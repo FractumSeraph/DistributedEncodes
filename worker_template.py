@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.4.0"
+WORKER_VERSION = "3.4.1"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -1482,6 +1482,20 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
             is_last = bool(chunk.get('is_last'))
             seek_flags = ['-ss', f"{start_sec:.5f}"] if start_sec > 0 else []
             limit_flags = [] if is_last else ['-t', f"{dur_sec:.5f}"]  # last chunk runs to EOF
+            # Pin the encoder time base to the source frame rate (manager sends
+            # the exact fraction, e.g. "24000/1001"). Without this, ffmpeg 7.x
+            # doesn't propagate a frame rate through setpts under -fps_mode
+            # passthrough, so libsvtav1 falls back to 1/time_base — 1000 fps on
+            # an MKV source — and refuses to start ("The maximum allowed frame
+            # rate is 240 fps"). Verified: output timestamps are bit-identical
+            # with and without this flag on ffmpeg 6.x.
+            etb_flags = []
+            _fr = str(chunk.get('fps') or '')
+            _m = re.fullmatch(r'([1-9]\d*)/([1-9]\d*)', _fr)
+            if _m:
+                _fn, _fd = int(_m.group(1)), int(_m.group(2))
+                if 0 < _fn / _fd <= 240:
+                    etb_flags = ['-enc_time_base', f"{_fd}/{_fn}"]
             cmd = ([FFMPEG_CMD] + input_flags + seek_flags +
                    ['-y', '-i', dl_url] + limit_flags +
                    ['-map', '0:v:0', '-an', '-sn',
@@ -1489,8 +1503,8 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                     '-c:v', ENCODING_CONFIG["VIDEO_CODEC"],
                     '-preset', ENCODING_CONFIG["VIDEO_PRESET"],
                     '-crf', str(target_crf),
-                    '-pix_fmt', ENCODING_CONFIG["VIDEO_PIX_FMT"],
-                    '-vf', f"setpts=PTS-STARTPTS,{ENCODING_CONFIG['VIDEO_SCALE']}",
+                    '-pix_fmt', ENCODING_CONFIG["VIDEO_PIX_FMT"]] + etb_flags +
+                   ['-vf', f"setpts=PTS-STARTPTS,{ENCODING_CONFIG['VIDEO_SCALE']}",
                     '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
                     '-progress', 'pipe:1', out_path])
             prog_total = dur_sec

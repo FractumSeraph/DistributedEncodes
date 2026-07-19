@@ -165,6 +165,16 @@ async function processChunk(chunk) {
         // lp=1 only limits encoder threading (browser memory), it does not
         // change the bitstream — no tune override, so browser chunks match
         // native chunks (SVT default tune) when tiled into one video.
+        // -enc_time_base pins the encoder time base to the source frame rate
+        // (manager sends the exact fraction): FFmpeg 7.x (this wasm) doesn't
+        // propagate a frame rate through setpts, and libsvtav1 would see
+        // 1/time_base = 1000 fps and refuse to start (240 fps cap).
+        let etbArgs = [];
+        const frMatch = String(chunk.fps || '').match(/^([1-9]\d*)\/([1-9]\d*)$/);
+        if (frMatch) {
+            const fn = parseInt(frMatch[1], 10), fd = parseInt(frMatch[2], 10);
+            if (fn / fd <= 240) etbArgs = ['-enc_time_base', `${fd}/${fn}`];
+        }
         const args = [
             '-threads', '1', '-v', 'verbose',
             '-ss', lead.toFixed(3), '-i', segPath, '-t', dur.toFixed(3),
@@ -172,6 +182,7 @@ async function processChunk(chunk) {
             '-c:v', 'libsvtav1', '-preset', '2', '-crf', crf,
             '-pix_fmt', 'yuv420p',
             '-svtav1-params', 'lp=1',
+            ...etbArgs,
             '-vf', 'setpts=PTS-STARTPTS,scale=-2:480',
             '-movflags', '+faststart',
             outPath
