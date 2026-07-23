@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.4.1"
+WORKER_VERSION = "3.4.2"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -1080,14 +1080,22 @@ def _compute_source_hash(dl_url, is_local):
 # ==============================================================================
 
 def _ffmpeg_primary_url():
-    """Return the primary upstream URL for the current platform/arch."""
+    """Return the primary upstream URL for the current platform/arch.
+
+    Pinned to BtbN's 7.1 RELEASE-branch builds, NOT master-latest: master is a
+    daily dev snapshot, and nodes running it have hit real regressions in
+    production (an mp4 muxer assertion abort mid-encode, and fragmented-mp4
+    output the manager's ffprobe reads as 0-duration — every upload rejected).
+    'n7.1-latest' still receives bugfix rebuilds of the stable branch.
+    (arm64 also moved to BtbN: the johnvansickle static builds don't include
+    libsvtav1, so auto-download could never produce a usable encoder there.)"""
     if platform.system() == "Windows":
-        return "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
+        return "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-win64-gpl-7.1.zip"
     arch = platform.machine().lower()
     if arch in ['x86_64', 'amd64']:
-        return "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz"
+        return "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-linux64-gpl-7.1.tar.xz"
     elif arch in ['aarch64', 'arm64']:
-        return "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-arm64-static.tar.xz"
+        return "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-linuxarm64-gpl-7.1.tar.xz"
     return None
 
 def _save_ffmpeg_meta(url):
@@ -1111,6 +1119,7 @@ def update_ffmpeg_if_stale():
     last download.  A full download (~100-200 MB) only happens when the
     upstream file has actually changed.
     """
+    global FFMPEG_CMD, FFPROBE_CMD
     local_bin = os.path.abspath("ffmpeg.exe" if platform.system() == "Windows" else "./ffmpeg")
     if not os.path.exists(local_bin):
         return  # nothing local to update; check_ffmpeg() handles first install
@@ -1128,6 +1137,19 @@ def update_ffmpeg_if_stale():
             if m.get('url') == url:
                 stored_etag = m.get('etag', '')
                 stored_lm   = m.get('last_modified', '')
+            elif m.get('url'):
+                # The download channel changed (e.g. master-latest -> pinned
+                # n7.1 release): the local binary came from the WRONG channel,
+                # so replace it now instead of silently keeping it forever.
+                print("[*] FFmpeg download channel changed — fetching the pinned build...")
+                ok = download_ffmpeg_windows() if platform.system() == "Windows" else download_ffmpeg_linux()
+                if ok:
+                    _save_ffmpeg_meta(url)
+                    _lp = os.path.abspath("ffprobe.exe" if platform.system() == "Windows" else "./ffprobe")
+                    FFMPEG_CMD = local_bin
+                    if os.path.exists(_lp): FFPROBE_CMD = _lp
+                    print("[*] FFmpeg updated successfully.")
+                return
         except Exception:
             pass
 
@@ -1160,7 +1182,6 @@ def update_ffmpeg_if_stale():
     if ok:
         _save_ffmpeg_meta(url)
         # Re-point FFMPEG_CMD to the freshly extracted binary
-        global FFMPEG_CMD, FFPROBE_CMD
         local_ffprobe = os.path.abspath("ffprobe.exe" if platform.system() == "Windows" else "./ffprobe")
         FFMPEG_CMD = local_bin
         if os.path.exists(local_ffprobe):
@@ -1171,8 +1192,8 @@ def download_ffmpeg_windows():
     print("[*] FFmpeg not found. Attempting download (FULL Version ~128MB)...")
     
     urls = [
-        "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip",
-        "https://vsv.fractumseraph.net/ffmpeg-master-latest-win64-gpl.zip"
+        "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-win64-gpl-7.1.zip",
+        "https://vsv.fractumseraph.net/ffmpeg-n7.1-latest-win64-gpl-7.1.zip"
     ]
     
     temp_zip = "ffmpeg_temp.zip"
@@ -1229,9 +1250,10 @@ def download_ffmpeg_linux():
     arch = platform.machine().lower()
     
     if arch in ['x86_64', 'amd64']:
-        url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz"
+        url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-linux64-gpl-7.1.tar.xz"
     elif arch in ['aarch64', 'arm64']:
-        url = "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-arm64-static.tar.xz"
+        # BtbN, not johnvansickle: the JVS static builds have no libsvtav1.
+        url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-linuxarm64-gpl-7.1.tar.xz"
     else:
         print(f"[!] Unsupported architecture for auto-download: {arch}")
         return False
@@ -1296,38 +1318,71 @@ def has_svtav1(cmd):
     except:
         return False
 
+# Minimum supported FFmpeg = 7.1, expressed as its libavformat version (61.7).
+# The library version is the one signal every build reports identically —
+# distro strings ("7.1.5-0+deb13u1"), BtbN names ("n7.1-latest") and git
+# snapshots ("N-125708-g...") all differ, but the "libavformat 61. 7.100"
+# banner line is universal.
+_MIN_LAVF = (61, 7)
+
+def ffmpeg_meets_min_version(cmd):
+    """True when `cmd -version` reports libavformat >= 7.1's (61.7).
+    Returns True on parse failure — an unreadable banner shouldn't brick a
+    worker whose encoder support was already verified by has_svtav1()."""
+    try:
+        res = subprocess.run([cmd, "-version"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             encoding='utf-8', errors='replace', timeout=15)
+        out = res.stdout or ""
+        m = re.search(r'libavformat\s+(\d+)\.\s*(\d+)', out)
+        if not m:
+            return True
+        ver = (int(m.group(1)), int(m.group(2)))
+        if ver < _MIN_LAVF:
+            first = out.splitlines()[0] if out else cmd
+            print(f"[!] {first.strip()}")
+            print(f"[!] This FFmpeg is older than the supported minimum (7.1).")
+            return False
+        # Informational only: unreleased dev snapshots have caused real
+        # encode/mux regressions in this swarm — recommend a release build.
+        if re.search(r'^ffmpeg version [Nn]-\d+-g', out):
+            print("[!] WARNING: this FFmpeg is a git development snapshot, not a release.")
+            print("    Dev builds have caused broken uploads before — a stable release (7.1+) is recommended.")
+        return True
+    except Exception:
+        return True
+
 def check_ffmpeg():
     global FFMPEG_CMD, FFPROBE_CMD
-    
+
     local_ffmpeg = os.path.abspath("ffmpeg.exe" if platform.system() == "Windows" else "./ffmpeg")
     local_ffprobe = os.path.abspath("ffprobe.exe" if platform.system() == "Windows" else "./ffprobe")
-    
-    if os.path.exists(local_ffmpeg) and has_svtav1(local_ffmpeg):
+
+    if os.path.exists(local_ffmpeg) and has_svtav1(local_ffmpeg) and ffmpeg_meets_min_version(local_ffmpeg):
         FFMPEG_CMD = local_ffmpeg
         if os.path.exists(local_ffprobe): FFPROBE_CMD = local_ffprobe
         return
 
-    if shutil.which("ffmpeg") and has_svtav1("ffmpeg"):
+    if shutil.which("ffmpeg") and has_svtav1("ffmpeg") and ffmpeg_meets_min_version("ffmpeg"):
         FFMPEG_CMD = "ffmpeg"
         FFPROBE_CMD = "ffprobe"
         return
 
-    print("[!] Valid FFmpeg with libsvtav1 not found.")
-    
+    print("[!] No FFmpeg found with libsvtav1 support at version 7.1 or newer.")
+
     download_success = False
     if platform.system() == "Windows":
         download_success = download_ffmpeg_windows()
     else:
         download_success = download_ffmpeg_linux()
-        
+
     if download_success:
         if os.path.exists(local_ffmpeg) and has_svtav1(local_ffmpeg):
             FFMPEG_CMD = local_ffmpeg
             if os.path.exists(local_ffprobe): FFPROBE_CMD = local_ffprobe
             return
 
-    print("\n[CRITICAL ERROR] Could not find or download a version of FFmpeg with 'libsvtav1' support.")
-    print("Please install FFmpeg with SVT-AV1 support manually.")
+    print("\n[CRITICAL ERROR] Could not find or download FFmpeg 7.1+ with 'libsvtav1' support.")
+    print("Please install FFmpeg 7.1 or newer with SVT-AV1 support manually.")
     sys.exit(1)
 
 def verify_connection(manager_url):
@@ -1599,7 +1654,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
             prog_total = src_dur if src_dur > 0 else dur_sec
 
         # ---- Encode (2 attempts) ----
-        proc = None; log_buffer = []
+        proc = None; log_buffer = []; _trunc_note = None
         report_chunk("processing", 0)
         for _att in range(2):
             if SHUTDOWN_EVENT.is_set(): break
@@ -1657,7 +1712,32 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                 if proc.poll() is None:
                     try: proc.kill()
                     except Exception: pass
-            if proc.returncode == 0 or SHUTDOWN_EVENT.is_set(): break
+            if SHUTDOWN_EVENT.is_set(): break
+            if proc.returncode == 0:
+                # Self-check BEFORE uploading: a dropped source stream can make
+                # ffmpeg see a premature EOF and finish "successfully" with only
+                # part of the chunk encoded ("Stream ends prematurely" in the
+                # log, rc 0). The manager would reject it anyway (duration
+                # mismatch) — catching it here turns an upload+reject+strike
+                # into an immediate local retry. Mirrors the manager's tolerances.
+                if kind == 'video' and bool(chunk.get('is_last')) and src_dur > 0:
+                    _exp_dur = max(0.0, src_dur - start_sec)
+                else:
+                    _exp_dur = dur_sec
+                if kind == 'video':
+                    _tol = max(10.0, _exp_dur * 0.10) if chunk.get('is_last') else max(2.0, _exp_dur * 0.05)
+                else:
+                    _tol = max(10.0, _exp_dur * 0.05)
+                _odur = _probe_local_duration(out_path)
+                if _exp_dur > 0 and _odur < _exp_dur - _tol:
+                    _trunc_note = f"{_odur:.1f}s of {_exp_dur:.1f}s"
+                    log(worker_id, f"Chunk output truncated ({_trunc_note}) — source stream likely "
+                                   f"dropped mid-encode ({chunk_tag}). Retrying.", "WARN")
+                    try: os.remove(out_path)
+                    except OSError: pass
+                    continue  # burn this attempt, re-encode
+                _trunc_note = None
+                break
 
         def upload_chunk_log():
             try:
@@ -1686,7 +1766,10 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
 
         if proc is None or proc.returncode != 0 or not os.path.exists(out_path):
             rc = proc.returncode if proc else -1
-            err_msg = f"FFmpeg exited with code {rc} ({chunk_tag})"
+            if _trunc_note:
+                err_msg = f"Truncated output ({_trunc_note}) — source stream interrupted ({chunk_tag})"
+            else:
+                err_msg = f"FFmpeg exited with code {rc} ({chunk_tag})"
             log(worker_id, err_msg, "ERROR")
             report_chunk("failed", error_msg=err_msg)
             report_error(job_id, "chunk_encode_failure", err_msg,
@@ -2439,7 +2522,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                     "created_at":       time.time(),
                 })
 
-                proc = None; enc_time = 0
+                proc = None; enc_time = 0; _wf_trunc_note = None
                 log_buffer = []  # defined before the loop: a pre-first-attempt
                                  # shutdown must not NameError the failure dump
                 for _enc_attempt in range(3):
@@ -2527,8 +2610,26 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                             except Exception: pass
 
                     enc_time = time.time() - start_enc
-                    if proc.returncode == 0 or SHUTDOWN_EVENT.is_set(): break
-                
+                    if SHUTDOWN_EVENT.is_set(): break
+                    if proc.returncode == 0:
+                        # Self-check BEFORE uploading: a dropped source stream
+                        # can make ffmpeg see a premature EOF and exit 0 with a
+                        # truncated file. The manager rejects those anyway —
+                        # catching it locally saves the (large) upload and
+                        # retries immediately. Same tolerance as the manager.
+                        if total_sec > 0:
+                            _wf_odur = _probe_local_duration(local_dst)
+                            _wf_tol = max(10.0, total_sec * 0.05)
+                            if _wf_odur < total_sec - _wf_tol:
+                                _wf_trunc_note = f"{_wf_odur:.1f}s of {total_sec:.1f}s"
+                                log(worker_id, f"Encode output truncated ({_wf_trunc_note}) — source "
+                                               "stream likely dropped mid-encode. Retrying.", "WARN")
+                                try: os.remove(local_dst)
+                                except OSError: pass
+                                continue  # burn this attempt, re-encode
+                        _wf_trunc_note = None
+                        break
+
                 gz_log_path = os.path.join(temp_dir, "encode.log.gz")
                 try:
                     with open(raw_log_path, 'rb') as f_in, gzip.open(gz_log_path, 'wb') as f_out:
@@ -2651,6 +2752,8 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                 else:
                     rc = proc.returncode if proc else -1
                     err_msg = f"FFmpeg exited with code {rc}"
+                    if _wf_trunc_note:
+                        err_msg = f"Truncated output ({_wf_trunc_note}) — source stream interrupted"
                     if SHUTDOWN_EVENT.is_set(): err_msg = "Aborted by user/update"
 
                     log(worker_id, err_msg, "ERROR")

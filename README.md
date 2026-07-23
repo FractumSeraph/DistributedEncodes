@@ -411,6 +411,22 @@ python3 find_truncated.py --include-missing  # also re-encode jobs with no outpu
 ### `update.sh` / `update.ps1`
 Pulls the latest code from git and restarts the service. Run on the manager host.
 
+### Built-in auto-update (no scripts needed)
+Set `MANAGER_AUTO_UPDATE = True` in `config.py` and the manager keeps itself
+current: every `MANAGER_UPDATE_INTERVAL_HOURS` it fetches
+`origin/MANAGER_UPDATE_BRANCH`, fast-forwards to it, refreshes
+`requirements.txt` dependencies, syncs/backs up the database, and restarts
+into the new code — via `MANAGER_RESTART_CMD` if you set one, otherwise a
+zero-downtime gunicorn reload (SIGHUP), otherwise a clean exit under systemd
+(`Restart=always` relaunches it). A repo with local modifications is left
+alone, and diverged history is reported instead of force-reset. Security
+note: whoever can push to that branch controls the server — protect it.
+
+**Worker FFmpeg requirements:** workers require FFmpeg **7.1+** with
+`libsvtav1` at startup. Older or unsuitable system installs are ignored and a
+pinned stable 7.1 build (BtbN release branch) is downloaded instead; git dev
+snapshots print a warning (unreleased builds have produced broken uploads).
+
 ---
 
 ## Architecture Overview

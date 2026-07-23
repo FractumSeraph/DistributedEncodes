@@ -1,6 +1,8 @@
 import os
+import sys
 import math
 import time
+import signal
 import threading
 import contextlib
 import sqlite3
@@ -112,6 +114,25 @@ try:
         from config import DB_BACKUP_RETENTION
     except ImportError:
         DB_BACKUP_RETENTION = 10
+
+    # Self-update from git: pull origin/<branch> on a schedule and restart
+    # into the new code, so updates don't need a manual login+pull+restart.
+    try:
+        from config import MANAGER_AUTO_UPDATE
+    except ImportError:
+        MANAGER_AUTO_UPDATE = False
+    try:
+        from config import MANAGER_UPDATE_INTERVAL_HOURS
+    except ImportError:
+        MANAGER_UPDATE_INTERVAL_HOURS = 6
+    try:
+        from config import MANAGER_UPDATE_BRANCH
+    except ImportError:
+        MANAGER_UPDATE_BRANCH = "main"
+    try:
+        from config import MANAGER_RESTART_CMD
+    except ImportError:
+        MANAGER_RESTART_CMD = None
 
 except ImportError:
     print("[!] Critical Error: config.py not found.")
@@ -327,6 +348,108 @@ def _backup_loop():
     while True:
         backup_database()
         time.sleep(interval)
+
+# ==============================================================================
+# MANAGER SELF-UPDATE (git pull + restart)
+# ==============================================================================
+
+_REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def _git(*args, timeout=180):
+    return subprocess.run(['git'] + list(args), cwd=_REPO_DIR,
+                          capture_output=True, text=True, timeout=timeout)
+
+def _restart_self():
+    """Restart the manager so the freshly pulled code takes effect.
+    Returns True when a restart was initiated. Tried in order:
+      1. MANAGER_RESTART_CMD from config (e.g. 'systemctl --user restart ...').
+      2. Running under gunicorn: SIGHUP the master — a graceful, zero-downtime
+         reload that re-execs the workers with the new code.
+      3. Running under systemd (Restart=always in the shipped unit): exit
+         cleanly and let systemd bring the new version up.
+    A bare `python manager.py` in a terminal has no safe restart path — we
+    keep running on the old code and say so rather than kill the service."""
+    if MANAGER_RESTART_CMD:
+        try:
+            subprocess.Popen(MANAGER_RESTART_CMD, shell=True)
+            return True
+        except Exception as e:
+            log_event("ERROR", f"Auto-update: restart command failed: {e}")
+            return False
+    try:
+        ppid = os.getppid()
+        with open(f'/proc/{ppid}/cmdline', 'rb') as f:
+            if b'gunicorn' in f.read():
+                os.kill(ppid, signal.SIGHUP)
+                return True
+    except Exception:
+        pass
+    # Under systemd, our DIRECT parent is the systemd instance (system or
+    # --user). Checking the parent's process name (not just INVOCATION_ID,
+    # which children of a service inherit into shells) avoids killing a
+    # manager someone launched by hand in a terminal.
+    try:
+        if os.environ.get('INVOCATION_ID'):
+            with open(f'/proc/{os.getppid()}/comm') as f:
+                if f.read().strip() == 'systemd':
+                    # Small delay so the HTTP response / log write finishes first.
+                    threading.Thread(target=lambda: (time.sleep(2), os._exit(0)), daemon=True).start()
+                    return True
+    except Exception:
+        pass
+    return False
+
+def _auto_update_loop():
+    """Periodically fast-forward to origin/<branch> and restart into it.
+    Never touches a repo with local (tracked) modifications, and only ever
+    fast-forwards — a diverged history is reported, not force-reset."""
+    interval = max(1, int(MANAGER_UPDATE_INTERVAL_HOURS)) * 3600
+    branch = MANAGER_UPDATE_BRANCH
+    while True:
+        time.sleep(interval)
+        try:
+            if _git('fetch', 'origin', branch).returncode != 0:
+                continue  # network/remote hiccup — try again next cycle
+            local  = _git('rev-parse', 'HEAD').stdout.strip()
+            remote = _git('rev-parse', f'origin/{branch}').stdout.strip()
+            if not local or not remote or local == remote:
+                continue
+            if _git('status', '--porcelain', '--untracked-files=no').stdout.strip():
+                log_event("WARN", "Auto-update skipped: repo has local modifications.")
+                continue
+            pull = _git('pull', '--ff-only', 'origin', branch)
+            if pull.returncode != 0:
+                log_event("ERROR", f"Auto-update pull failed: {(pull.stderr or '')[-300:]}")
+                continue
+            log_event("WARN", f"Auto-update: {local[:7]} -> {remote[:7]} from origin/{branch}.")
+            # Best-effort dependency refresh, mirroring update.sh
+            req = os.path.join(_REPO_DIR, 'requirements.txt')
+            if os.path.exists(req):
+                try:
+                    subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', '-r', req],
+                                   capture_output=True, timeout=600)
+                except Exception:
+                    pass
+            # Make the DB safe before the process goes away.
+            try:
+                db_handler.sync_to_disk()
+            except Exception:
+                pass
+            if DB_BACKUP_ENABLED:
+                try:
+                    backup_database()
+                except Exception:
+                    pass
+            if _restart_self():
+                log_event("WARN", "Auto-update: restarting into the new version.")
+            else:
+                log_event("WARN", "Auto-update: new code pulled, but no automatic restart "
+                                  "path is available — restart the manager to apply it.")
+        except Exception as e:
+            try:
+                log_event("ERROR", f"Auto-update error: {e}")
+            except Exception:
+                pass
 
 # ==============================================================================
 # LOGGING
@@ -2973,6 +3096,9 @@ threading.Thread(target=scan_and_queue, daemon=True).start()
 threading.Thread(target=maintenance_loop, daemon=True).start()
 if DB_BACKUP_ENABLED:
     threading.Thread(target=_backup_loop, daemon=True).start()
+if MANAGER_AUTO_UPDATE:
+    threading.Thread(target=_auto_update_loop, daemon=True).start()
+    print(f"[*] Auto-update enabled: checking origin/{MANAGER_UPDATE_BRANCH} every {MANAGER_UPDATE_INTERVAL_HOURS}h.")
 print(f"[*] Manager initialized and ready. (Service URL: {SERVER_URL_DISPLAY})")
 
 if __name__ == '__main__':
