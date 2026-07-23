@@ -1318,38 +1318,71 @@ def has_svtav1(cmd):
     except:
         return False
 
+# Minimum supported FFmpeg = 7.1, expressed as its libavformat version (61.7).
+# The library version is the one signal every build reports identically —
+# distro strings ("7.1.5-0+deb13u1"), BtbN names ("n7.1-latest") and git
+# snapshots ("N-125708-g...") all differ, but the "libavformat 61. 7.100"
+# banner line is universal.
+_MIN_LAVF = (61, 7)
+
+def ffmpeg_meets_min_version(cmd):
+    """True when `cmd -version` reports libavformat >= 7.1's (61.7).
+    Returns True on parse failure — an unreadable banner shouldn't brick a
+    worker whose encoder support was already verified by has_svtav1()."""
+    try:
+        res = subprocess.run([cmd, "-version"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             encoding='utf-8', errors='replace', timeout=15)
+        out = res.stdout or ""
+        m = re.search(r'libavformat\s+(\d+)\.\s*(\d+)', out)
+        if not m:
+            return True
+        ver = (int(m.group(1)), int(m.group(2)))
+        if ver < _MIN_LAVF:
+            first = out.splitlines()[0] if out else cmd
+            print(f"[!] {first.strip()}")
+            print(f"[!] This FFmpeg is older than the supported minimum (7.1).")
+            return False
+        # Informational only: unreleased dev snapshots have caused real
+        # encode/mux regressions in this swarm — recommend a release build.
+        if re.search(r'^ffmpeg version [Nn]-\d+-g', out):
+            print("[!] WARNING: this FFmpeg is a git development snapshot, not a release.")
+            print("    Dev builds have caused broken uploads before — a stable release (7.1+) is recommended.")
+        return True
+    except Exception:
+        return True
+
 def check_ffmpeg():
     global FFMPEG_CMD, FFPROBE_CMD
-    
+
     local_ffmpeg = os.path.abspath("ffmpeg.exe" if platform.system() == "Windows" else "./ffmpeg")
     local_ffprobe = os.path.abspath("ffprobe.exe" if platform.system() == "Windows" else "./ffprobe")
-    
-    if os.path.exists(local_ffmpeg) and has_svtav1(local_ffmpeg):
+
+    if os.path.exists(local_ffmpeg) and has_svtav1(local_ffmpeg) and ffmpeg_meets_min_version(local_ffmpeg):
         FFMPEG_CMD = local_ffmpeg
         if os.path.exists(local_ffprobe): FFPROBE_CMD = local_ffprobe
         return
 
-    if shutil.which("ffmpeg") and has_svtav1("ffmpeg"):
+    if shutil.which("ffmpeg") and has_svtav1("ffmpeg") and ffmpeg_meets_min_version("ffmpeg"):
         FFMPEG_CMD = "ffmpeg"
         FFPROBE_CMD = "ffprobe"
         return
 
-    print("[!] Valid FFmpeg with libsvtav1 not found.")
-    
+    print("[!] No FFmpeg found with libsvtav1 support at version 7.1 or newer.")
+
     download_success = False
     if platform.system() == "Windows":
         download_success = download_ffmpeg_windows()
     else:
         download_success = download_ffmpeg_linux()
-        
+
     if download_success:
         if os.path.exists(local_ffmpeg) and has_svtav1(local_ffmpeg):
             FFMPEG_CMD = local_ffmpeg
             if os.path.exists(local_ffprobe): FFPROBE_CMD = local_ffprobe
             return
 
-    print("\n[CRITICAL ERROR] Could not find or download a version of FFmpeg with 'libsvtav1' support.")
-    print("Please install FFmpeg with SVT-AV1 support manually.")
+    print("\n[CRITICAL ERROR] Could not find or download FFmpeg 7.1+ with 'libsvtav1' support.")
+    print("Please install FFmpeg 7.1 or newer with SVT-AV1 support manually.")
     sys.exit(1)
 
 def verify_connection(manager_url):

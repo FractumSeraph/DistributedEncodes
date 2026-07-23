@@ -39,6 +39,24 @@ DB_BACKUP_INTERVAL_HOURS = 12
 DB_BACKUP_RETENTION = 10
 
 # ==============================================================================
+# MANAGER AUTO-UPDATE
+# ==============================================================================
+# When True, the manager checks origin/<branch> on a schedule, fast-forwards
+# to it, and restarts itself into the new code — no manual login/pull/restart.
+# Restart order: MANAGER_RESTART_CMD if set; else a graceful gunicorn reload
+# (SIGHUP to the master, zero downtime); else a clean exit under systemd
+# (the shipped unit has Restart=always). Repos with local modifications are
+# never touched, and only fast-forward pulls are performed.
+# NOTE: this executes whatever lands on the branch — anyone with push access
+# to it effectively controls the server. Keep the branch protected.
+MANAGER_AUTO_UPDATE = True
+MANAGER_UPDATE_INTERVAL_HOURS = 6
+MANAGER_UPDATE_BRANCH = "main"
+# Optional explicit restart command, e.g.:
+# MANAGER_RESTART_CMD = "systemctl --user restart distributed-encodes.service"
+MANAGER_RESTART_CMD = None
+
+# ==============================================================================
 # FILE & DIRECTORY SETTINGS
 # ==============================================================================
 # Local folder to scan for source files
