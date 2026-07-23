@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.4.2"
+WORKER_VERSION = "3.4.3"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -1392,10 +1392,60 @@ def verify_connection(manager_url):
     print(f"[!] Could not connect to {manager_url}"); return False
 
 
+def _ensure_temp_writable(temp_dir):
+    """Make sure this worker's temp dir is usable, self-healing the common
+    accident: a previous run as another user (e.g. via sudo) left root-owned
+    encode.log/output files behind, and every open(..., 'w') now dies with
+    [Errno 13]. Unwritable leftovers are deleted when possible (they're
+    unusable for resume anyway). Returns an error string, or None when OK."""
+    try:
+        os.makedirs(temp_dir, exist_ok=True)
+        probe = os.path.join(temp_dir, '.write_test')
+        try:
+            with open(probe, 'w') as f:
+                f.write('x')
+            os.remove(probe)
+        except (PermissionError, OSError) as e:
+            return f"Temp dir '{temp_dir}' is not writable by this user ({e})"
+        for name in os.listdir(temp_dir):
+            p = os.path.join(temp_dir, name)
+            if not os.path.isfile(p) or os.access(p, os.W_OK):
+                continue
+            try:
+                os.remove(p)
+                print(f"[*] Removed unwritable leftover from a previous run: {p}")
+            except OSError:
+                return (f"'{p}' is not writable and cannot be removed "
+                        f"(owned by another user?)")
+        return None
+    except OSError as e:
+        return str(e)
+
 def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=False, series_id=None, watermark=False, max_size_mb=0, local_source_dir=None, no_chunks=False, wallet=None):
     global UPDATE_AVAILABLE
     log(worker_id, "Thread active.")
     os.makedirs(temp_dir, exist_ok=True)
+    # Refuse to take ANY job with a broken temp dir: every encode would fail,
+    # burning fail_count strikes against perfectly good jobs on the manager.
+    _tmp_err = _ensure_temp_writable(temp_dir)
+    if _tmp_err:
+        log(worker_id, f"{_tmp_err}. Likely cause: the worker previously ran as a different "
+                       f"user (sudo). Fix: delete '{temp_dir}' (sudo rm -rf) or chown it, "
+                       "then restart the worker WITHOUT sudo. Not taking jobs.", "ERROR")
+        try:
+            requests.post(f"{manager_url}/report_error",
+                          json={"job_id": "none", "worker_id": worker_id,
+                                "error_type": "temp_dir_permissions",
+                                "message": _tmp_err[:2048], "details": ""},
+                          headers=get_auth_headers(), timeout=10)
+        except Exception:
+            pass
+        with PROGRESS_LOCK:
+            WORKER_PROGRESS[worker_id] = "Perm Error"
+        d = WORKER_DETAILS.get(worker_id)
+        if d is not None:
+            d["phase"] = "Perm Error"
+        return
     
     def update_status(msg):
         with PROGRESS_LOCK:
