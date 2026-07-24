@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.4.3"
+WORKER_VERSION = "3.4.4"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -253,23 +253,35 @@ if HAS_TEXTUAL:
 
     def _phase_style(phase: str) -> str:
         return {
-            "Idle":      "dim",
-            "Starting":  "dim",
-            "Probe":     "cyan",
-            "DL":        "bold cyan",
-            "Encoding":  "bold yellow",
-            "Uploading": "bold green",
-            "Done":      "bright_green",
-            "Failed":    "bold red",
-            "Paused":    "bold orange3",
-            "Quota":     "orange_red1",
-            "Retrying":  "bold orange3",
+            "Idle":       "dim",
+            "Starting":   "dim",
+            "Probe":      "cyan",
+            "Verifying":  "cyan",
+            "DL":         "bold cyan",
+            "Encoding":   "bold yellow",
+            "Uploading":  "bold green",
+            "Done":       "bright_green",
+            "Failed":     "bold red",
+            "Perm Error": "bold red",
+            "Paused":     "bold orange3",
+            "Quota":      "orange_red1",
+            "Retrying":   "bold orange3",
         }.get(phase, "white")
 
-    def _make_bar(pct: int, width: int = 16) -> str:
+    def _make_bar(pct: int, width: int = 12) -> str:
         pct = max(0, min(100, pct))
         filled = int(width * pct / 100)
         return "▓" * filled + "░" * (width - filled) + f" {pct:3d}%"
+
+    def _fit_name(name: str, width: int) -> str:
+        """Middle-truncate a display name: the START identifies the movie/show
+        and the END carries the chunk tag ('... [3/12]'), so keep both and
+        drop the release-group boilerplate in the middle."""
+        if width < 8 or len(name) <= width:
+            return name if len(name) <= width else name[:max(0, width)]
+        head = (width - 1) * 2 // 3
+        tail = width - 1 - head
+        return name[:head] + "…" + name[-tail:]
 
     def _fmt_elapsed(seconds: float) -> str:
         if seconds <= 0:
@@ -396,6 +408,7 @@ if HAS_TEXTUAL:
             # Column keys assigned in on_mount
             self._col_file = self._col_phase = self._col_bar = None
             self._col_elapsed = self._col_done = self._col_eta = None
+            self._file_w = 32  # real value computed from terminal width in on_mount
             # Monotonic timestamp recorded when the pause modal is first shown.
             # Used by _check_signals to distinguish a genuine second press (force-stop)
             # from the race-condition echo of the *same* keypress handled by both
@@ -416,10 +429,27 @@ if HAS_TEXTUAL:
 
         def on_mount(self) -> None:
             table = self.query_one("#workers-table", DataTable)
-            cols = table.add_columns("Worker", "Current File", "Phase", "Progress", "Elapsed", "Done", "ETA")
-            _cw, self._col_file, self._col_phase, self._col_bar, self._col_elapsed, self._col_done, self._col_eta = cols
+            # Explicit column widths. Without them, DataTable sizes each column
+            # to its header + the initial '-' placeholder and update_width=False
+            # freezes that forever — "Current File" was stuck at 12 cells and
+            # "ETA" at 3, clipping everything written into them later.
+            w_worker = max(6, min(18, max((len(w) for w in self._worker_ids), default=6)))
+            # Fixed columns + per-cell padding + table chrome; whatever is left
+            # of the terminal goes to the file name column.
+            fixed = w_worker + 10 + 17 + 8 + 7 + 8 + (2 * 7) + 6
+            self._file_w = max(20, min(64, get_term_width() - fixed))
+            _cw               = table.add_column("Worker",       width=w_worker)
+            self._col_file    = table.add_column("Current File", width=self._file_w)
+            self._col_phase   = table.add_column("Phase",        width=10)
+            self._col_bar     = table.add_column("Progress",     width=17)
+            self._col_elapsed = table.add_column("Elapsed",      width=8)
+            self._col_done    = table.add_column("Done",         width=7)
+            self._col_eta     = table.add_column("ETA",          width=8)
             for wid in self._worker_ids:
-                table.add_row(wid, "-", "Starting", _make_bar(0), "-", "0", "-", key=wid)
+                # Long worker ids get middle-truncated for display; the row KEY
+                # stays the full id, so updates and lookups are unaffected. The
+                # thread suffix (-1/-2) survives at the end.
+                table.add_row(_fit_name(wid, w_worker), "-", "Starting", _make_bar(0), "-", "0", "-", key=wid)
             self.title = "Fractum Distributed Worker"
             url_display = self._manager_url or "no manager"
             self.sub_title = f"v{WORKER_VERSION}  \u2502  {len(self._worker_ids)} worker(s)  \u2502  {url_display}"
@@ -508,8 +538,9 @@ if HAS_TEXTUAL:
                 filename  = d.get("file", "-")
                 job_start = d.get("job_start", 0.0)
                 jobs_done = d.get("jobs_done", 0)
+                jobs_failed = d.get("jobs_failed", 0)
 
-                idle_phases = {"Idle", "Starting", "Quota", "Done", "Failed"}
+                idle_phases = {"Idle", "Starting", "Quota", "Done", "Failed", "Perm Error"}
                 elapsed = (now - job_start) if job_start > 0 and phase not in idle_phases else 0.0
 
                 # ETA: estimate remaining time from elapsed and progress
@@ -520,17 +551,20 @@ if HAS_TEXTUAL:
 
                 style = _phase_style(phase)
                 phase_text = Text(phase, style=style)
-                bar_text   = Text(_make_bar(pct) if phase not in {"Idle", "Starting"} else " " * 20, style=style)
+                bar_text   = Text(_make_bar(pct) if phase not in {"Idle", "Starting"} else " " * 17, style=style)
 
-                max_fn = 32
-                fn_display = filename if len(filename) <= max_fn else "\u2026" + filename[-(max_fn - 1):]
+                # Middle truncation: keep the identifying start AND the chunk
+                # tag at the end (previously only the tail was kept, so every
+                # row read '\u20261080p.BluRay.x264-OFT.mkv').
+                fn_display = _fit_name(filename, self._file_w)
+                done_display = f"{jobs_done}" if not jobs_failed else f"{jobs_done} \u2717{jobs_failed}"
 
                 try:
                     table.update_cell(wid, self._col_file,    fn_display,              update_width=False)
                     table.update_cell(wid, self._col_phase,   phase_text,              update_width=False)
                     table.update_cell(wid, self._col_bar,     bar_text,                update_width=False)
                     table.update_cell(wid, self._col_elapsed, _fmt_elapsed(elapsed),   update_width=False)
-                    table.update_cell(wid, self._col_done,    str(jobs_done),          update_width=False)
+                    table.update_cell(wid, self._col_done,    done_display,            update_width=False)
                     table.update_cell(wid, self._col_eta,     _fmt_elapsed(eta_sec),   update_width=False)
                 except Exception:
                     pass
@@ -1827,7 +1861,9 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
             upload_chunk_log()
             cleanup()
             d = WORKER_DETAILS.get(worker_id)
-            if d is not None: d["phase"] = "Failed"
+            if d is not None:
+                d["phase"] = "Failed"
+                d["jobs_failed"] = d.get("jobs_failed", 0) + 1
             return
 
         # ---- Upload (3 attempts) ----
@@ -1884,7 +1920,9 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
             log(worker_id, err_msg, "ERROR")
             report_chunk("failed", error_msg=err_msg)
             d = WORKER_DETAILS.get(worker_id)
-            if d is not None: d["phase"] = "Failed"
+            if d is not None:
+                d["phase"] = "Failed"
+                d["jobs_failed"] = d.get("jobs_failed", 0) + 1
 
         upload_chunk_log()
         cleanup()
@@ -2793,7 +2831,9 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                         upload_encode_log()
                     else:
                         d = WORKER_DETAILS.get(worker_id)
-                        if d is not None: d["phase"] = "Failed"
+                        if d is not None:
+                            d["phase"] = "Failed"
+                            d["jobs_failed"] = d.get("jobs_failed", 0) + 1
                         err_msg = "Upload failed after 3 attempts"
                         log(worker_id, err_msg, "ERROR")
                         post_status("failed", error_msg=err_msg)
@@ -2805,6 +2845,11 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                     if _wf_trunc_note:
                         err_msg = f"Truncated output ({_wf_trunc_note}) — source stream interrupted"
                     if SHUTDOWN_EVENT.is_set(): err_msg = "Aborted by user/update"
+
+                    d = WORKER_DETAILS.get(worker_id)
+                    if d is not None and not SHUTDOWN_EVENT.is_set():
+                        d["phase"] = "Failed"
+                        d["jobs_failed"] = d.get("jobs_failed", 0) + 1
 
                     log(worker_id, err_msg, "ERROR")
                     log(worker_id, "--- FFmpeg Output Dump ---", "ERROR")
@@ -2968,7 +3013,7 @@ def run_worker(args):
     for i in range(num_jobs):
         worker_id = f"{username}-{base_workername}-{i+1}"
         worker_ids.append(worker_id)
-        WORKER_DETAILS[worker_id] = {"file": "-", "phase": "Starting", "pct": 0, "job_start": 0.0, "jobs_done": 0}
+        WORKER_DETAILS[worker_id] = {"file": "-", "phase": "Starting", "pct": 0, "job_start": 0.0, "jobs_done": 0, "jobs_failed": 0}
         temp_dir = f"./temp_encode_{base_workername}_{i+1}"
 
         t = threading.Thread(target=worker_task, args=(worker_id, manager_url, temp_dir, quota_tracker, single_mode, args.series_id, args.watermark, args.max_size_mb, getattr(args, 'local_source', None), getattr(args, 'no_chunks', False), getattr(args, 'wallet', None)))
