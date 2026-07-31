@@ -355,7 +355,16 @@ Workers can attach a FractumCoin wallet address with `--wallet ADDR` (or `&walle
 - Ledger rows are never rewritten by retries, archives, or chunk cleanup, and re-uploads to an already-completed job earn nothing — the payout record is stable.
 - The public scoreboard is a view of the same ledger, so score = minutes of successful encodes uploaded, identical between chunked and whole-file work. Existing history is backfilled into the ledger on first startup (with no wallet attached).
 
-**Payouts:** `GET /api/earnings` (admin auth) returns per-wallet totals (`total_minutes`, `unpaid_minutes`, upload counts, first/last activity) plus recent ledger rows. Work uploaded without a wallet appears under `(no wallet)`. A `paid` flag exists on every row for future payout tooling.
+**Payouts:** `GET /api/earnings` (admin auth) returns per-wallet totals (`total_minutes`, `unpaid_minutes`, upload counts, first/last activity) plus recent ledger rows. Work uploaded without a wallet appears under `(no wallet)` and cannot be paid.
+
+Actual coin settlement is done by the **payout daemon** (FractumCoin repo, `encode-rewards/`), which runs next to the coin wallet — the manager never talks to the coin daemon, so wallet RPC stays localhost-only on that machine. The flow:
+
+1. The daemon polls `GET /api/payouts/pending` (authenticated with `PAYOUT_TOKEN` via the `X-Payout-Token` header) for unpaid ledger rows grouped by wallet.
+2. It validates each address, converts minutes → FRCT at its configured rate, sends coins, then settles the rows via `POST /api/payouts/mark_paid` (idempotent — retries after a lost response can't double-record; rows already paid update nothing).
+3. **Hybrid approval:** wallets owed at most the auto cap are paid automatically. Larger balances need an admin click in the **FRACTUM_PAYOUTS** panel on `/admin` (`POST /api/payouts/approve`). Approval is a snapshot of the wallet's unpaid rows at click time — work uploaded afterwards accumulates unapproved.
+4. The daemon reports heartbeat + invalid addresses via `POST /api/payouts/report`; the admin panel shows daemon health (dry-run/paused state, treasury balance, rate), per-wallet owed FRCT with AUTO / NEEDS APPROVAL / INVALID ADDRESS badges, and paid history with txids.
+
+Config: `PAYOUT_TOKEN` (shared secret for the daemon; `None` disables the token path), plus `PAYOUT_RATE_FRCT_PER_MIN` / `PAYOUT_AUTO_CAP_FRCT` — **display hints for the admin UI only**; the daemon's own config is authoritative for money movement, and the UI warns when they drift apart.
 
 ---
 

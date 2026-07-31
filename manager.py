@@ -96,6 +96,23 @@ try:
     except ImportError:
         REQUIRE_WORKER_TOKEN = True
 
+    # FractumCoin payouts: shared secret for the payout daemon (X-Payout-Token
+    # header). None disables the payout API for the daemon entirely — admin
+    # Basic auth still works for testing. Rate/cap are ADMIN UI DISPLAY HINTS
+    # only; the daemon's own config is authoritative for money movement.
+    try:
+        from config import PAYOUT_TOKEN
+    except ImportError:
+        PAYOUT_TOKEN = None
+    try:
+        from config import PAYOUT_RATE_FRCT_PER_MIN
+    except ImportError:
+        PAYOUT_RATE_FRCT_PER_MIN = 1.0
+    try:
+        from config import PAYOUT_AUTO_CAP_FRCT
+    except ImportError:
+        PAYOUT_AUTO_CAP_FRCT = 250.0
+
     # Periodic timestamped backups of the job/earnings database, so a
     # corruption or bad disk write doesn't wipe the whole queue.
     try:
@@ -534,7 +551,8 @@ def add_security_headers(response):
 
 @app.before_request
 def csrf_protect():
-    if request.method == "POST" and request.path.startswith('/api/admin_action'):
+    if request.method == "POST" and request.path.startswith(
+            ('/api/admin_action', '/api/payouts/approve', '/api/payouts/unapprove')):
         origin = request.headers.get('Origin')
         referer = request.headers.get('Referer')
         target = origin or referer or ""
@@ -579,6 +597,21 @@ def requires_worker_auth(f):
         if not secrets.compare_digest(str(token), str(WORKER_SECRET)):
             return jsonify({"status": "error", "message": "Unauthorized Worker"}), 401
         return f(*args, **kwargs)
+    return decorated
+
+def requires_payout_auth(f):
+    """Auth for the FractumCoin payout daemon on the Pi. Accepts either the
+    dedicated X-Payout-Token (revocable, scoped — the admin password never
+    lives on the Pi) or admin Basic auth as a testing fallback."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = request.headers.get('X-Payout-Token')
+        if token and PAYOUT_TOKEN and secrets.compare_digest(str(token), str(PAYOUT_TOKEN)):
+            return f(*args, **kwargs)
+        auth = request.authorization
+        if auth and check_auth(auth.username, auth.password):
+            return f(*args, **kwargs)
+        return jsonify({"status": "error", "message": "Unauthorized"}), 401
     return decorated
 
 def verify_upload(filepath):
@@ -1743,6 +1776,54 @@ def init_db():
             if backfilled_full > 0 or backfilled_chunks > 0:
                 print(f"[*] Earnings ledger backfilled from history: {backfilled_full} whole file(s), {backfilled_chunks} chunk(s).")
 
+        # Payout tooling (additive, idempotent): `approved` marks unpaid rows an
+        # admin has cleared for an over-cap payout; `paid_txid`/`paid_at` record
+        # the FractumCoin transaction that settled the row.
+        try: cursor.execute("ALTER TABLE earnings ADD COLUMN approved INTEGER DEFAULT 0")
+        except sqlite3.OperationalError: pass
+        try: cursor.execute("ALTER TABLE earnings ADD COLUMN paid_txid TEXT")
+        except sqlite3.OperationalError: pass
+        try: cursor.execute("ALTER TABLE earnings ADD COLUMN paid_at TIMESTAMP")
+        except sqlite3.OperationalError: pass
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_earnings_unpaid ON earnings(paid, wallet)")
+
+        # Payout history: one row per wallet per settled batch, written by
+        # /api/payouts/mark_paid. `txid` is shared across wallets when the
+        # daemon batches a run into a single sendmany transaction.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS payouts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TIMESTAMP,
+                wallet TEXT NOT NULL,
+                minutes REAL,
+                frct REAL,
+                rate REAL,
+                txid TEXT,
+                earning_count INTEGER,
+                mode TEXT
+            )
+        ''')
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_payouts_wallet ON payouts(wallet)")
+
+        # Daemon-reported wallet problems (e.g. failed validateaddress) so bad
+        # addresses surface in the admin UI instead of silently never paying.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS payout_wallet_status (
+                wallet TEXT PRIMARY KEY,
+                status TEXT,
+                detail TEXT,
+                updated_at TIMESTAMP
+            )
+        ''')
+
+        # Daemon heartbeat and other payout key/values.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS payout_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        ''')
+
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS error_reports (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2853,6 +2934,214 @@ def api_earnings():
         finally:
             conn.close()
     return jsonify({"wallets": wallets, "recent": recent})
+
+# ==============================================================================
+# FRACTUMCOIN PAYOUTS
+# ==============================================================================
+# The payout daemon on the Pi (FractumCoin repo, encode-rewards/) polls
+# /api/payouts/pending, sends FRCT over localhost RPC, then settles rows via
+# /api/payouts/mark_paid. The manager never talks to the coin daemon itself —
+# wallet RPC stays localhost-only on the Pi.
+
+PAYOUT_IDS_PER_WALLET = 5000   # oldest-first cap per run; remainder next cycle
+SQLITE_IN_CHUNK = 500          # stay well under SQLite's parameter limit
+
+@app.route('/api/payouts/pending')
+@requires_payout_auth
+def api_payouts_pending():
+    """Work order for the payout daemon: unpaid ledger rows grouped by wallet.
+    Rows without a wallet (historical backfill, workers without --wallet) are
+    excluded here — '(no wallet)' in /api/earnings is a display artifact and
+    must never reach validateaddress or sendmany."""
+    with read_lock():
+        conn = db_handler.get_connection(); conn.row_factory = sqlite3.Row
+        try:
+            c = conn.cursor()
+            c.execute("""
+                SELECT wallet,
+                       ROUND(SUM(minutes), 3) as unpaid_minutes,
+                       ROUND(SUM(CASE WHEN approved=1 THEN minutes ELSE 0 END), 3) as approved_minutes,
+                       MIN(timestamp) as first_upload
+                FROM earnings
+                WHERE paid=0 AND wallet IS NOT NULL AND wallet != ''
+                GROUP BY wallet ORDER BY first_upload ASC""")
+            groups = [dict(r) for r in c.fetchall()]
+            wallets = []
+            for g in groups:
+                c.execute("SELECT id, approved FROM earnings "
+                          "WHERE paid=0 AND wallet=? ORDER BY id ASC LIMIT ?",
+                          (g['wallet'], PAYOUT_IDS_PER_WALLET))
+                rows = c.fetchall()
+                c.execute("SELECT status FROM payout_wallet_status WHERE wallet=?", (g['wallet'],))
+                srow = c.fetchone()
+                wallets.append({
+                    "wallet": g['wallet'],
+                    "unpaid_minutes": g['unpaid_minutes'],
+                    "approved_minutes": g['approved_minutes'],
+                    "first_upload": g['first_upload'],
+                    "earning_ids": [r['id'] for r in rows],
+                    "approved_earning_ids": [r['id'] for r in rows if r['approved']],
+                    "status": srow['status'] if srow else 'ok',
+                })
+        finally:
+            conn.close()
+    return jsonify({
+        "rate_hint_frct_per_min": PAYOUT_RATE_FRCT_PER_MIN,
+        "auto_cap_hint_frct": PAYOUT_AUTO_CAP_FRCT,
+        "wallets": wallets,
+    })
+
+@app.route('/api/payouts/mark_paid', methods=['POST'])
+@requires_payout_auth
+def api_payouts_mark_paid():
+    """Settle ledger rows after the daemon has broadcast a transaction.
+    Idempotent: rows already paid update nothing, and a pure retry (updated=0)
+    writes no history row, so daemon retries after a lost response converge."""
+    data = request.json or {}
+    txid = sanitize_input(data.get('txid')) or None
+    try:
+        rate = float(data.get('rate_frct_per_min') or 0)
+    except (TypeError, ValueError):
+        rate = 0
+    entries = data.get('payouts')
+    if not isinstance(entries, list) or not entries:
+        return jsonify({"status": "error", "message": "payouts list required"}), 400
+
+    results = []
+    now = datetime.now()
+    with db_lock:
+        conn = db_handler.get_connection(); c = conn.cursor()
+        try:
+            for entry in entries:
+                wallet = sanitize_wallet((entry or {}).get('wallet'))
+                ids = (entry or {}).get('earning_ids')
+                if not wallet or not isinstance(ids, list) or not ids:
+                    return jsonify({"status": "error", "message": "each payout needs wallet and earning_ids"}), 400
+                try:
+                    ids = [int(i) for i in ids]
+                except (TypeError, ValueError):
+                    return jsonify({"status": "error", "message": "earning_ids must be integers"}), 400
+                updated = 0
+                for i in range(0, len(ids), SQLITE_IN_CHUNK):
+                    chunk = ids[i:i + SQLITE_IN_CHUNK]
+                    ph = ",".join("?" * len(chunk))
+                    # wallet=? guard: a confused daemon can only settle rows
+                    # belonging to the wallet it actually paid.
+                    c.execute(f"UPDATE earnings SET paid=1, paid_txid=?, paid_at=? "
+                              f"WHERE id IN ({ph}) AND paid=0 AND wallet=?",
+                              [txid, now] + chunk + [wallet])
+                    updated += c.rowcount
+                if updated > 0:
+                    # No duplicate history when the daemon re-pushes a
+                    # settlement this DB lost (RAM-mode flush window) — the
+                    # same wallet+txid pair is the same real-world payment.
+                    c.execute("SELECT 1 FROM payouts WHERE wallet=? AND txid IS ? LIMIT 1", (wallet, txid))
+                    if c.fetchone() is None:
+                        try:
+                            minutes = round(float(entry.get('minutes') or 0), 3)
+                            frct = round(float(entry.get('frct') or 0), 8)
+                        except (TypeError, ValueError):
+                            minutes, frct = 0, 0
+                        mode = sanitize_input(entry.get('mode')) or 'auto'
+                        c.execute("INSERT INTO payouts (created_at, wallet, minutes, frct, rate, txid, earning_count, mode) "
+                                  "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                                  (now, wallet, minutes, frct, rate, txid, updated, mode))
+                results.append({"wallet": wallet, "updated": updated,
+                                "already_paid": len(ids) - updated})
+            conn.commit()
+        finally:
+            conn.close()
+
+    # Paid flags are money-critical: flush the RAM DB immediately so a crash
+    # can't revert a settlement the daemon has already journaled.
+    db_handler.sync_to_disk()
+    for r in results:
+        if r["updated"] > 0:
+            log_event("INFO", f"Payout recorded: wallet {r['wallet']} settled {r['updated']} earning row(s), txid {str(txid)[:16]}")
+    return jsonify({"status": "ok", "results": results})
+
+@app.route('/api/payouts/approve', methods=['POST'])
+@app.route('/api/payouts/unapprove', methods=['POST'])
+@requires_auth
+def api_payouts_approve():
+    """Admin approval for over-cap wallets (hybrid payouts). Approval is a
+    snapshot of the wallet's CURRENT unpaid rows — work uploaded after the
+    click accumulates unapproved, so there is no open-ended standing approval.
+    Covered by the csrf_protect origin check (Basic-auth browsers auto-send
+    credentials)."""
+    data = request.json or {}
+    wallet = sanitize_wallet(data.get('wallet'))
+    if not wallet:
+        return jsonify({"status": "error", "message": "wallet required"}), 400
+    approving = request.path.endswith('/approve')
+    with db_lock:
+        conn = db_handler.get_connection(); c = conn.cursor()
+        try:
+            c.execute("UPDATE earnings SET approved=? WHERE wallet=? AND paid=0",
+                      (1 if approving else 0, wallet))
+            count = c.rowcount
+            c.execute("SELECT ROUND(SUM(minutes), 3) FROM earnings WHERE wallet=? AND paid=0 AND approved=1", (wallet,))
+            approved_minutes = c.fetchone()[0] or 0
+            conn.commit()
+        finally:
+            conn.close()
+    log_event("WARN", f"Admin {'approved' if approving else 'revoked approval for'} payout of wallet {wallet} ({count} row(s))")
+    return jsonify({"status": "ok", "rows": count, "approved_minutes": approved_minutes})
+
+@app.route('/api/payouts/report', methods=['POST'])
+@requires_payout_auth
+def api_payouts_report():
+    """Daemon telemetry: heartbeat JSON plus per-wallet address problems, so
+    dry-run state, treasury balance, and invalid addresses show in the UI."""
+    data = request.json or {}
+    heartbeat = data.get('heartbeat')
+    statuses = data.get('wallet_status') or []
+    now = datetime.now()
+    with db_lock:
+        conn = db_handler.get_connection(); c = conn.cursor()
+        try:
+            if isinstance(heartbeat, dict):
+                heartbeat['received_at'] = now.isoformat()
+                c.execute("INSERT OR REPLACE INTO payout_meta (key, value) VALUES ('daemon_heartbeat', ?)",
+                          (json.dumps(heartbeat),))
+            for s in statuses:
+                wallet = sanitize_wallet((s or {}).get('wallet'))
+                if not wallet:
+                    continue
+                status = sanitize_input(s.get('status')) or 'ok'
+                detail = str(s.get('detail') or '')[:300]
+                c.execute("INSERT OR REPLACE INTO payout_wallet_status (wallet, status, detail, updated_at) "
+                          "VALUES (?, ?, ?, ?)", (wallet, status, detail, now))
+            conn.commit()
+        finally:
+            conn.close()
+    return jsonify({"status": "ok"})
+
+@app.route('/api/payouts/status')
+@requires_auth
+def api_payouts_status():
+    """Feeds the admin UI payouts panel."""
+    with read_lock():
+        conn = db_handler.get_connection(); conn.row_factory = sqlite3.Row
+        try:
+            c = conn.cursor()
+            c.execute("SELECT * FROM payouts ORDER BY id DESC LIMIT 100")
+            history = [dict(r) for r in c.fetchall()]
+            c.execute("SELECT * FROM payout_wallet_status ORDER BY updated_at DESC")
+            wallet_status = [dict(r) for r in c.fetchall()]
+            c.execute("SELECT value FROM payout_meta WHERE key='daemon_heartbeat'")
+            row = c.fetchone()
+        finally:
+            conn.close()
+    daemon = None
+    if row:
+        try:
+            daemon = json.loads(row['value'])
+        except (ValueError, TypeError):
+            daemon = None
+    return jsonify({"history": history, "wallet_status": wallet_status, "daemon": daemon,
+                    "rate_hint_frct_per_min": PAYOUT_RATE_FRCT_PER_MIN,
+                    "auto_cap_hint_frct": PAYOUT_AUTO_CAP_FRCT})
 
 @app.route('/api/logs')
 @requires_auth

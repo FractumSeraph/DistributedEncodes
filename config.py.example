@@ -28,6 +28,22 @@ SECRET_KEY = "ChangeThisToAnotherRandomString"
 REQUIRE_WORKER_TOKEN = True
 
 # ==============================================================================
+# FRACTUMCOIN PAYOUTS
+# ==============================================================================
+# Shared secret for the payout daemon (FractumCoin repo, encode-rewards/) that
+# runs next to the coin wallet and settles the earnings ledger. It presents
+# this as an X-Payout-Token header. None disables the token path entirely
+# (admin Basic auth still reaches the payout API for testing).
+PAYOUT_TOKEN = None
+
+# Display hints for the admin UI ONLY — the payout daemon's own config is
+# authoritative for real money movement. Keep them in sync so the UI's
+# "FRCT owed" figures and AUTO/NEEDS-APPROVAL badges match what the daemon
+# actually does (the UI warns when the daemon reports different values).
+PAYOUT_RATE_FRCT_PER_MIN = 1.0
+PAYOUT_AUTO_CAP_FRCT = 250.0
+
+# ==============================================================================
 # DATABASE BACKUPS
 # ==============================================================================
 # The database is the single source of truth for the whole queue and the
