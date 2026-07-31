@@ -253,6 +253,10 @@
                     fetch('/api/payouts/status'),
                     fetch('/api/earnings?limit=1')
                 ]);
+                // fetch() does not reject on 4xx/5xx and the error bodies are
+                // valid JSON, so without this a broken/unauthorized payout API
+                // would render as a healthy "nothing owed" panel.
+                if (!pR.ok || !sR.ok || !eR.ok) throw new Error('payout API error');
                 payoutPending = await pR.json();
                 payoutStatus = await sR.json();
                 const earn = await eR.json();
@@ -268,6 +272,10 @@
             if (!strip || !tbody || !hist) return;
             if (!payoutPending || !payoutStatus) {
                 strip.textContent = '// PAYOUT API UNAVAILABLE //';
+                // Don't leave a stale owed table with live APPROVE buttons
+                // sitting under an "unavailable" header.
+                tbody.innerHTML = '<tr><td colspan="5" style="text-align:center; color:#555;">// UNAVAILABLE //</td></tr>';
+                hist.innerHTML = '<tr><td colspan="5" style="text-align:center; color:#555;">// UNAVAILABLE //</td></tr>';
                 return;
             }
 
@@ -283,14 +291,19 @@
                 strip.innerHTML = '<span style="color:var(--neon-orange)">DAEMON: NEVER REPORTED</span>';
             } else {
                 const ageMin = d.received_at ? Math.round((Date.now() - new Date(d.received_at).getTime()) / 60000) : null;
-                const stale = ageMin == null || ageMin > 30;
+                // NaN (unparseable date) and null both count as stale — a
+                // non-finite age must never render green.
+                const stale = !Number.isFinite(ageMin) || ageMin > 30;
                 let parts = [];
-                parts.push(`<span style="color:${stale ? 'var(--neon-red)' : 'var(--neon-green)'}">HEARTBEAT ${ageMin == null ? '?' : ageMin + 'm ago'}</span>`);
+                parts.push(`<span style="color:${stale ? 'var(--neon-red)' : 'var(--neon-green)'}">HEARTBEAT ${Number.isFinite(ageMin) ? ageMin + 'm ago' : '?'}</span>`);
                 if (d.dry_run) parts.push('<span style="color:var(--neon-orange)">[DRY RUN]</span>');
                 if (d.paused) parts.push('<span style="color:var(--neon-red)">[PAUSED]</span>');
-                if (d.treasury_frct != null) parts.push(`TREASURY ${d.treasury_frct} FRCT`);
-                parts.push(`RATE ${rate} FRCT/min`);
-                parts.push(`AUTO CAP ${cap} FRCT`);
+                // Escape daemon-reported values — a compromised Pi POSTing to
+                // /api/payouts/report must not inject HTML into the admin page
+                // (these run with the admin's cached credentials).
+                if (d.treasury_frct != null) parts.push(`TREASURY ${escapeHTML(String(d.treasury_frct))} FRCT`);
+                parts.push(`RATE ${escapeHTML(String(rate))} FRCT/min`);
+                parts.push(`AUTO CAP ${escapeHTML(String(cap))} FRCT`);
                 if (d.rate_frct_per_min != null && rateHint != null && d.rate_frct_per_min !== rateHint)
                     parts.push(`<span style="color:var(--neon-red)">[RATE DRIFT: UI hint ${rateHint}]</span>`);
                 if (d.auto_cap_frct != null && capHint != null && d.auto_cap_frct !== capHint)
@@ -303,23 +316,28 @@
             (payoutStatus.wallet_status || []).forEach(s => { statusByWallet[s.wallet] = s; });
 
             const rows = (payoutPending.wallets || []).map(w => {
-                const owed = w.unpaid_minutes * rate;
+                // Total debt drives the human-facing figures and the approval
+                // badge; the daemon settles it in per-run batches (served_*).
+                const totalMin = w.total_unpaid_minutes != null ? w.total_unpaid_minutes : w.served_minutes;
+                const owed = totalMin * rate;
+                const approvedMin = w.served_approved_minutes || 0;
                 const invalid = (statusByWallet[w.wallet] || {}).status === 'invalid_address';
+                const truncNote = w.truncated ? ' <span style="color:var(--neon-orange)" title="More unpaid rows than the per-run cap — paid in batches across cycles.">[BATCHED]</span>' : '';
                 let state, actions = '';
                 if (invalid) {
                     state = '<span style="color:var(--neon-red)">INVALID ADDRESS</span>';
                 } else if (owed <= cap) {
                     state = '<span style="color:var(--neon-green)">AUTO</span>';
-                } else if (w.approved_minutes > 0) {
-                    state = `<span style="color:var(--neon-green)">APPROVED ${(w.approved_minutes * rate).toFixed(2)} FRCT</span>`;
+                } else if (approvedMin > 0) {
+                    state = `<span style="color:var(--neon-green)">APPROVED ${(approvedMin * rate).toFixed(2)} FRCT</span>`;
                     actions = `<button data-pay-act="unapprove" data-wallet="${escapeHTML(w.wallet)}" style="border-color:var(--neon-orange); color:var(--neon-orange)">REVOKE</button>`;
                 } else {
                     state = '<span style="color:var(--neon-orange)">NEEDS APPROVAL</span>';
                     actions = `<button data-pay-act="approve" data-wallet="${escapeHTML(w.wallet)}" style="border-color:var(--neon-green); color:var(--neon-green)">APPROVE</button>`;
                 }
                 return `<tr>
-                    <td style="word-break:break-all; font-size:0.82em;" title="${escapeHTML(w.wallet)}">${escapeHTML(w.wallet)}</td>
-                    <td>${w.unpaid_minutes}</td>
+                    <td style="word-break:break-all; font-size:0.82em;" title="${escapeHTML(w.wallet)}">${escapeHTML(w.wallet)}${truncNote}</td>
+                    <td>${escapeHTML(String(totalMin))}</td>
                     <td>${owed.toFixed(2)}</td>
                     <td>${state}</td>
                     <td>${actions}</td>
@@ -360,7 +378,12 @@
                 fetch(`/api/payouts/${action}`, {
                     method: 'POST', headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({wallet: wallet})
-                }).then(() => refreshAll());
+                }).then(r => {
+                    // Surface CSRF/auth/500 failures — silently swallowing them
+                    // leaves the admin believing an approval succeeded.
+                    if (!r.ok) alert(`Payout ${action} failed: HTTP ${r.status}`);
+                    return refreshAll();
+                }).catch(() => alert(`Payout ${action} failed: network error`));
                 return;
             }
             const copyBtn = e.target.closest('[data-copy-txid]');

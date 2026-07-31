@@ -510,6 +510,15 @@ def sanitize_wallet(val):
     cleaned = re.sub(r'[^a-zA-Z0-9:_.-]', '', str(val))[:128]
     return cleaned or None
 
+def sanitize_txid(val):
+    """Normalize a payout transaction id for storage. Kept wider than
+    sanitize_input because the daemon may send a COMMA-JOINED list of txids
+    (one per wallet in per-address sendtoaddress mode) — stripping the commas
+    would fuse them into one unusable, unverifiable string."""
+    if not val: return None
+    cleaned = re.sub(r'[^a-zA-Z0-9,:_.-]', '', str(val))[:2048]
+    return cleaned or None
+
 def _record_earning(conn, wallet, worker_id, job_id, kind, chunk_index, minutes):
     """Append one verified upload to the FractumCoin earnings ledger.
     Caller holds db_lock and commits."""
@@ -606,11 +615,17 @@ def requires_payout_auth(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         token = request.headers.get('X-Payout-Token')
-        if token and PAYOUT_TOKEN and secrets.compare_digest(str(token), str(PAYOUT_TOKEN)):
+        # Header values are latin-1 in WSGI; compare as bytes so a stray high
+        # byte yields a clean 401 rather than a TypeError 500 from compare_digest.
+        if token and PAYOUT_TOKEN and secrets.compare_digest(
+                str(token).encode('utf-8', 'ignore'), str(PAYOUT_TOKEN).encode('utf-8', 'ignore')):
             return f(*args, **kwargs)
         auth = request.authorization
         if auth and check_auth(auth.username, auth.password):
             return f(*args, **kwargs)
+        # Failed auth on the money API is worth a log line — token brute-force
+        # against payouts would otherwise be invisible.
+        log_event("WARN", f"Payout API auth failure from {get_remote_address()}")
         return jsonify({"status": "error", "message": "Unauthorized"}), 401
     return decorated
 
@@ -2945,6 +2960,8 @@ def api_earnings():
 
 PAYOUT_IDS_PER_WALLET = 5000   # oldest-first cap per run; remainder next cycle
 SQLITE_IN_CHUNK = 500          # stay well under SQLite's parameter limit
+PAYOUT_MAX_ENTRIES = 1000      # reject oversized mark_paid batches before the
+PAYOUT_MAX_IDS = 100000        # global write lock (authenticated-DoS guard)
 
 @app.route('/api/payouts/pending')
 @requires_payout_auth
@@ -2959,8 +2976,7 @@ def api_payouts_pending():
             c = conn.cursor()
             c.execute("""
                 SELECT wallet,
-                       ROUND(SUM(minutes), 3) as unpaid_minutes,
-                       ROUND(SUM(CASE WHEN approved=1 THEN minutes ELSE 0 END), 3) as approved_minutes,
+                       ROUND(SUM(minutes), 3) as total_unpaid_minutes,
                        MIN(timestamp) as first_upload
                 FROM earnings
                 WHERE paid=0 AND wallet IS NOT NULL AND wallet != ''
@@ -2968,16 +2984,29 @@ def api_payouts_pending():
             groups = [dict(r) for r in c.fetchall()]
             wallets = []
             for g in groups:
-                c.execute("SELECT id, approved FROM earnings "
+                # Sum minutes over EXACTLY the rows we hand out — never the
+                # full-wallet aggregate. If a wallet has more than the cap of
+                # unpaid rows, the daemon pays only what it can settle this
+                # run (`served_minutes`/ids stay in lockstep) and the rest
+                # comes next cycle. Paying the uncapped total against a capped
+                # id set silently overpays the remainder every cycle.
+                c.execute("SELECT id, approved, minutes FROM earnings "
                           "WHERE paid=0 AND wallet=? ORDER BY id ASC LIMIT ?",
                           (g['wallet'], PAYOUT_IDS_PER_WALLET))
                 rows = c.fetchall()
+                served_minutes = round(sum(r['minutes'] or 0 for r in rows), 3)
+                served_approved_minutes = round(
+                    sum(r['minutes'] or 0 for r in rows if r['approved']), 3)
                 c.execute("SELECT status FROM payout_wallet_status WHERE wallet=?", (g['wallet'],))
                 srow = c.fetchone()
                 wallets.append({
                     "wallet": g['wallet'],
-                    "unpaid_minutes": g['unpaid_minutes'],
-                    "approved_minutes": g['approved_minutes'],
+                    # served_* are authoritative for payment; total_* is for
+                    # UI/context only. truncated flags the cap being hit.
+                    "served_minutes": served_minutes,
+                    "served_approved_minutes": served_approved_minutes,
+                    "total_unpaid_minutes": g['total_unpaid_minutes'],
+                    "truncated": len(rows) >= PAYOUT_IDS_PER_WALLET,
                     "first_upload": g['first_upload'],
                     "earning_ids": [r['id'] for r in rows],
                     "approved_earning_ids": [r['id'] for r in rows if r['approved']],
@@ -2998,7 +3027,7 @@ def api_payouts_mark_paid():
     Idempotent: rows already paid update nothing, and a pure retry (updated=0)
     writes no history row, so daemon retries after a lost response converge."""
     data = request.json or {}
-    txid = sanitize_input(data.get('txid')) or None
+    txid = sanitize_txid(data.get('txid'))
     try:
         rate = float(data.get('rate_frct_per_min') or 0)
     except (TypeError, ValueError):
@@ -3006,21 +3035,45 @@ def api_payouts_mark_paid():
     entries = data.get('payouts')
     if not isinstance(entries, list) or not entries:
         return jsonify({"status": "error", "message": "payouts list required"}), 400
+    if len(entries) > PAYOUT_MAX_ENTRIES:
+        return jsonify({"status": "error", "message": "too many payout entries"}), 400
+
+    # Validate and normalize EVERY entry before taking db_lock. A 400 raised
+    # mid-transaction would roll back rows for entries the daemon already
+    # broadcast, and it would re-send them next cycle (double-spend). All-or-
+    # nothing: reject the whole batch up front or settle it atomically.
+    clean = []
+    total_ids = 0
+    for entry in entries:
+        wallet = sanitize_wallet((entry or {}).get('wallet'))
+        ids = (entry or {}).get('earning_ids')
+        if not wallet or not isinstance(ids, list) or not ids:
+            return jsonify({"status": "error", "message": "each payout needs wallet and earning_ids"}), 400
+        norm_ids = []
+        for i in ids:
+            # bool is an int subclass — reject it explicitly, and reject floats
+            # so a daemon bug can't settle the wrong rows via silent int().
+            if isinstance(i, bool) or not isinstance(i, int):
+                return jsonify({"status": "error", "message": "earning_ids must be integers"}), 400
+            norm_ids.append(i)
+        total_ids += len(norm_ids)
+        if total_ids > PAYOUT_MAX_IDS:
+            return jsonify({"status": "error", "message": "too many earning_ids in batch"}), 400
+        try:
+            minutes = round(float(entry.get('minutes') or 0), 3)
+            frct = round(float(entry.get('frct') or 0), 8)
+        except (TypeError, ValueError):
+            minutes, frct = 0, 0
+        clean.append({"wallet": wallet, "ids": norm_ids, "minutes": minutes,
+                      "frct": frct, "mode": sanitize_input(entry.get('mode')) or 'auto'})
 
     results = []
     now = datetime.now()
     with db_lock:
         conn = db_handler.get_connection(); c = conn.cursor()
         try:
-            for entry in entries:
-                wallet = sanitize_wallet((entry or {}).get('wallet'))
-                ids = (entry or {}).get('earning_ids')
-                if not wallet or not isinstance(ids, list) or not ids:
-                    return jsonify({"status": "error", "message": "each payout needs wallet and earning_ids"}), 400
-                try:
-                    ids = [int(i) for i in ids]
-                except (TypeError, ValueError):
-                    return jsonify({"status": "error", "message": "earning_ids must be integers"}), 400
+            for entry in clean:
+                wallet, ids = entry["wallet"], entry["ids"]
                 updated = 0
                 for i in range(0, len(ids), SQLITE_IN_CHUNK):
                     chunk = ids[i:i + SQLITE_IN_CHUNK]
@@ -3035,17 +3088,17 @@ def api_payouts_mark_paid():
                     # No duplicate history when the daemon re-pushes a
                     # settlement this DB lost (RAM-mode flush window) — the
                     # same wallet+txid pair is the same real-world payment.
-                    c.execute("SELECT 1 FROM payouts WHERE wallet=? AND txid IS ? LIMIT 1", (wallet, txid))
-                    if c.fetchone() is None:
-                        try:
-                            minutes = round(float(entry.get('minutes') or 0), 3)
-                            frct = round(float(entry.get('frct') or 0), 8)
-                        except (TypeError, ValueError):
-                            minutes, frct = 0, 0
-                        mode = sanitize_input(entry.get('mode')) or 'auto'
+                    # Only dedupe on a real txid: a NULL txid ("wallet + NULL")
+                    # would match ANY prior no-txid payout for that wallet and
+                    # silently drop every later history row.
+                    dup = None
+                    if txid is not None:
+                        c.execute("SELECT 1 FROM payouts WHERE wallet=? AND txid=? LIMIT 1", (wallet, txid))
+                        dup = c.fetchone()
+                    if dup is None:
                         c.execute("INSERT INTO payouts (created_at, wallet, minutes, frct, rate, txid, earning_count, mode) "
                                   "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                                  (now, wallet, minutes, frct, rate, txid, updated, mode))
+                                  (now, wallet, entry["minutes"], entry["frct"], rate, txid, updated, entry["mode"]))
                 results.append({"wallet": wallet, "updated": updated,
                                 "already_paid": len(ids) - updated})
             conn.commit()
@@ -3095,13 +3148,19 @@ def api_payouts_report():
     dry-run state, treasury balance, and invalid addresses show in the UI."""
     data = request.json or {}
     heartbeat = data.get('heartbeat')
-    statuses = data.get('wallet_status') or []
+    statuses = data.get('wallet_status')
+    if not isinstance(statuses, list):
+        statuses = []
+    statuses = statuses[:PAYOUT_MAX_ENTRIES]   # bound the write under db_lock
     now = datetime.now()
     with db_lock:
         conn = db_handler.get_connection(); c = conn.cursor()
         try:
             if isinstance(heartbeat, dict):
-                heartbeat['received_at'] = now.isoformat()
+                # astimezone() stamps the server's UTC offset so the admin
+                # browser computes heartbeat age correctly regardless of its
+                # own timezone (a tz-less string is parsed as browser-local).
+                heartbeat['received_at'] = now.astimezone().isoformat()
                 c.execute("INSERT OR REPLACE INTO payout_meta (key, value) VALUES ('daemon_heartbeat', ?)",
                           (json.dumps(heartbeat),))
             for s in statuses:
