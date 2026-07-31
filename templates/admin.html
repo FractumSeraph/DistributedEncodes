@@ -156,6 +156,44 @@
             </div>
         </div>
 
+        <div class="card" style="border-color: var(--neon-green); margin-top: 20px;">
+            <div class="card-header" style="border-color: var(--neon-green);">
+                <h3 style="color:var(--neon-green)">>> FRACTUM_PAYOUTS</h3>
+                <span id="payout-daemon-strip" style="font-size:0.78em; color:var(--text-dim);"></span>
+            </div>
+            <div class="scroll-box" style="max-height: 300px;">
+                <table>
+                    <thead>
+                        <tr>
+                            <th width="34%">WALLET</th>
+                            <th width="14%">UNPAID MIN</th>
+                            <th width="14%">FRCT OWED</th>
+                            <th width="18%">STATE</th>
+                            <th width="20%">ACTIONS</th>
+                        </tr>
+                    </thead>
+                    <tbody id="payout-wallet-list"></tbody>
+                </table>
+            </div>
+            <div class="card-header" style="border-top: 1px dashed var(--neon-green); border-bottom: none;">
+                <h3 style="color:var(--neon-green); font-size:0.85em;">PAID HISTORY</h3>
+            </div>
+            <div class="scroll-box" style="max-height: 220px;">
+                <table>
+                    <thead>
+                        <tr>
+                            <th width="16%">TIME</th>
+                            <th width="30%">WALLET</th>
+                            <th width="12%">FRCT</th>
+                            <th width="10%">MODE</th>
+                            <th width="32%">TXID</th>
+                        </tr>
+                    </thead>
+                    <tbody id="payout-history-list"></tbody>
+                </table>
+            </div>
+        </div>
+
         <div class="toolbar" style="margin-top: 30px;">
             <div class="label">LOG LEVEL:</div>
             <div class="toolbar-group">
@@ -198,10 +236,159 @@
         }
 
         async function refreshAll() {
-            await Promise.all([loadJobs(), loadLogs(), loadErrorReports(), loadConfig()]);
+            await Promise.all([loadJobs(), loadLogs(), loadErrorReports(), loadConfig(), loadPayouts()]);
             applyFilters();
             renderErrorReports();
+            renderPayouts();
         }
+
+        let payoutPending = null;
+        let payoutStatus = null;
+        let payoutNoWalletMinutes = 0;
+
+        async function loadPayouts() {
+            try {
+                const [pR, sR, eR] = await Promise.all([
+                    fetch('/api/payouts/pending'),
+                    fetch('/api/payouts/status'),
+                    fetch('/api/earnings?limit=1')
+                ]);
+                // fetch() does not reject on 4xx/5xx and the error bodies are
+                // valid JSON, so without this a broken/unauthorized payout API
+                // would render as a healthy "nothing owed" panel.
+                if (!pR.ok || !sR.ok || !eR.ok) throw new Error('payout API error');
+                payoutPending = await pR.json();
+                payoutStatus = await sR.json();
+                const earn = await eR.json();
+                const nw = (earn.wallets || []).find(w => w.wallet === '(no wallet)');
+                payoutNoWalletMinutes = nw ? nw.unpaid_minutes : 0;
+            } catch(e) { payoutPending = null; payoutStatus = null; }
+        }
+
+        function renderPayouts() {
+            const strip = document.getElementById('payout-daemon-strip');
+            const tbody = document.getElementById('payout-wallet-list');
+            const hist = document.getElementById('payout-history-list');
+            if (!strip || !tbody || !hist) return;
+            if (!payoutPending || !payoutStatus) {
+                strip.textContent = '// PAYOUT API UNAVAILABLE //';
+                // Don't leave a stale owed table with live APPROVE buttons
+                // sitting under an "unavailable" header.
+                tbody.innerHTML = '<tr><td colspan="5" style="text-align:center; color:#555;">// UNAVAILABLE //</td></tr>';
+                hist.innerHTML = '<tr><td colspan="5" style="text-align:center; color:#555;">// UNAVAILABLE //</td></tr>';
+                return;
+            }
+
+            const d = payoutStatus.daemon;
+            const rateHint = payoutStatus.rate_hint_frct_per_min;
+            const capHint = payoutStatus.auto_cap_hint_frct;
+            // The daemon's config is authoritative for money — display its
+            // values when it has reported in, and warn on drift vs our hints.
+            const rate = (d && d.rate_frct_per_min != null) ? d.rate_frct_per_min : rateHint;
+            const cap = (d && d.auto_cap_frct != null) ? d.auto_cap_frct : capHint;
+
+            if (!d) {
+                strip.innerHTML = '<span style="color:var(--neon-orange)">DAEMON: NEVER REPORTED</span>';
+            } else {
+                const ageMin = d.received_at ? Math.round((Date.now() - new Date(d.received_at).getTime()) / 60000) : null;
+                // NaN (unparseable date) and null both count as stale — a
+                // non-finite age must never render green.
+                const stale = !Number.isFinite(ageMin) || ageMin > 30;
+                let parts = [];
+                parts.push(`<span style="color:${stale ? 'var(--neon-red)' : 'var(--neon-green)'}">HEARTBEAT ${Number.isFinite(ageMin) ? ageMin + 'm ago' : '?'}</span>`);
+                if (d.dry_run) parts.push('<span style="color:var(--neon-orange)">[DRY RUN]</span>');
+                if (d.paused) parts.push('<span style="color:var(--neon-red)">[PAUSED]</span>');
+                // Escape daemon-reported values — a compromised Pi POSTing to
+                // /api/payouts/report must not inject HTML into the admin page
+                // (these run with the admin's cached credentials).
+                if (d.treasury_frct != null) parts.push(`TREASURY ${escapeHTML(String(d.treasury_frct))} FRCT`);
+                parts.push(`RATE ${escapeHTML(String(rate))} FRCT/min`);
+                parts.push(`AUTO CAP ${escapeHTML(String(cap))} FRCT`);
+                if (d.rate_frct_per_min != null && rateHint != null && d.rate_frct_per_min !== rateHint)
+                    parts.push(`<span style="color:var(--neon-red)">[RATE DRIFT: UI hint ${rateHint}]</span>`);
+                if (d.auto_cap_frct != null && capHint != null && d.auto_cap_frct !== capHint)
+                    parts.push(`<span style="color:var(--neon-red)">[CAP DRIFT: UI hint ${capHint}]</span>`);
+                if (d.last_error) parts.push(`<span style="color:var(--neon-red)" title="${escapeHTML(String(d.last_error))}">[ERROR]</span>`);
+                strip.innerHTML = parts.join(' &nbsp;|&nbsp; ');
+            }
+
+            const statusByWallet = {};
+            (payoutStatus.wallet_status || []).forEach(s => { statusByWallet[s.wallet] = s; });
+
+            const rows = (payoutPending.wallets || []).map(w => {
+                // Total debt drives the human-facing figures and the approval
+                // badge; the daemon settles it in per-run batches (served_*).
+                const totalMin = w.total_unpaid_minutes != null ? w.total_unpaid_minutes : w.served_minutes;
+                const owed = totalMin * rate;
+                const approvedMin = w.served_approved_minutes || 0;
+                const invalid = (statusByWallet[w.wallet] || {}).status === 'invalid_address';
+                const truncNote = w.truncated ? ' <span style="color:var(--neon-orange)" title="More unpaid rows than the per-run cap — paid in batches across cycles.">[BATCHED]</span>' : '';
+                let state, actions = '';
+                if (invalid) {
+                    state = '<span style="color:var(--neon-red)">INVALID ADDRESS</span>';
+                } else if (owed <= cap) {
+                    state = '<span style="color:var(--neon-green)">AUTO</span>';
+                } else if (approvedMin > 0) {
+                    state = `<span style="color:var(--neon-green)">APPROVED ${(approvedMin * rate).toFixed(2)} FRCT</span>`;
+                    actions = `<button data-pay-act="unapprove" data-wallet="${escapeHTML(w.wallet)}" style="border-color:var(--neon-orange); color:var(--neon-orange)">REVOKE</button>`;
+                } else {
+                    state = '<span style="color:var(--neon-orange)">NEEDS APPROVAL</span>';
+                    actions = `<button data-pay-act="approve" data-wallet="${escapeHTML(w.wallet)}" style="border-color:var(--neon-green); color:var(--neon-green)">APPROVE</button>`;
+                }
+                return `<tr>
+                    <td style="word-break:break-all; font-size:0.82em;" title="${escapeHTML(w.wallet)}">${escapeHTML(w.wallet)}${truncNote}</td>
+                    <td>${escapeHTML(String(totalMin))}</td>
+                    <td>${owed.toFixed(2)}</td>
+                    <td>${state}</td>
+                    <td>${actions}</td>
+                </tr>`;
+            });
+            if (payoutNoWalletMinutes > 0) {
+                rows.push(`<tr style="color:#555;">
+                    <td>(no wallet)</td><td>${payoutNoWalletMinutes}</td><td>-</td>
+                    <td>UNPAYABLE</td><td></td>
+                </tr>`);
+            }
+            tbody.innerHTML = rows.length ? rows.join('') :
+                '<tr><td colspan="5" style="text-align:center; color:#555;">// NOTHING OWED //</td></tr>';
+
+            const history = payoutStatus.history || [];
+            hist.innerHTML = history.length ? history.map(h => `<tr>
+                    <td style="color:#666; font-size:0.85em;">${fmtTs(h.created_at)}</td>
+                    <td style="word-break:break-all; font-size:0.82em;">${escapeHTML(h.wallet)}</td>
+                    <td>${h.frct}</td>
+                    <td style="color:#888; font-size:0.8em;">${escapeHTML(h.mode || '')}</td>
+                    <td style="font-size:0.78em; color:#888;">
+                        <span title="${escapeHTML(h.txid || '')}">${escapeHTML((h.txid || '-').slice(0, 20))}${(h.txid || '').length > 20 ? '…' : ''}</span>
+                        ${h.txid ? `<button data-copy-txid="${escapeHTML(h.txid)}" style="font-size:0.8em; padding:1px 5px;">COPY</button>` : ''}
+                    </td>
+                </tr>`).join('') :
+                '<tr><td colspan="5" style="text-align:center; color:#555;">// NO PAYOUTS YET //</td></tr>';
+        }
+
+        document.addEventListener('click', (e) => {
+            const payBtn = e.target.closest('[data-pay-act]');
+            if (payBtn) {
+                const action = payBtn.dataset.payAct;
+                const wallet = payBtn.dataset.wallet;
+                const msg = action === 'approve'
+                    ? `Approve payout of ALL current unpaid earnings for wallet\n${wallet}?\n(New work after this stays unapproved.)`
+                    : `Revoke payout approval for wallet\n${wallet}?`;
+                if (!confirm(msg)) return;
+                fetch(`/api/payouts/${action}`, {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({wallet: wallet})
+                }).then(r => {
+                    // Surface CSRF/auth/500 failures — silently swallowing them
+                    // leaves the admin believing an approval succeeded.
+                    if (!r.ok) alert(`Payout ${action} failed: HTTP ${r.status}`);
+                    return refreshAll();
+                }).catch(() => alert(`Payout ${action} failed: network error`));
+                return;
+            }
+            const copyBtn = e.target.closest('[data-copy-txid]');
+            if (copyBtn) navigator.clipboard.writeText(copyBtn.dataset.copyTxid);
+        });
 
         async function loadConfig() {
             try {
