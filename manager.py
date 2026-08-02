@@ -1801,6 +1801,8 @@ def init_db():
         try: cursor.execute("ALTER TABLE earnings ADD COLUMN paid_at TIMESTAMP")
         except sqlite3.OperationalError: pass
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_earnings_unpaid ON earnings(paid, wallet)")
+        # (wallet, txid) → workers lookup for the admin payout history.
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_earnings_paid_txid ON earnings(paid_txid)")
 
         # Payout history: one row per wallet per settled batch, written by
         # /api/payouts/mark_paid. `txid` is shared across wallets when the
@@ -2999,8 +3001,15 @@ def api_payouts_pending():
                     sum(r['minutes'] or 0 for r in rows if r['approved']), 3)
                 c.execute("SELECT status FROM payout_wallet_status WHERE wallet=?", (g['wallet'],))
                 srow = c.fetchone()
+                # Worker attribution over the wallet's whole unpaid balance
+                # (additive field — the daemon reads only the keys it knows).
+                c.execute("SELECT DISTINCT worker_id FROM earnings "
+                          "WHERE paid=0 AND wallet=? AND worker_id IS NOT NULL AND worker_id != '' "
+                          "ORDER BY worker_id", (g['wallet'],))
+                workers = [r['worker_id'] for r in c.fetchall()]
                 wallets.append({
                     "wallet": g['wallet'],
+                    "workers": workers,
                     # served_* are authoritative for payment; total_* is for
                     # UI/context only. truncated flags the cap being hit.
                     "served_minutes": served_minutes,
@@ -3186,6 +3195,21 @@ def api_payouts_status():
             c = conn.cursor()
             c.execute("SELECT * FROM payouts ORDER BY id DESC LIMIT 100")
             history = [dict(r) for r in c.fetchall()]
+            # Attribute each settled batch to the workers whose rows it paid:
+            # mark_paid stamps the same txid on the earnings rows and on the
+            # history row, so (wallet, txid) recovers the contributor set.
+            txids = list({h['txid'] for h in history if h['txid']})
+            workers_by_key = {}
+            for i in range(0, len(txids), SQLITE_IN_CHUNK):
+                chunk = txids[i:i + SQLITE_IN_CHUNK]
+                ph = ",".join("?" * len(chunk))
+                c.execute(f"SELECT DISTINCT wallet, paid_txid, worker_id FROM earnings "
+                          f"WHERE paid_txid IN ({ph}) AND worker_id IS NOT NULL AND worker_id != ''",
+                          chunk)
+                for r in c.fetchall():
+                    workers_by_key.setdefault((r['wallet'], r['paid_txid']), []).append(r['worker_id'])
+            for h in history:
+                h['workers'] = sorted(workers_by_key.get((h['wallet'], h['txid']), []))
             c.execute("SELECT * FROM payout_wallet_status ORDER BY updated_at DESC")
             wallet_status = [dict(r) for r in c.fetchall()]
             c.execute("SELECT value FROM payout_meta WHERE key='daemon_heartbeat'")

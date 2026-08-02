@@ -165,11 +165,12 @@
                 <table>
                     <thead>
                         <tr>
-                            <th width="34%">WALLET</th>
-                            <th width="14%">UNPAID MIN</th>
-                            <th width="14%">FRCT OWED</th>
-                            <th width="18%">STATE</th>
-                            <th width="20%">ACTIONS</th>
+                            <th width="26%">WALLET</th>
+                            <th width="16%">WORKERS</th>
+                            <th width="12%">UNPAID MIN</th>
+                            <th width="12%">FRCT OWED</th>
+                            <th width="16%">STATE</th>
+                            <th width="18%">ACTIONS</th>
                         </tr>
                     </thead>
                     <tbody id="payout-wallet-list"></tbody>
@@ -182,11 +183,12 @@
                 <table>
                     <thead>
                         <tr>
-                            <th width="16%">TIME</th>
-                            <th width="30%">WALLET</th>
-                            <th width="12%">FRCT</th>
-                            <th width="10%">MODE</th>
-                            <th width="32%">TXID</th>
+                            <th width="14%">TIME</th>
+                            <th width="24%">WALLET</th>
+                            <th width="16%">WORKERS</th>
+                            <th width="10%">FRCT</th>
+                            <th width="8%">MODE</th>
+                            <th width="28%">TXID</th>
                         </tr>
                     </thead>
                     <tbody id="payout-history-list"></tbody>
@@ -245,6 +247,7 @@
         let payoutPending = null;
         let payoutStatus = null;
         let payoutNoWalletMinutes = 0;
+        let payoutNoWalletWorkers = 0;
 
         async function loadPayouts() {
             try {
@@ -262,6 +265,7 @@
                 const earn = await eR.json();
                 const nw = (earn.wallets || []).find(w => w.wallet === '(no wallet)');
                 payoutNoWalletMinutes = nw ? nw.unpaid_minutes : 0;
+                payoutNoWalletWorkers = nw ? nw.workers : 0;
             } catch(e) { payoutPending = null; payoutStatus = null; }
         }
 
@@ -274,8 +278,8 @@
                 strip.textContent = '// PAYOUT API UNAVAILABLE //';
                 // Don't leave a stale owed table with live APPROVE buttons
                 // sitting under an "unavailable" header.
-                tbody.innerHTML = '<tr><td colspan="5" style="text-align:center; color:#555;">// UNAVAILABLE //</td></tr>';
-                hist.innerHTML = '<tr><td colspan="5" style="text-align:center; color:#555;">// UNAVAILABLE //</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; color:#555;">// UNAVAILABLE //</td></tr>';
+                hist.innerHTML = '<tr><td colspan="6" style="text-align:center; color:#555;">// UNAVAILABLE //</td></tr>';
                 return;
             }
 
@@ -335,8 +339,12 @@
                     state = '<span style="color:var(--neon-orange)">NEEDS APPROVAL</span>';
                     actions = `<button data-pay-act="approve" data-wallet="${escapeHTML(w.wallet)}" style="border-color:var(--neon-green); color:var(--neon-green)">APPROVE</button>`;
                 }
+                // Worker ids are sanitized at ingest, but never trust ledger
+                // strings in innerHTML (defense-in-depth, like the heartbeat).
+                const workers = escapeHTML((w.workers || []).join(', ')) || '-';
                 return `<tr>
                     <td style="word-break:break-all; font-size:0.82em;" title="${escapeHTML(w.wallet)}">${escapeHTML(w.wallet)}${truncNote}</td>
+                    <td style="word-break:break-word; font-size:0.82em;" title="${workers}">${workers}</td>
                     <td>${escapeHTML(String(totalMin))}</td>
                     <td>${owed.toFixed(2)}</td>
                     <td>${state}</td>
@@ -345,17 +353,20 @@
             });
             if (payoutNoWalletMinutes > 0) {
                 rows.push(`<tr style="color:#555;">
-                    <td>(no wallet)</td><td>${payoutNoWalletMinutes}</td><td>-</td>
+                    <td>(no wallet)</td>
+                    <td>${payoutNoWalletWorkers ? payoutNoWalletWorkers + ' worker(s)' : '-'}</td>
+                    <td>${payoutNoWalletMinutes}</td><td>-</td>
                     <td>UNPAYABLE</td><td></td>
                 </tr>`);
             }
             tbody.innerHTML = rows.length ? rows.join('') :
-                '<tr><td colspan="5" style="text-align:center; color:#555;">// NOTHING OWED //</td></tr>';
+                '<tr><td colspan="6" style="text-align:center; color:#555;">// NOTHING OWED //</td></tr>';
 
             const history = payoutStatus.history || [];
             hist.innerHTML = history.length ? history.map(h => `<tr>
                     <td style="color:#666; font-size:0.85em;">${fmtTs(h.created_at)}</td>
                     <td style="word-break:break-all; font-size:0.82em;">${escapeHTML(h.wallet)}</td>
+                    <td style="word-break:break-word; font-size:0.82em;">${escapeHTML((h.workers || []).join(', ')) || '-'}</td>
                     <td>${h.frct}</td>
                     <td style="color:#888; font-size:0.8em;">${escapeHTML(h.mode || '')}</td>
                     <td style="font-size:0.78em; color:#888;">
@@ -363,7 +374,7 @@
                         ${h.txid ? `<button data-copy-txid="${escapeHTML(h.txid)}" style="font-size:0.8em; padding:1px 5px;">COPY</button>` : ''}
                     </td>
                 </tr>`).join('') :
-                '<tr><td colspan="5" style="text-align:center; color:#555;">// NO PAYOUTS YET //</td></tr>';
+                '<tr><td colspan="6" style="text-align:center; color:#555;">// NO PAYOUTS YET //</td></tr>';
         }
 
         document.addEventListener('click', (e) => {
