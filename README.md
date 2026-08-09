@@ -94,7 +94,21 @@ Append `&series_id=X` to focus on a specific series.
 
 ---
 
-### Option 3: Windows (Manual)
+### Option 3: Windows (One-liner)
+
+Open **PowerShell** (no admin needed) and paste:
+
+```powershell
+irm https://encode.fractumseraph.net/install/windows | iex
+```
+
+The script asks for a username and a worker name (press Enter to use the computer's name), installs Python 3.11 per-user if it is missing, downloads the worker into `%USERPROFILE%\FractumWorker`, and starts it. FFmpeg (~40 MB portable build) and the TUI library are fetched automatically on first run.
+
+- Re-run the same line any time to update and restart the worker — the identity saved in `worker_config.json` is reused, so it only asks once.
+- Append `?jobs=2` or `?series_id=X` (combine with `&`) to the URL to run more parallel jobs or focus on one series.
+
+<details>
+<summary><b>Manual setup</b> (if you'd rather not pipe a script into your shell)</summary>
 
 1. **Install Python 3.11+** from [python.org](https://www.python.org/).  
    During installation, check **"Add Python to PATH"**.
@@ -114,6 +128,8 @@ Append `&series_id=X` to focus on a specific series.
    ```
 
    > FFmpeg is downloaded automatically (~40 MB portable build) if it is not found on the system.
+
+</details>
 
 ---
 
