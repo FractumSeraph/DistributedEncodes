@@ -1932,6 +1932,100 @@ python3 worker.py --username "{u}" --workername "{w}" --jobs {j} --manager "{SER
 """
     return Response(script, mimetype='text/x-shellscript')
 
+# PowerShell twin of /install. Kept as a plain string with __PLACEHOLDER__
+# substitution because the script's own braces would collide with an f-string.
+WINDOWS_INSTALL_PS = r"""# Fractum Worker - Windows bootstrap (served by the manager)
+# Usage:  irm __BASE__/install/windows | iex
+$ErrorActionPreference = "Stop"
+
+Write-Host ""
+Write-Host "=== Fractum Distributed Encoder :: Worker Setup ===" -ForegroundColor Cyan
+Write-Host ""
+
+# Everything lives in ~\FractumWorker so re-running the one-liner resumes this worker.
+$WorkDir = Join-Path $env:USERPROFILE "FractumWorker"
+New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
+Set-Location $WorkDir
+
+# --- 1. Username (doubles as the worker name); skipped when a saved config exists ---
+$UserArgs = @()
+if (Test-Path "worker_config.json") {
+    Write-Host "[*] Found worker_config.json - reusing the saved identity." -ForegroundColor Green
+} else {
+    $FractumUser = ""
+    while ([string]::IsNullOrWhiteSpace($FractumUser)) {
+        $FractumUser = Read-Host "Enter a username (it will also be this worker's name)"
+    }
+    $FractumUser = $FractumUser -replace '[^a-zA-Z0-9_.-]', ''
+    if ([string]::IsNullOrWhiteSpace($FractumUser)) { $FractumUser = "Anonymous" }
+    $UserArgs = @("--username", $FractumUser, "--workername", $FractumUser)
+}
+
+# --- 2. Find or install Python 3 ---
+function Find-Python {
+    foreach ($c in @("python", "python3", "py")) {
+        # The Microsoft Store stub prints "Python was not found..." so the
+        # match filters it out; 2>&1 under EAP=Stop can throw, hence try/catch.
+        try { if ("$(& $c --version 2>&1)" -match "Python 3") { return $c } } catch {}
+    }
+    $LocalPy = Join-Path $env:LOCALAPPDATA "Programs\Python\Python311\python.exe"
+    if (Test-Path $LocalPy) { return $LocalPy }
+    return $null
+}
+$Py = Find-Python
+if (-not $Py) {
+    Write-Host "[*] Python 3 not found - installing Python 3.11 for the current user (1-2 min)..." -ForegroundColor Yellow
+    $Installer = Join-Path $env:TEMP "python_installer.exe"
+    Invoke-WebRequest "https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe" -OutFile $Installer -UseBasicParsing
+    Start-Process -FilePath $Installer -ArgumentList "/quiet InstallAllUsers=0 PrependPath=1 Include_test=0" -Wait
+    Remove-Item $Installer -ErrorAction SilentlyContinue
+    $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "User") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "Machine")
+    $Py = Find-Python
+    if (-not $Py) {
+        Write-Host "[!] Automatic Python install failed. Install Python 3 from https://www.python.org (check 'Add python.exe to PATH'), then re-run this command." -ForegroundColor Red
+        return
+    }
+}
+Write-Host "[*] Using $("$(& $Py --version 2>&1)".Trim())" -ForegroundColor Green
+
+# --- 3. Base dependency (the worker self-installs the TUI and FFmpeg on first run) ---
+& $Py -m pip install --disable-pip-version-check --quiet requests | Out-Null
+
+# --- 4. Download the latest worker ---
+Write-Host "[*] Downloading worker.py..."
+Invoke-WebRequest "__BASE__/dl/worker" -OutFile "worker.py" -UseBasicParsing
+
+# --- 5. Run it ---
+$env:WORKER_SECRET = '__SECRET__'
+Write-Host "[*] Starting worker (press 'q' in the TUI or Ctrl+C to stop)..." -ForegroundColor Cyan
+$RunArgs = @("worker.py", "--manager", "__MANAGER__", "--jobs", "__JOBS__"__EXTRA__) + $UserArgs
+& $Py @RunArgs
+"""
+
+@app.route('/install/windows')
+@app.route('/install.ps1')
+def install_script_windows():
+    """Windows one-liner:  irm https://<manager>/install/windows | iex
+
+    Unlike /install there are no username/workername query params — the script
+    prompts for a username interactively and uses it as the worker name too
+    (saved to worker_config.json, so re-runs skip the prompt). jobs, series_id
+    and wallet behave the same as on /install."""
+    j = request.args.get('jobs', '1')
+    if not j.isdigit(): j = '1'
+    s_id = request.args.get('series_id', '')
+    if s_id and not s_id.isdigit(): s_id = ''
+    wallet = sanitize_wallet(request.args.get('wallet'))
+    extra = f', "--series-id", "{s_id}"' if s_id else ''
+    if wallet: extra += f', "--wallet", "{wallet}"'
+    script = (WINDOWS_INSTALL_PS
+              .replace('__BASE__', SERVER_URL_DISPLAY.rstrip('/'))
+              .replace('__MANAGER__', SERVER_URL_DISPLAY)
+              .replace('__SECRET__', WORKER_SECRET.replace("'", "''"))
+              .replace('__JOBS__', j)
+              .replace('__EXTRA__', extra))
+    return Response(script, mimetype='text/plain')
+
 @app.route('/download_source/<path:filename>')
 @requires_worker_auth
 def download_source(filename):

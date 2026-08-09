@@ -262,7 +262,14 @@
                 </div>
                 
                 <div class="os-section">
-                    <span class="os-title">:: WINDOWS / MANUAL</span>
+                    <span class="os-title">:: WINDOWS (ONE-LINER)</span>
+                    Open PowerShell and run this. It asks for your username, then installs everything and starts encoding:
+                    <code id="win-cmd">Loading...</code>
+                    <p style="font-size:0.8em; color:#888; margin-top:5px;">To focus on a series, append <code>?series_id=X</code> to the URL. Re-run the same line to restart the worker later.</p>
+                </div>
+
+                <div class="os-section">
+                    <span class="os-title">:: MANUAL</span>
                     1. Download the script below.<br>
                     2. Install Python 3 & FFmpeg (with SVT-AV1).<br>
                     3. Run: <code>python worker.py --manager <span id="mgr-url">...</span></code>
@@ -298,6 +305,7 @@
         function openModal() { 
             const url = window.location.origin;
             document.getElementById('linux-cmd').innerText = `curl -s "${url}/install?username=User&workername=Box1" | sudo bash`;
+            document.getElementById('win-cmd').innerText = `irm ${url}/install/windows | iex`;
             document.getElementById('mgr-url').innerText = url;
             document.getElementById('helpModal').style.display = 'flex'; 
         }
