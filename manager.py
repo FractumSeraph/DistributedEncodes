@@ -1947,18 +1947,22 @@ $WorkDir = Join-Path $env:USERPROFILE "FractumWorker"
 New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
 Set-Location $WorkDir
 
-# --- 1. Username (doubles as the worker name); skipped when a saved config exists ---
+# --- 1. Username + worker name (defaults to this computer's name); skipped when a saved config exists ---
 $UserArgs = @()
 if (Test-Path "worker_config.json") {
     Write-Host "[*] Found worker_config.json - reusing the saved identity." -ForegroundColor Green
 } else {
     $FractumUser = ""
     while ([string]::IsNullOrWhiteSpace($FractumUser)) {
-        $FractumUser = Read-Host "Enter a username (it will also be this worker's name)"
+        $FractumUser = Read-Host "Enter a username"
     }
     $FractumUser = $FractumUser -replace '[^a-zA-Z0-9_.-]', ''
     if ([string]::IsNullOrWhiteSpace($FractumUser)) { $FractumUser = "Anonymous" }
-    $UserArgs = @("--username", $FractumUser, "--workername", $FractumUser)
+    $WorkerName = Read-Host "Enter a name for this worker (press Enter to use '$env:COMPUTERNAME')"
+    if ([string]::IsNullOrWhiteSpace($WorkerName)) { $WorkerName = "$env:COMPUTERNAME" }
+    $WorkerName = $WorkerName -replace '[^a-zA-Z0-9_.-]', ''
+    if ([string]::IsNullOrWhiteSpace($WorkerName)) { $WorkerName = "WindowsNode" }
+    $UserArgs = @("--username", $FractumUser, "--workername", $WorkerName)
 }
 
 # --- 2. Find or install Python 3 ---
@@ -2008,9 +2012,10 @@ def install_script_windows():
     """Windows one-liner:  irm https://<manager>/install/windows | iex
 
     Unlike /install there are no username/workername query params — the script
-    prompts for a username interactively and uses it as the worker name too
-    (saved to worker_config.json, so re-runs skip the prompt). jobs, series_id
-    and wallet behave the same as on /install."""
+    prompts for a username interactively, and for a worker name that defaults
+    to the machine's $env:COMPUTERNAME (saved to worker_config.json, so re-runs
+    skip the prompts). jobs, series_id and wallet behave the same as on
+    /install."""
     j = request.args.get('jobs', '1')
     if not j.isdigit(): j = '1'
     s_id = request.args.get('series_id', '')
