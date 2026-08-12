@@ -147,6 +147,20 @@ Use `fractum-worker.service` to run the worker as a persistent background servic
 
 ---
 
+### Option 5: Kaggle Notebook (free cloud CPU)
+
+[`kaggle_worker.ipynb`](kaggle_worker.ipynb) runs the worker on a free Kaggle session for up to ~12 hours per run.
+
+1. On Kaggle: **Create → New Notebook → File → Import Notebook** and upload `kaggle_worker.ipynb`.
+2. In the notebook sidebar: *Internet* → **On**, *Accelerator* → **None** (the encoder is CPU-only — a GPU adds nothing and burns your weekly GPU quota).
+3. Edit the **CONFIG** cell — username, worker name, jobs, optional extra flags.
+4. **Save Version → Save & Run All (Commit)** — the worker runs headless and stops itself gracefully before Kaggle's 12 h session limit. You can close the browser.
+5. Re-run the notebook — or schedule it (*Notebook → Schedule a notebook run*) — to keep contributing.
+
+The notebook runs the worker with `--no-tui` and samples progress lines once a minute so the saved log stays small, keeps temp files out of the size-capped `/kaggle/working`, and skips manual FFmpeg installs entirely (the worker downloads its own `libsvtav1`-capable static build). An optional `WORKER_SECRET` can be supplied via Kaggle's *Add-ons → Secrets* instead of being hardcoded.
+
+---
+
 ### TUI Controls
 
 When running with the Textual TUI (default — installed automatically on first run if not already present):
