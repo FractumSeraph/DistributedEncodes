@@ -3476,7 +3476,7 @@ def admin_action():
                 c.execute("UPDATE jobs SET status='queued', progress=0, worker_id=NULL, fail_count=0, chunked=0, chunkable=NULL, started_at=NULL, last_updated=? WHERE status IN ('failed', 'permanently_failed')", (datetime.now(),))
             elif action == 'clear_stale':
                 cutoff = datetime.now() - timedelta(minutes=10)
-                c.execute("UPDATE jobs SET status='queued', progress=0, worker_id=NULL, last_updated=?, started_at=NULL WHERE status IN ('processing', 'downloading', 'uploading') AND COALESCE(chunked, 0)=0 AND last_updated < ?", (datetime.now(), cutoff))
+                c.execute("UPDATE jobs SET status='queued', progress=0, worker_id=NULL, last_updated=?, started_at=NULL WHERE status IN ('processing', 'downloading', 'uploading', 'paused') AND COALESCE(chunked, 0)=0 AND last_updated < ?", (datetime.now(), cutoff))
                 c.execute("UPDATE chunks SET status='pending', worker_id=NULL, progress=0, last_updated=? WHERE status='processing' AND last_updated < ?", (datetime.now(), cutoff))
                 # A chunked job whose chunks have ALL gone silent is wedged
                 # (e.g. no chunk-capable workers left) — give the admin the
@@ -3579,8 +3579,12 @@ def maintenance_loop():
                 conn = db_handler.get_connection(); cursor = conn.cursor()
                 try:
                     now = datetime.now()
-                    # Whole-file jobs: 4h heartbeat timeout (chunked jobs are handled below)
-                    cursor.execute("SELECT id, filename, last_updated, worker_id FROM jobs WHERE status IN ('processing', 'downloading', 'uploading') AND COALESCE(chunked, 0)=0")
+                    # Whole-file jobs: 4h heartbeat timeout (chunked jobs are handled
+                    # below). 'paused' is included: a genuinely paused worker still
+                    # heartbeats every 30s, so a paused row with a stale timestamp is
+                    # a dead worker — previously nothing ever swept those, and jobs
+                    # sat 'paused' forever once the worker vanished.
+                    cursor.execute("SELECT id, filename, last_updated, worker_id FROM jobs WHERE status IN ('processing', 'downloading', 'uploading', 'paused') AND COALESCE(chunked, 0)=0")
                     for row in cursor.fetchall():
                         jid, fname, last_up, worker_id = row
                         if last_up:
@@ -3618,8 +3622,11 @@ def maintenance_loop():
                     # nothing to protect: requeue immediately as before. Either
                     # way completed uploads survive on disk for a later re-split.
                     dead_cutoff = now - timedelta(hours=6)
+                    # 'paused' included: a chunked job should never be paused (the
+                    # report_status guards forbid it now), but rows written before
+                    # those guards existed can carry the state forever otherwise.
                     cursor.execute("SELECT id, COALESCE(chunk_stall_count, 0) FROM jobs "
-                                   "WHERE COALESCE(chunked, 0)=1 AND status='processing' AND last_updated < ?",
+                                   "WHERE COALESCE(chunked, 0)=1 AND status IN ('processing', 'paused') AND last_updated < ?",
                                    (dead_cutoff,))
                     for jid, stalls in cursor.fetchall():
                         cursor.execute("SELECT COUNT(*) FROM chunks WHERE job_id=? AND status='completed'", (jid,))
@@ -3627,7 +3634,7 @@ def maintenance_loop():
                         if completed > 0 and stalls < 3:
                             cursor.execute("UPDATE chunks SET status='pending', worker_id=NULL, progress=0, "
                                            "last_updated=? WHERE job_id=? AND status='processing'", (now, jid))
-                            cursor.execute("UPDATE jobs SET chunk_stall_count=?, last_updated=? WHERE id=?",
+                            cursor.execute("UPDATE jobs SET status='processing', chunk_stall_count=?, last_updated=? WHERE id=?",
                                            (stalls + 1, now, jid))
                             conn.commit()
                             log_event("WARN", f"No chunk activity for 6h — holding job with {completed} "
