@@ -879,6 +879,71 @@ def _remove_chunk_dir_async(job_id):
     threading.Thread(target=shutil.rmtree, args=(_chunk_dir(job_id),),
                      kwargs={'ignore_errors': True}, daemon=True).start()
 
+def _chunk_plan_path(job_id):
+    return os.path.join(_chunk_dir(job_id), "plan.json")
+
+def _save_chunk_plan(job_id, ranges, has_track):
+    """Persist the chunk plan next to the uploaded chunk files. The plan is
+    deterministic (same source duration/fps → identical boundaries), so when a
+    requeued job is split again, any preserved chunk file that matches this
+    manifest is restored as completed instead of being re-encoded."""
+    try:
+        os.makedirs(_chunk_dir(job_id), exist_ok=True)
+        with open(_chunk_plan_path(job_id), 'w') as f:
+            json.dump({"ranges": [[s, d] for s, d in ranges], "has_track": bool(has_track)}, f)
+    except OSError as e:
+        log_event("WARN", f"Could not save chunk plan manifest: {e}", job_id)
+
+def _restore_completed_chunks(c, job_id, ranges, has_track, now):
+    """Re-mark chunk rows completed for uploads preserved from a previous
+    round of this job. Only applies when the saved manifest matches the NEW
+    plan exactly — a mismatch (CHUNK_DURATION_SEC changed, source replaced)
+    deletes the stale files so old-plan chunks can never tile into a new-plan
+    assembly. Returns the number of restored chunks. No earnings are recorded
+    here: the original uploader was credited when the chunk first arrived."""
+    cdir = _chunk_dir(job_id)
+    plan_path = _chunk_plan_path(job_id)
+    if not os.path.isfile(plan_path):
+        return 0
+    try:
+        with open(plan_path) as f:
+            old = json.load(f)
+        old_ranges = [(float(s), float(d)) for s, d in old.get("ranges", [])]
+    except (OSError, ValueError, TypeError):
+        old_ranges = None
+    same = (old_ranges is not None
+            and len(old_ranges) == len(ranges)
+            and bool(old.get("has_track")) == bool(has_track)
+            and all(abs(a - x) < 0.001 and abs(b - y) < 0.001
+                    for (a, b), (x, y) in zip(old_ranges, ranges)))
+    if not same:
+        # Synchronous removal (only of our own files): the async rmtree could
+        # race the fresh plan.json written right after this returns.
+        try:
+            for name in os.listdir(cdir):
+                if re.fullmatch(r'(video_\d+|audio_track)\.mp4|plan\.json', name):
+                    try: os.remove(os.path.join(cdir, name))
+                    except OSError: pass
+        except OSError:
+            pass
+        return 0
+    restored = 0
+    for i in range(len(ranges)):
+        p = os.path.join(cdir, f"video_{i}.mp4")
+        if os.path.isfile(p) and os.path.getsize(p) > 1024:
+            c.execute("UPDATE chunks SET status='completed', progress=100, worker_id='(restored)', "
+                      "uploaded_path=?, last_updated=? WHERE job_id=? AND kind='video' AND chunk_index=?",
+                      (p, now, job_id, i))
+            restored += c.rowcount
+    if has_track:
+        p = os.path.join(cdir, "audio_track.mp4")
+        if os.path.isfile(p) and os.path.getsize(p) > 1024:
+            c.execute("UPDATE chunks SET status='completed', progress=100, worker_id='(restored)', "
+                      "uploaded_path=?, last_updated=? WHERE job_id=? AND kind='audio' AND chunk_index=-1",
+                      (p, now, job_id))
+            restored += c.rowcount
+    return restored
+
 def _requeue_job_whole(conn, job_id, reason, penalize=True, disable_chunking=True):
     """Chunking gave up on this job: drop chunk state and put it back in the queue.
 
@@ -900,8 +965,16 @@ def _requeue_job_whole(conn, job_id, reason, penalize=True, disable_chunking=Tru
     # Commit before log_event opens its own write connection, otherwise the
     # pending transaction on `conn` would block it (SQLite single-writer).
     conn.commit()
-    _remove_chunk_dir_async(job_id)
-    log_event("WARN", f"Chunked encode abandoned ({reason}). Job requeued (status={new_status}).", job_id)
+    # Completed chunk FILES are preserved (only the rows go): the chunk plan is
+    # deterministic, so if this job is ever split again the finished uploads
+    # are restored instead of re-encoded. They're cleaned up when the job
+    # completes (whole or assembled), is deleted, or dies permanently.
+    if new_status == 'permanently_failed':
+        _remove_chunk_dir_async(job_id)
+        log_event("WARN", f"Chunked encode abandoned ({reason}). Job permanently failed.", job_id)
+    else:
+        log_event("WARN", f"Chunked encode abandoned ({reason}). Job requeued; "
+                          "completed chunk uploads preserved for reuse.", job_id)
 
 def _update_job_chunk_progress(conn, job_id):
     """Recompute aggregate job progress from its chunks (call with db_lock held)."""
@@ -1050,15 +1123,30 @@ def _split_claimed_job(job):
                 c.execute("INSERT INTO chunks (job_id, kind, chunk_index, start_sec, duration_sec, "
                           "status, last_updated) VALUES (?, 'video', ?, ?, ?, 'pending', ?)",
                           (job_id, i, start, dur, now))
-            if has_audio or has_subs:
+            has_track = bool(has_audio or has_subs)
+            if has_track:
                 c.execute("INSERT INTO chunks (job_id, kind, chunk_index, start_sec, duration_sec, "
                           "status, last_updated) VALUES (?, 'audio', -1, 0, ?, 'pending', ?)",
                           (job_id, duration, now))
+            # Bank recovery: chunks uploaded during a previous round of this
+            # job (before a requeue) are restored instead of re-encoded.
+            restored = _restore_completed_chunks(c, job_id, ranges, has_track, now)
+            all_done = False
+            if restored:
+                _update_job_chunk_progress(conn, job_id)
+                c.execute("SELECT COUNT(*) FROM chunks WHERE job_id=? AND status != 'completed'", (job_id,))
+                all_done = (c.fetchone()[0] == 0)
             conn.commit()
             log_event("INFO", f"Split into {total} chunk(s) ({duration/60:.1f} min source).", job_id)
-            return True
+            if restored:
+                log_event("INFO", f"Restored {restored} previously-completed chunk(s) — only the rest re-encode.", job_id)
         finally:
             conn.close()
+    _save_chunk_plan(job_id, ranges, has_track)
+    if all_done:
+        # Every chunk came back from the bank — no worker needed at all.
+        _maybe_start_assembly(job_id)
+    return True
 
 def _assign_pending_chunk(worker_id, folder_filter, max_size_mb, video_only=False, max_chunk_sec=None):
     """Hand the oldest pending chunk to a worker. Prioritizes the earliest-started
@@ -1717,6 +1805,12 @@ def init_db():
         # their own probe — the slowest, most fragile step on constrained nodes
         # (e.g. a Raspberry Pi range-streaming a large MKV over HTTP).
         try: cursor.execute("ALTER TABLE jobs ADD COLUMN stream_meta TEXT")
+        except sqlite3.OperationalError: pass
+        # [ADDED] chunk_stall_count: consecutive 6h-no-chunk-activity strikes.
+        # While completed chunks exist, a stalled chunked job is held (in-flight
+        # chunks re-pended) rather than wiped; only after repeated stalls does
+        # it fall back to the whole-file queue. Resets when a chunk completes.
+        try: cursor.execute("ALTER TABLE jobs ADD COLUMN chunk_stall_count INTEGER DEFAULT 0")
         except sqlite3.OperationalError: pass
 
         # Chunk work-items for split jobs.  kind = 'video' (a time range) or
@@ -2458,6 +2552,10 @@ def upload_chunk():
             if newly_completed and kind == 'video':
                 _record_earning(conn, wallet, worker_id, job_id, 'video_chunk', chunk_index,
                                 float(crow['duration_sec'] or 0) / 60.0)
+            if newly_completed:
+                # Real progress: reset the 6h-stall strike counter.
+                c.execute("UPDATE jobs SET chunk_stall_count=0 WHERE id=? AND COALESCE(chunk_stall_count,0) != 0",
+                          (job_id,))
             _update_job_chunk_progress(conn, job_id)
             c.execute("SELECT COUNT(*) FROM chunks WHERE job_id=? AND status != 'completed'", (job_id,))
             all_done = (c.fetchone()[0] == 0)
@@ -2610,11 +2708,16 @@ def upload_result():
                 # (job was reset+re-split to chunked during the slow verify —
                 # the chunk workers earn per chunk; crediting the straggler too
                 # would be a double payout).
-                if c.rowcount == 1 and prev is not None and prev[0] != 'completed':
+                _completed_now = (c.rowcount == 1)
+                if _completed_now and prev is not None and prev[0] != 'completed':
                     _record_earning(conn, wallet, worker_id, job_id, 'full', None, verified_dur / 60.0)
                 conn.commit()
             finally:
                 conn.close()
+        if _completed_now:
+            # The job finished whole — any chunk uploads preserved from an
+            # earlier chunked round are no longer needed.
+            _remove_chunk_dir_async(job_id)
 
         # [CRITICAL] Immediate Sync to Disk
         db_handler.sync_to_disk()
@@ -3333,13 +3436,11 @@ def admin_action():
                 c.execute("DELETE FROM chunks WHERE job_id = ?", (job_id,))
                 _remove_chunk_dir_async(job_id)
             elif action == 'retry':
+                # Chunk FILES stay on disk: a retry that gets chunked again
+                # restores previously-completed uploads instead of re-encoding.
                 c.execute("DELETE FROM chunks WHERE job_id = ?", (job_id,))
-                _remove_chunk_dir_async(job_id)
                 c.execute("UPDATE jobs SET status='queued', progress=0, worker_id=NULL, fail_count=0, chunked=0, chunkable=NULL, started_at=NULL, last_updated=? WHERE id=?", (datetime.now(), job_id))
             elif action == 'retry_all_failed':
-                c.execute("SELECT id FROM jobs WHERE status IN ('failed', 'permanently_failed')")
-                for (fid,) in c.fetchall():
-                    _remove_chunk_dir_async(fid)
                 c.execute("DELETE FROM chunks WHERE job_id IN (SELECT id FROM jobs WHERE status IN ('failed', 'permanently_failed'))")
                 c.execute("UPDATE jobs SET status='queued', progress=0, worker_id=NULL, fail_count=0, chunked=0, chunkable=NULL, started_at=NULL, last_updated=? WHERE status IN ('failed', 'permanently_failed')", (datetime.now(),))
             elif action == 'clear_stale':
@@ -3478,14 +3579,31 @@ def maintenance_loop():
                                         AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.job_id = j.id AND c.status != 'completed')""")
                     assembly_candidates = [r[0] for r in cursor.fetchall()]
 
-                    # Backstop: a chunked job with zero chunk activity for 6h gets
-                    # requeued (e.g. every chunk-capable worker left). No fail
-                    # penalty and chunking stays allowed — nothing actually failed.
+                    # Backstop: a chunked job with zero chunk activity for 6h.
+                    # If it already has completed chunks, that's banked work —
+                    # hold the job (re-pend in-flight chunks, keep waiting for
+                    # chunk workers) for up to 3 stall cycles before giving it
+                    # to the whole-file queue. With no completed chunks there's
+                    # nothing to protect: requeue immediately as before. Either
+                    # way completed uploads survive on disk for a later re-split.
                     dead_cutoff = now - timedelta(hours=6)
-                    cursor.execute("SELECT id FROM jobs WHERE COALESCE(chunked, 0)=1 AND status='processing' AND last_updated < ?", (dead_cutoff,))
-                    for (jid,) in cursor.fetchall():
-                        _requeue_job_whole(conn, jid, "no chunk activity for 6h",
-                                           penalize=False, disable_chunking=False)
+                    cursor.execute("SELECT id, COALESCE(chunk_stall_count, 0) FROM jobs "
+                                   "WHERE COALESCE(chunked, 0)=1 AND status='processing' AND last_updated < ?",
+                                   (dead_cutoff,))
+                    for jid, stalls in cursor.fetchall():
+                        cursor.execute("SELECT COUNT(*) FROM chunks WHERE job_id=? AND status='completed'", (jid,))
+                        completed = cursor.fetchone()[0]
+                        if completed > 0 and stalls < 3:
+                            cursor.execute("UPDATE chunks SET status='pending', worker_id=NULL, progress=0, "
+                                           "last_updated=? WHERE job_id=? AND status='processing'", (now, jid))
+                            cursor.execute("UPDATE jobs SET chunk_stall_count=?, last_updated=? WHERE id=?",
+                                           (stalls + 1, now, jid))
+                            conn.commit()
+                            log_event("WARN", f"No chunk activity for 6h — holding job with {completed} "
+                                              f"completed chunk(s) banked (stall {stalls + 1}/3).", jid)
+                        else:
+                            _requeue_job_whole(conn, jid, f"no chunk activity for 6h (stall {stalls + 1})",
+                                               penalize=False, disable_chunking=False)
 
                     # Auto-requeue transiently-failed jobs (fail_count < 5) after
                     # a short cooldown. Previously a worker-reported 'failed' left
