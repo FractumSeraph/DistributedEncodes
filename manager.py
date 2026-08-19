@@ -3055,29 +3055,60 @@ def api_stats():
                 GROUP BY 1 ORDER BY total_minutes DESC""")
             sb = [dict(r) for r in c.fetchall()]
 
-            c.execute("SELECT id, COALESCE(worker_id, 'Pending...') as worker_id, filename, duration, progress, status, COALESCE(chunked, 0) as chunked FROM jobs WHERE status IN ('processing', 'downloading', 'uploading')")
-            act = [dict(r) for r in c.fetchall()]
-
-            # For chunked jobs, show swarm status instead of a single worker name.
-            chunk_info = {}
-            active_chunked_ids = [a['id'] for a in act if a['chunked']]
-            if active_chunked_ids:
-                ph = ",".join("?" * len(active_chunked_ids))
-                c.execute(f"""SELECT job_id, COUNT(*) as total,
-                                    SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) as done,
-                                    COUNT(DISTINCT CASE WHEN status='processing' THEN worker_id END) as active_workers
-                             FROM chunks WHERE job_id IN ({ph}) GROUP BY job_id""", active_chunked_ids)
-                for r in c.fetchall():
-                    chunk_info[r['job_id']] = dict(r)
+            # ACTIVE list — worker-centric: one row per worker currently doing
+            # something (a whole file OR one chunk), so chunked jobs show every
+            # participant with their own file+progress instead of collapsing
+            # into an opaque "N worker(s) · d/t chunks" pseudo-row.
+            act = []
+            c.execute("""SELECT worker_id, filename, progress, status FROM jobs
+                         WHERE status IN ('processing', 'downloading', 'uploading', 'paused')
+                           AND COALESCE(chunked, 0)=0
+                           AND worker_id IS NOT NULL AND worker_id NOT LIKE '(%'""")
+            for r in c.fetchall():
+                act.append({"worker_id": r['worker_id'], "filename": r['filename'],
+                            "progress": r['progress'] or 0,
+                            "detail": r['status'] if r['status'] != 'processing' else ''})
+            c.execute("""SELECT ch.worker_id, ch.kind, ch.chunk_index, COALESCE(ch.progress, 0) AS progress,
+                                j.filename,
+                                (SELECT COUNT(*) FROM chunks c2 WHERE c2.job_id = ch.job_id AND c2.kind='video') AS vtotal,
+                                (SELECT COUNT(*) FROM chunks c2 WHERE c2.job_id = ch.job_id AND c2.status='completed') AS done,
+                                (SELECT COUNT(*) FROM chunks c2 WHERE c2.job_id = ch.job_id) AS total
+                         FROM chunks ch JOIN jobs j ON j.id = ch.job_id
+                         WHERE ch.status='processing' AND ch.worker_id IS NOT NULL AND j.status='processing'""")
+            for r in c.fetchall():
+                tag = f"[audio]" if r['kind'] == 'audio' else f"[chunk {r['chunk_index'] + 1}/{r['vtotal']}]"
+                act.append({"worker_id": r['worker_id'], "filename": f"{r['filename']} {tag}",
+                            "progress": r['progress'],
+                            "detail": f"{r['done']}/{r['total']} chunks done"})
+            # Chunked jobs nobody is working right now still deserve a line —
+            # otherwise they'd vanish from the dashboard entirely (they're
+            # 'processing', so they don't appear in the queue either).
+            c.execute("""SELECT j.filename, j.progress,
+                                (SELECT COUNT(*) FROM chunks c2 WHERE c2.job_id = j.id AND c2.status='completed') AS done,
+                                (SELECT COUNT(*) FROM chunks c2 WHERE c2.job_id = j.id) AS total
+                         FROM jobs j
+                         WHERE j.status='processing' AND COALESCE(j.chunked, 0)=1
+                           AND NOT EXISTS (SELECT 1 FROM chunks c2 WHERE c2.job_id = j.id
+                                             AND c2.status='processing' AND c2.worker_id IS NOT NULL)""")
+            for r in c.fetchall():
+                act.append({"worker_id": "-", "filename": r['filename'],
+                            "progress": r['progress'] or 0,
+                            "detail": f"{r['done']}/{r['total']} chunks done · waiting for workers"})
+            # username/workername split for display: ids are
+            # "{username}-{workername}[-{runid}]-{thread}".
             for a in act:
-                ci = chunk_info.get(a['id'])
-                if a['chunked'] and ci:
-                    if ci['active_workers'] > 0:
-                        a['worker_id'] = f"{ci['active_workers']} worker(s) · {ci['done']}/{ci['total']} chunks"
-                    else:
-                        a['worker_id'] = f"chunked · {ci['done']}/{ci['total']} chunks"
-                a.pop('id', None); a.pop('chunked', None)
-            
+                parts = (a['worker_id'] or '').split('-')
+                if len(parts) >= 3 and parts[-1].isdigit():
+                    a['username'], a['workername'] = parts[0], '-'.join(parts[1:-1])
+                elif len(parts) >= 2:
+                    a['username'], a['workername'] = parts[0], '-'.join(parts[1:])
+                else:
+                    a['username'], a['workername'] = a['worker_id'], ''
+            act.sort(key=lambda a: (a['username'].lower(), a['workername'].lower(), a['filename']))
+
+            c.execute("SELECT COUNT(*) FROM jobs WHERE status IN ('processing', 'downloading', 'uploading', 'paused')")
+            active_jobs = c.fetchone()[0]
+
             c.execute("SELECT id, status, worker_id FROM jobs ORDER BY last_updated DESC LIMIT 20")
             hist = [dict(r) for r in c.fetchall()]
             
@@ -3094,7 +3125,7 @@ def api_stats():
             total_completed = c.fetchone()[0]
         finally:
             conn.close()
-    return jsonify({"scoreboard": sb, "active": act, "history": hist, "queue_depth": queue_depth, "queue_items": queue_items, "total_jobs": total_count, "total_completed": total_completed})
+    return jsonify({"scoreboard": sb, "active": act, "active_jobs": active_jobs, "history": hist, "queue_depth": queue_depth, "queue_items": queue_items, "total_jobs": total_count, "total_completed": total_completed})
 
 @app.route('/api/all_jobs')
 @requires_auth

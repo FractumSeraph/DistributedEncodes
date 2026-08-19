@@ -234,7 +234,7 @@
             </div>
 
             <div class="card">
-                <div class="card-header"><h3>>> ACTIVE_PROCESSES</h3></div>
+                <div class="card-header"><h3>>> ACTIVE_WORKERS</h3></div>
                 <div id="active-list"><div style="color:#888; padding:10px;">Scanning...</div></div>
             </div>
 
@@ -367,11 +367,14 @@
                 const completed = (rawData.total_completed !== undefined)
                     ? rawData.total_completed
                     : rawData.scoreboard.reduce((acc, u) => acc + u.files_count, 0);
-                const activeCount = rawData.active.length;
-                
+                // active is worker-centric (one row per busy worker); the
+                // "processing" stat tile still counts JOBS in flight.
+                const activeCount = (rawData.active_jobs !== undefined)
+                    ? rawData.active_jobs : rawData.active.length;
+
                 const data = {
                     queue: {
-                        total: rawData.total_jobs || (completed + activeCount), 
+                        total: rawData.total_jobs || (completed + activeCount),
                         pending: rawData.queue_depth !== undefined ? rawData.queue_depth : "?",
                         processing: activeCount,
                         done: completed
@@ -382,7 +385,9 @@
                         count: u.files_count
                     })),
                     active: rawData.active.map(j => ({
-                        user: j.worker_id,
+                        username: j.username || j.worker_id,
+                        workername: j.workername || '',
+                        detail: j.detail || '',
                         file: j.filename,
                         progress: j.progress
                     })),
@@ -411,13 +416,19 @@
                 
                 const act = document.getElementById('active-list');
                 act.innerHTML = data.active.length ? data.active.map(j => {
-                    const cleanName = j.file.split('/').pop(); 
+                    const cleanName = j.file.split('/').pop();
                     const pct = j.progress || 0;
+                    const who = j.workername
+                        ? `${escapeHTML(j.username)} <span style="color:var(--text-dim); font-weight:normal;">· ${escapeHTML(j.workername)}</span>`
+                        : escapeHTML(j.username);
+                    const detail = j.detail
+                        ? `<span style="color:var(--text-dim); font-size:0.78em; padding-right:8px;">${escapeHTML(j.detail)}</span>`
+                        : '';
                     return `
                     <div class="job-item">
                         <div class="job-header">
-                            <div class="job-user">${escapeHTML(j.user)}</div>
-                            <div class="job-percent">${pct}%</div>
+                            <div class="job-user">${who}</div>
+                            <div class="job-percent">${detail}${pct}%</div>
                         </div>
                         <div class="job-file" title="${escapeHTML(cleanName)}">${escapeHTML(cleanName)}</div>
                         <div class="progress-bg"><div class="progress-fill" style="width: ${pct}%"></div></div>
