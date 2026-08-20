@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.4.4"
+WORKER_VERSION = "3.4.5"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -1113,24 +1113,83 @@ def _compute_source_hash(dl_url, is_local):
 # FFMPEG MANAGEMENT
 # ==============================================================================
 
-def _ffmpeg_primary_url():
-    """Return the primary upstream URL for the current platform/arch.
+# FFmpeg auto-download policy: BtbN RELEASE-branch builds only ("nX.Y-latest"),
+# NEVER "master-latest" — master is a daily dev snapshot, and nodes running it
+# hit real regressions in production (an mp4 muxer assertion abort mid-encode,
+# and fragmented-mp4 output the manager's ffprobe read as 0-duration).
+# BtbN rotates WHICH release branches its 'latest' tag carries (n7.1 aged out
+# and started 404ing), so the exact version is DISCOVERED from the release's
+# asset list at download time — newest release branch wins — with the versions
+# below as hardcoded fallbacks when discovery is unavailable.
+# (arm64 uses BtbN too: the johnvansickle static builds have no libsvtav1.)
+_FFMPEG_FALLBACK_VERSIONS = ("9.0", "8.1")  # newest first; refresh occasionally
+_FFMPEG_DL_BASE = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/"
 
-    Pinned to BtbN's 7.1 RELEASE-branch builds, NOT master-latest: master is a
-    daily dev snapshot, and nodes running it have hit real regressions in
-    production (an mp4 muxer assertion abort mid-encode, and fragmented-mp4
-    output the manager's ffprobe reads as 0-duration — every upload rejected).
-    'n7.1-latest' still receives bugfix rebuilds of the stable branch.
-    (arm64 also moved to BtbN: the johnvansickle static builds don't include
-    libsvtav1, so auto-download could never produce a usable encoder there.)"""
+def _ffmpeg_platform_tag():
+    """(platform_tag, archive_ext) for BtbN asset names, or (None, None)."""
     if platform.system() == "Windows":
-        return "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-win64-gpl-7.1.zip"
+        return "win64", "zip"
     arch = platform.machine().lower()
     if arch in ['x86_64', 'amd64']:
-        return "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-linux64-gpl-7.1.tar.xz"
-    elif arch in ['aarch64', 'arm64']:
-        return "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-linuxarm64-gpl-7.1.tar.xz"
-    return None
+        return "linux64", "tar.xz"
+    if arch in ['aarch64', 'arm64']:
+        return "linuxarm64", "tar.xz"
+    return None, None
+
+def _discover_ffmpeg_release_url():
+    """Find the newest RELEASE-branch build in BtbN's 'latest' release.
+    Tries the GitHub API first, then the assets HTML (no API rate limit).
+    Returns a download URL or None; never returns a master-latest build."""
+    plat, ext = _ffmpeg_platform_tag()
+    if not plat:
+        return None
+    names = []
+    hdrs = {'User-Agent': f'FractumWorker/{WORKER_VERSION}'}
+    try:
+        r = requests.get("https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest",
+                         headers=dict(hdrs, Accept='application/vnd.github+json'), timeout=20)
+        if r.status_code == 200:
+            names = [a.get('name', '') for a in r.json().get('assets', [])]
+    except Exception:
+        pass
+    if not names:
+        try:
+            r = requests.get("https://github.com/BtbN/FFmpeg-Builds/releases/expanded_assets/latest",
+                             headers=hdrs, timeout=20)
+            if r.status_code == 200:
+                names = re.findall(r'ffmpeg-n[\d.]+-latest-[a-z0-9]+-gpl-[\d.]+\.(?:zip|tar\.xz)', r.text)
+        except Exception:
+            pass
+    best = None  # (major, minor, asset_name)
+    pat = re.compile(rf'^ffmpeg-n(\d+)\.(\d+)-latest-{plat}-gpl-(\d+)\.(\d+)\.{re.escape(ext)}$')
+    for n in set(names):
+        m = pat.match(n)
+        if m and m.group(1) == m.group(3) and m.group(2) == m.group(4):
+            ver = (int(m.group(1)), int(m.group(2)))
+            if best is None or ver > best[:2]:
+                best = (ver[0], ver[1], n)
+    return _FFMPEG_DL_BASE + best[2] if best else None
+
+def _ffmpeg_candidate_urls():
+    """Download URLs to try, best first: the discovered newest release build,
+    then hardcoded fallback versions for when discovery is unreachable."""
+    plat, ext = _ffmpeg_platform_tag()
+    if not plat:
+        return []
+    urls = []
+    discovered = _discover_ffmpeg_release_url()
+    if discovered:
+        urls.append(discovered)
+    for v in _FFMPEG_FALLBACK_VERSIONS:
+        u = f"{_FFMPEG_DL_BASE}ffmpeg-n{v}-latest-{plat}-gpl-{v}.{ext}"
+        if u not in urls:
+            urls.append(u)
+    return urls
+
+def _ffmpeg_primary_url():
+    """The URL the staleness checker tracks — best available candidate."""
+    urls = _ffmpeg_candidate_urls()
+    return urls[0] if urls else None
 
 def _save_ffmpeg_meta(url):
     """Store the ETag/Last-Modified of url so we can detect upstream updates."""
@@ -1224,14 +1283,15 @@ def update_ffmpeg_if_stale():
 
 def download_ffmpeg_windows():
     print("[*] FFmpeg not found. Attempting download (FULL Version ~128MB)...")
-    
-    urls = [
-        "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-win64-gpl-7.1.zip",
+
+    # Newest release-branch build (discovered) first, hardcoded fallbacks,
+    # then the project mirror as a last resort when GitHub is unreachable.
+    urls = _ffmpeg_candidate_urls() + [
         "https://vsv.fractumseraph.net/ffmpeg-n7.1-latest-win64-gpl-7.1.zip"
     ]
-    
+
     temp_zip = "ffmpeg_temp.zip"
-    
+
     for url in urls:
         print(f"[*] Trying mirror: {url}")
         try:
@@ -1269,7 +1329,7 @@ def download_ffmpeg_windows():
                 
             os.remove(temp_zip)
             print("[*] FFmpeg installed locally!")
-            _save_ffmpeg_meta(_ffmpeg_primary_url() or url)
+            _save_ffmpeg_meta(url)
             return True
             
         except Exception as e:
@@ -1281,21 +1341,21 @@ def download_ffmpeg_windows():
 
 def download_ffmpeg_linux():
     print("[*] Downloading static FFmpeg build (BtbN)...")
-    arch = platform.machine().lower()
-    
-    if arch in ['x86_64', 'amd64']:
-        url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-linux64-gpl-7.1.tar.xz"
-    elif arch in ['aarch64', 'arm64']:
-        # BtbN, not johnvansickle: the JVS static builds have no libsvtav1.
-        url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-linuxarm64-gpl-7.1.tar.xz"
-    else:
-        print(f"[!] Unsupported architecture for auto-download: {arch}")
+    urls = _ffmpeg_candidate_urls()
+    if not urls:
+        print(f"[!] Unsupported architecture for auto-download: {platform.machine().lower()}")
         return False
+    for url in urls:
+        if _download_ffmpeg_linux_from(url):
+            return True
+    return False
 
+def _download_ffmpeg_linux_from(url):
     try:
+        print(f"[*] Trying: {url}")
         r = requests.get(url, stream=True, allow_redirects=True, timeout=180)
         r.raise_for_status()
-        
+
         tar_name = f"ffmpeg_static_{int(time.time())}.tar.xz"
         total_size = int(r.headers.get('content-length', 0))
         downloaded = 0
