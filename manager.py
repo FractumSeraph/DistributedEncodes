@@ -1287,6 +1287,18 @@ def _maybe_start_assembly(job_id):
         ASSEMBLING_JOBS.add(job_id)
     threading.Thread(target=_assemble_job, args=(job_id,), daemon=True).start()
 
+class _AssemblyInterrupted(Exception):
+    """The concat ffmpeg was KILLED rather than failing — almost always the
+    manager itself being stopped (Ctrl+C/SIGTERM reaches child processes).
+    The job's completed chunks must be left alone: the maintenance loop
+    re-triggers assembly automatically (including after a restart)."""
+
+# In-memory interruption counter per job (resets on restart, which is exactly
+# right — a restart is the legitimate interruption case). Bounds the retry
+# loop so a repeat killer (e.g. the OOM reaper hitting every concat) can't
+# re-trigger assembly forever.
+_ASSEMBLY_INTERRUPTS = {}
+
 def _assemble_job(job_id):
     """Concatenate all uploaded video chunks (stream copy — zero quality loss)
     and mux in the audio/subtitle track, then verify and finalize the job."""
@@ -1336,7 +1348,12 @@ def _assemble_job(job_id):
         cmd += ['-c', 'copy', '-movflags', '+faststart', out_tmp]
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
         if res.returncode != 0 or not os.path.exists(out_tmp):
-            raise RuntimeError(f"concat failed (rc={res.returncode}): {res.stderr[-500:] if res.stderr else ''}")
+            err_tail = res.stderr[-500:] if res.stderr else ''
+            # rc 255 / negative rc / "received signal" = ffmpeg was killed,
+            # not a real mux error. Don't tear the job down for that.
+            if res.returncode == 255 or res.returncode < 0 or 'received signal' in err_tail:
+                raise _AssemblyInterrupted(f"concat killed (rc={res.returncode})")
+            raise RuntimeError(f"concat failed (rc={res.returncode}): {err_tail}")
 
         is_valid, reason, _assembled_dur = verify_upload(out_tmp)
         if not is_valid:
@@ -1394,7 +1411,31 @@ def _assemble_job(job_id):
         if warn:
             log_event("WARN", warn, job_id)
         log_event("INFO", f"Chunked job assembled and completed ({len(video_chunks)} chunks by {len(workers)} worker(s)).", job_id)
+        with ASSEMBLY_LOCK:
+            _ASSEMBLY_INTERRUPTS.pop(job_id, None)
 
+    except _AssemblyInterrupted as e:
+        with ASSEMBLY_LOCK:
+            n = _ASSEMBLY_INTERRUPTS.get(job_id, 0) + 1
+            _ASSEMBLY_INTERRUPTS[job_id] = n
+        if n >= 5:
+            # Something keeps killing the concat (OOM?) — stop looping and
+            # hand the job to the whole-file path. Chunk files stay banked.
+            log_event("ERROR", f"Assembly interrupted {n}x ({e}) — giving up on chunked assembly.", job_id)
+            with db_lock:
+                conn = db_handler.get_connection()
+                try:
+                    _requeue_job_whole(conn, job_id, f"assembly interrupted {n}x")
+                    conn.commit()
+                finally:
+                    conn.close()
+        else:
+            # Leave the job and its completed chunks EXACTLY as they are: the
+            # maintenance loop re-triggers assembly for fully-completed chunked
+            # jobs — within a minute if we're still running, or right after
+            # startup when the interruption was the manager being stopped.
+            log_event("WARN", f"Assembly interrupted ({e}) — chunks kept intact; "
+                              f"assembly will retry automatically (attempt {n}/5).", job_id)
     except Exception as e:
         log_event("ERROR", f"Chunk assembly failed: {e}", job_id)
         with db_lock:
