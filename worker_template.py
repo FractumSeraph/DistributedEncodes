@@ -1286,12 +1286,14 @@ def download_ffmpeg_windows():
 
     # Newest release-branch build (discovered) first, hardcoded fallbacks,
     # then the project mirror as a last resort when GitHub is unreachable.
-    # The mirror uses a STABLE alias filename — overwrite that one file with
-    # any current BtbN win64-gpl release zip to refresh it, no code change
-    # needed. (The n7.1 name is the legacy mirror file, kept as a final try.)
-    urls = _ffmpeg_candidate_urls() + [
-        "https://vsv.fractumseraph.net/ffmpeg-latest-win64-gpl.zip",
-        "https://vsv.fractumseraph.net/ffmpeg-n7.1-latest-win64-gpl-7.1.zip"
+    # The mirror is tried with each candidate's ORIGINAL filename (so any
+    # current BtbN win64-gpl zip dropped there under its real name works),
+    # then a stable alias, then the legacy n7.1 mirror file.
+    _mirror = "https://vsv.fractumseraph.net/"
+    _cands = _ffmpeg_candidate_urls()
+    urls = _cands + [_mirror + u.rsplit('/', 1)[-1] for u in _cands] + [
+        _mirror + "ffmpeg-latest-win64-gpl.zip",
+        _mirror + "ffmpeg-n7.1-latest-win64-gpl-7.1.zip"
     ]
 
     temp_zip = "ffmpeg_temp.zip"
