@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.4.6"
+WORKER_VERSION = "3.4.7"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -1493,45 +1493,106 @@ def verify_connection(manager_url):
 
 
 def _ensure_temp_writable(temp_dir):
-    """Make sure this worker's temp dir is usable, self-healing the common
-    accident: a previous run as another user (e.g. via sudo) left root-owned
-    encode.log/output files behind, and every open(..., 'w') now dies with
-    [Errno 13]. Unwritable leftovers are deleted when possible (they're
-    unusable for resume anyway). Returns an error string, or None when OK."""
-    try:
-        os.makedirs(temp_dir, exist_ok=True)
-        probe = os.path.join(temp_dir, '.write_test')
+    """Return (usable_dir, None) or (None, error): make sure this worker has a
+    usable temp dir, self-healing every variant of the common accident where a
+    previous run as another user (e.g. via sudo) poisoned it:
+
+      1. root-owned FILES inside a user-owned dir  -> delete the files
+      2. user-owned dir with a broken mode         -> chmod it back
+      3. root-owned dir that can be removed        -> delete + recreate
+      4. root-owned dir that CANNOT be removed     -> use a deterministic
+         per-user sibling dir (temp_encode_X_u<uid>) instead — the worker's
+         own folder is always writable if the worker runs at all
+
+    Only when even the sibling dir cannot be created (the worker's folder
+    itself is read-only) does this give up and return an error."""
+
+    def _writable(d):
         try:
+            os.makedirs(d, exist_ok=True)
+            probe = os.path.join(d, '.write_test')
             with open(probe, 'w') as f:
                 f.write('x')
             os.remove(probe)
-        except (PermissionError, OSError) as e:
-            return f"Temp dir '{temp_dir}' is not writable by this user ({e})"
-        for name in os.listdir(temp_dir):
-            p = os.path.join(temp_dir, name)
-            if not os.path.isfile(p) or os.access(p, os.W_OK):
-                continue
+            return True
+        except OSError:
+            return False
+
+    def _clear_leftovers(d):
+        """Delete unwritable leftover files (useless for resume anyway).
+        Returns True when the dir ends up clean."""
+        try:
+            for name in os.listdir(d):
+                p = os.path.join(d, name)
+                if not os.path.isfile(p) or os.access(p, os.W_OK):
+                    continue
+                try:
+                    os.remove(p)
+                    print(f"[*] Removed unwritable leftover from a previous run: {p}")
+                except OSError:
+                    return False
+            return True
+        except OSError:
+            return False
+
+    try:
+        if _writable(temp_dir) and _clear_leftovers(temp_dir):
+            return temp_dir, None
+
+        # Heal 2: a dir we own whose mode got mangled.
+        try:
+            os.chmod(temp_dir, 0o755)
+        except OSError:
+            pass
+        if _writable(temp_dir) and _clear_leftovers(temp_dir):
+            print(f"[*] Repaired permissions on '{temp_dir}'.")
+            return temp_dir, None
+
+        # Heal 3: remove the poisoned dir entirely (works whenever the parent
+        # folder is ours — e.g. an EMPTY root-owned dir) and start fresh.
+        try:
+            shutil.rmtree(temp_dir)
+        except OSError:
+            # rmtree can't even LIST an unreadable foreign dir, but deleting an
+            # empty one only needs write permission on the parent.
             try:
-                os.remove(p)
-                print(f"[*] Removed unwritable leftover from a previous run: {p}")
+                os.rmdir(temp_dir)
             except OSError:
-                return (f"'{p}' is not writable and cannot be removed "
-                        f"(owned by another user?)")
-        return None
+                pass
+        if not os.path.isdir(temp_dir) and _writable(temp_dir):
+            print(f"[*] Recreated temp dir '{temp_dir}' (previous one was unusable).")
+            return temp_dir, None
+
+        # Heal 4: the dir is another user's and can't be emptied — step around
+        # it with a per-user sibling. Deterministic name, so resume checkpoints
+        # still work across restarts for THIS user.
+        if hasattr(os, 'getuid'):
+            suffix = f"u{os.getuid()}"
+        else:
+            suffix = re.sub(r'[^A-Za-z0-9_-]', '_', os.environ.get('USERNAME', 'alt')) or 'alt'
+        alt = f"{temp_dir.rstrip('/' + os.sep)}_{suffix}"
+        if _writable(alt) and _clear_leftovers(alt):
+            print(f"[!] '{temp_dir}' belongs to another user and can't be cleaned — "
+                  f"using '{alt}' instead.")
+            print(f"    (Reclaim the old dir's disk later with: sudo rm -rf '{temp_dir}')")
+            return alt, None
+
+        return None, (f"Temp dir '{temp_dir}' is not writable and no fallback beside it "
+                      f"could be created — the worker's own folder appears read-only")
     except OSError as e:
-        return str(e)
+        return None, str(e)
 
 def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=False, series_id=None, watermark=False, max_size_mb=0, local_source_dir=None, no_chunks=False, wallet=None):
     global UPDATE_AVAILABLE
     log(worker_id, "Thread active.")
-    os.makedirs(temp_dir, exist_ok=True)
-    # Refuse to take ANY job with a broken temp dir: every encode would fail,
-    # burning fail_count strikes against perfectly good jobs on the manager.
-    _tmp_err = _ensure_temp_writable(temp_dir)
+    # Self-heal the temp dir (sudo leftovers, mangled modes, root-owned dirs —
+    # a per-user sibling dir is used when the original can't be reclaimed).
+    # Only a fully read-only worker folder still refuses jobs: encoding there
+    # would just burn fail_count strikes against good jobs on the manager.
+    temp_dir, _tmp_err = _ensure_temp_writable(temp_dir)
     if _tmp_err:
-        log(worker_id, f"{_tmp_err}. Likely cause: the worker previously ran as a different "
-                       f"user (sudo). Fix: delete '{temp_dir}' (sudo rm -rf) or chown it, "
-                       "then restart the worker WITHOUT sudo. Not taking jobs.", "ERROR")
+        log(worker_id, f"{_tmp_err}. Fix the worker folder's permissions (chown/chmod it to "
+                       "the user running the worker), then restart. Not taking jobs.", "ERROR")
         try:
             requests.post(f"{manager_url}/report_error",
                           json={"job_id": "none", "worker_id": worker_id,
