@@ -629,10 +629,13 @@ def requires_payout_auth(f):
         return jsonify({"status": "error", "message": "Unauthorized"}), 401
     return decorated
 
-def verify_upload(filepath):
+def verify_upload(filepath, source_has_audio=None):
     """Validate a finished encode. Returns (ok, reason, duration_sec) — the
     duration comes from ffprobe, so earnings credit is based on what was
-    actually delivered, not on what the worker claims."""
+    actually delivered, not on what the worker claims.
+
+    source_has_audio: True when the SOURCE is known to carry an audio track,
+    so a silent upload can be rejected. None = unknown (skip that check)."""
     try:
         cmd = ['ffprobe', '-v', 'error', '-print_format', 'json', '-show_streams', '-show_format', filepath]
         result = subprocess.run(cmd, capture_output=True, text=True)
@@ -641,16 +644,27 @@ def verify_upload(filepath):
 
         data = json.loads(result.stdout)
         duration = float(data.get('format', {}).get('duration') or 0)
-        has_video = False
+        video_count = 0
+        audio_count = 0
         for stream in data.get('streams', []):
             if stream['codec_type'] == 'video':
                 if stream.get('codec_name') != 'av1': return False, "Invalid Codec (Not AV1)", 0.0
                 if int(stream.get('height', 0)) != 480: return False, "Invalid Height", 0.0
-                has_video = True
+                video_count += 1
             elif stream['codec_type'] == 'audio':
                 if stream.get('codec_name') != 'opus': return False, "Invalid Audio Codec", 0.0
+                audio_count += 1
 
-        if not has_video: return False, "No Video Stream", 0.0
+        if not video_count: return False, "No Video Stream", 0.0
+        # A second video stream is never a valid target layout, and is the
+        # signature of an encode that mapped the video track twice instead of
+        # video+audio (a worker whose probe found no audio index). Those files
+        # verify as "AV1 at 480p" but play SILENTLY — 54 shipped before this
+        # check existed.
+        if video_count > 1:
+            return False, f"Multiple video streams ({video_count}) — audio track was mis-mapped", 0.0
+        if source_has_audio and not audio_count:
+            return False, "No Audio Stream (source has audio)", 0.0
         return True, "Verified", duration
     except Exception as e:
         return False, str(e), 0.0
@@ -665,6 +679,12 @@ def build_download_url(job_id, source_type, source_url):
         base_url = source_url if source_url else REMOTE_SOURCE_URL
         return urljoin(base_url, quote(job_id)) if base_url else ""
     return f"{SERVER_URL_DISPLAY.rstrip('/')}/download_source/{quote(job_id, safe='/')}"
+
+def _completed_path(job_id):
+    """Absolute path of a job's finished encode, or None if the job id would
+    escape COMPLETED_DIRECTORY (path-traversal guard, same as the upload path)."""
+    p = os.path.abspath(os.path.join(COMPLETED_DIRECTORY, os.path.splitext(job_id)[0] + ".mp4"))
+    return p if p.startswith(os.path.abspath(COMPLETED_DIRECTORY) + os.sep) else None
 
 def _chunk_dir(job_id):
     """Directory where uploaded chunks for a job are stored (short + unique)."""
@@ -1308,7 +1328,7 @@ def _assemble_job(job_id):
             conn.row_factory = sqlite3.Row
             try:
                 c = conn.cursor()
-                c.execute("SELECT status, source_duration_sec, total_chunks FROM jobs WHERE id=? AND COALESCE(chunked,0)=1", (job_id,))
+                c.execute("SELECT status, source_duration_sec, total_chunks, stream_meta FROM jobs WHERE id=? AND COALESCE(chunked,0)=1", (job_id,))
                 jrow = c.fetchone()
                 if jrow is None or jrow['status'] != 'processing':
                     return
@@ -1355,7 +1375,13 @@ def _assemble_job(job_id):
                 raise _AssemblyInterrupted(f"concat killed (rc={res.returncode})")
             raise RuntimeError(f"concat failed (rc={res.returncode}): {err_tail}")
 
-        is_valid, reason, _assembled_dur = verify_upload(out_tmp)
+        _src_audio = None
+        if jrow['stream_meta']:
+            try:
+                _src_audio = json.loads(jrow['stream_meta']).get('audio_index') is not None
+            except (TypeError, ValueError):
+                _src_audio = None
+        is_valid, reason, _assembled_dur = verify_upload(out_tmp, source_has_audio=_src_audio)
         if not is_valid:
             raise RuntimeError(f"assembled file failed verification: {reason}")
 
@@ -2675,7 +2701,7 @@ def upload_result():
             conn = db_handler.get_connection()
             try:
                 c = conn.cursor()
-                c.execute("SELECT status, COALESCE(chunked, 0), source_type, source_url, source_duration_sec FROM jobs WHERE id=?", (job_id,))
+                c.execute("SELECT status, COALESCE(chunked, 0), source_type, source_url, source_duration_sec, stream_meta FROM jobs WHERE id=?", (job_id,))
                 jrow = c.fetchone()
             finally:
                 conn.close()
@@ -2691,7 +2717,15 @@ def upload_result():
         temp_path = os.path.join(quarantine_dir, f"{uuid.uuid4().hex}.mp4")
         request.files['file'].save(temp_path)
 
-        is_valid, reason, verified_dur = verify_upload(temp_path)
+        # When the manager's own probe recorded an audio track on the source,
+        # a silent upload is a defect — reject it instead of shipping it.
+        _src_audio = None
+        if len(jrow) > 5 and jrow[5]:
+            try:
+                _src_audio = json.loads(jrow[5]).get('audio_index') is not None
+            except (TypeError, ValueError):
+                _src_audio = None
+        is_valid, reason, verified_dur = verify_upload(temp_path, source_has_audio=_src_audio)
 
         # Length check: a valid-but-TRUNCATED encode (ffmpeg died near the end
         # yet exited 0, a resume glitch, etc.) passes the codec/height check but
@@ -3499,6 +3533,7 @@ def admin_action():
     data = request.json or {}; job_id = data.get('job_id'); action = data.get('action')
     log_event("WARN", f"Admin performed '{action}' on job", job_id)
     post_commit_logs = []
+    purged = None
 
     with db_lock:
         conn = db_handler.get_connection(); c = conn.cursor()
@@ -3512,6 +3547,26 @@ def admin_action():
                 # restores previously-completed uploads instead of re-encoding.
                 c.execute("DELETE FROM chunks WHERE job_id = ?", (job_id,))
                 c.execute("UPDATE jobs SET status='queued', progress=0, worker_id=NULL, fail_count=0, chunked=0, chunkable=NULL, started_at=NULL, last_updated=? WHERE id=?", (datetime.now(), job_id))
+            elif action == 'retry_purge':
+                # Retry, but DELETE the finished encode first. For outputs that
+                # passed verification yet are defective (e.g. the worker-3.0.26
+                # batch that muxed the video twice instead of video+audio, so
+                # the file plays silently): the broken file must not survive if
+                # the re-encode never lands, and its banked chunks must not be
+                # restored into the new attempt.
+                _cp = _completed_path(job_id)
+                if _cp and os.path.isfile(_cp):
+                    try:
+                        os.remove(_cp)
+                        post_commit_logs.append(f"Deleted defective output for re-encode: {job_id}")
+                    except OSError as _e:
+                        post_commit_logs.append(f"Could not delete output for {job_id}: {_e}")
+                c.execute("DELETE FROM chunks WHERE job_id = ?", (job_id,))
+                _remove_chunk_dir_async(job_id)
+                c.execute("UPDATE jobs SET status='queued', progress=0, worker_id=NULL, fail_count=0, "
+                          "chunked=0, chunkable=NULL, started_at=NULL, chunk_stall_count=0, "
+                          "last_updated=? WHERE id=?", (datetime.now(), job_id))
+                purged = (c.rowcount == 1)
             elif action == 'retry_all_failed':
                 c.execute("DELETE FROM chunks WHERE job_id IN (SELECT id FROM jobs WHERE status IN ('failed', 'permanently_failed'))")
                 c.execute("UPDATE jobs SET status='queued', progress=0, worker_id=NULL, fail_count=0, chunked=0, chunkable=NULL, started_at=NULL, last_updated=? WHERE status IN ('failed', 'permanently_failed')", (datetime.now(),))
@@ -3557,6 +3612,10 @@ def admin_action():
         # FIXED: Run scan in a background thread to prevent client timeout
         threading.Thread(target=scan_and_queue, daemon=True).start()
 
+    if purged is not None:
+        # Report whether the job row actually changed, so bulk callers can
+        # tell a real requeue from a no-op on an unknown/stale job id.
+        return jsonify({"status": "ok", "requeued": purged})
     return jsonify({"status": "ok"})
 
 @app.route('/api/get_config')

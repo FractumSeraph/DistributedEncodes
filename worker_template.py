@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.4.7"
+WORKER_VERSION = "3.4.8"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -2213,7 +2213,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                     # Encode the remainder starting from _r_p1_dur
                     _r_hdrs  = f"X-Worker-Token: {WORKER_SECRET}\r\n"
                     _r_dl    = _r_chk.get('dl_url', '')
-                    _r_ai    = _r_chk.get('audio_index', 0)
+                    _r_ai    = _r_chk.get('audio_index')  # None = source has no audio
                     _r_si    = _r_chk.get('subtitle_indices', [])
                     _r_vf    = _r_chk.get('video_filter', ENCODING_CONFIG['VIDEO_SCALE'])
                     _r_af    = _r_chk.get('audio_filter', 'aresample=async=1')
@@ -2233,7 +2233,8 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                     )
                     _r_rem_cmd = (
                         [FFMPEG_CMD] + _r_input_args
-                        + ['-map', '0:v:0', '-map', f'0:{_r_ai}']
+                        + ['-map', '0:v:0']
+                        + (['-map', f'0:{_r_ai}'] if _r_ai is not None else [])
                         + [x for idx in _r_si for x in ['-map', f'0:{idx}']]
                         + ['-fps_mode', 'passthrough', '-avoid_negative_ts', 'make_zero',
                            '-c:v', ENCODING_CONFIG["VIDEO_CODEC"],
@@ -2536,7 +2537,10 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                         # "pending" or "error" → server has no hash yet, proceed normally
                 # -------------------------------------------------------
 
-                total_sec = 0; total_min = 0; audio_index = 0; subtitle_indices = []
+                # audio_index None = "no audio track". It must NOT default to 0:
+                # stream 0 is the video, and mapping it as audio produced silent
+                # files with two video streams (see the audio_map guard below).
+                total_sec = 0; total_min = 0; audio_index = None; subtitle_indices = []
                 meta_audio_channels = None
                 # Reset every job: a stale probe_data surviving from the previous
                 # loop iteration must never satisfy the failure check below.
@@ -2574,7 +2578,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                         # Start each attempt clean so a partially-parsed failure
                         # can't leave duplicate subtitle maps or a half-set state.
                         probe_data = None
-                        audio_index = 0; subtitle_indices = []
+                        audio_index = None; subtitle_indices = []
                         if _is_local:
                             cmd_probe = [FFPROBE_CMD,
                                 '-v', 'quiet', '-print_format', 'json', '-show_streams', '-show_format', dl_url]
@@ -2689,15 +2693,24 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                 else:
                     target_crf = base_crf
 
+                # Map the audio track ONLY when the source actually has one.
+                # audio_index defaults to 0, so an audio-less source (or a
+                # probe that found no audio streams) used to emit
+                # '-map 0:v:0 -map 0:0' — the VIDEO mapped twice. Those files
+                # still verified as AV1/480p and shipped, silent, with a
+                # duplicated video stream. The chunk path always guarded this;
+                # the whole-file path did not.
+                audio_map = ['-map', f'0:{audio_index}'] if audio_index is not None else []
+                if audio_index is None:
+                    log(worker_id, "Source has no audio stream — encoding video only.", "WARN")
                 if _is_local:
-                    cmd = [FFMPEG_CMD, '-y', '-i', dl_url,
-                           '-map', '0:v:0', '-map', f'0:{audio_index}']
+                    cmd = [FFMPEG_CMD, '-y', '-i', dl_url, '-map', '0:v:0'] + audio_map
                 else:
                     cmd = [FFMPEG_CMD,
                            '-headers', ffmpeg_http_headers,
                            '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '60',
                            '-reconnect_on_network_error', '1',
-                           '-y', '-i', dl_url, '-map', '0:v:0', '-map', f'0:{audio_index}']
+                           '-y', '-i', dl_url, '-map', '0:v:0'] + audio_map
                 for idx in subtitle_indices: cmd.extend(['-map', f'0:{idx}'])
                 
                 cmd.extend([
