@@ -531,6 +531,11 @@
                     if (j.status === 'failed' || j.status === 'permanently_failed' || j.status === 'completed') {
                         actions = `<button data-act="retry" data-id="${escapeHTML(j.id)}" style="border-color:var(--neon-green); color:var(--neon-green)">RETRY</button> ` + actions;
                     }
+                    // RE-ENC deletes the finished encode first — for outputs that
+                    // passed verification but are defective (e.g. silent files).
+                    if (j.status === 'completed') {
+                        actions = `<button data-act="retry_purge" data-id="${escapeHTML(j.id)}" style="border-color:var(--neon-orange); color:var(--neon-orange)" title="Delete the finished encode and re-encode from source">RE-ENC</button> ` + actions;
+                    }
                     actions += ` <button data-act="log" data-id="${escapeHTML(j.id)}" style="border-color:#555; color:#888; font-size:0.75em;">LOG</button>`;
 
                     // NEW: Build warning badge
@@ -602,6 +607,7 @@
             if (action === 'archive_history') msg = "ARCHIVE ALL HISTORY? This will force a re-encode of ALL files.";
             if (action === 'purge_queue') msg = "DELETE ALL QUEUED JOBS? (They will come back if files exist on disk)";
             if (action === 'clear_error_reports') msg = "Clear ALL error reports?";
+            if (action === 'retry_purge') msg = "DELETE this job's finished encode and re-encode it from source?";
 
             if(!confirm(msg)) return;
             fetch('/api/admin_action', {
