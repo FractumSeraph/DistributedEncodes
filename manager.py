@@ -1113,9 +1113,14 @@ def _split_claimed_job(job):
                 # reset it (and a worker re-claimed it) while we were probing.
                 # Still record the stream layout when we have it, so the
                 # whole-file worker can skip its own probe.
+                # stream_meta takes the FRESH probe when we have one (COALESCE
+                # only as a fallback): the blob's shape grows over time — the
+                # 'fps' field was added later — and keeping a stale blob meant
+                # jobs probed before that never got an fps, so their chunks
+                # failed forever with "maximum allowed frame rate is 240 fps".
                 c.execute("UPDATE jobs SET status='queued', worker_id=NULL, started_at=NULL, "
-                          "chunkable=0, source_duration_sec=COALESCE(source_duration_sec, ?), "
-                          "stream_meta=COALESCE(stream_meta, ?), last_updated=? "
+                          "chunkable=0, source_duration_sec=COALESCE(?, source_duration_sec), "
+                          "stream_meta=COALESCE(?, stream_meta), last_updated=? "
                           "WHERE id=? AND status='processing' AND worker_id='(chunking)'",
                           (probe['duration'] if probe else None, _stream_meta_json(probe),
                            datetime.now(), job_id))
@@ -1129,7 +1134,7 @@ def _split_claimed_job(job):
             # whole-file worker via /get_job after such a reset) may have taken
             # the job while the probe ran. If the claim is gone, walk away.
             c.execute("UPDATE jobs SET chunked=1, chunkable=1, source_duration_sec=?, total_chunks=?, "
-                      "stream_meta=COALESCE(stream_meta, ?), "
+                      "stream_meta=COALESCE(?, stream_meta), "
                       "progress=0, worker_id='(chunked)', last_updated=? "
                       "WHERE id=? AND status='processing' AND worker_id='(chunking)'",
                       (duration, total, _stream_meta_json(probe), now, job_id))
