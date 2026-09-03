@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.4.8"
+WORKER_VERSION = "3.4.9"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -1029,17 +1029,81 @@ def _start_heartbeat(fn, interval=30):
 
 _RESUME_CHK_PREFIX = "resume_chk_"
 
-def _probe_local_duration(file_path):
-    """Return duration in seconds of a local media file, or 0.0 on failure."""
+def _media_duration(file_path):
+    """Duration of a local media file in seconds, or None when it CANNOT be
+    determined. None and 0.0 must stay distinguishable: chunk output is written
+    as a fragmented MP4 (empty_moov), whose container duration some ffprobe
+    builds report as absent — treating that "unknown" as "zero" made the
+    post-encode self-check discard perfectly good chunks as truncated."""
+    # 1. container duration (cheap, works for most files)
     try:
         res = subprocess.run(
-            [FFPROBE_CMD, '-v', 'quiet', '-print_format', 'json', '-show_format', file_path],
+            [FFPROBE_CMD, '-v', 'quiet', '-print_format', 'json',
+             '-show_format', '-show_streams', file_path],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             encoding='utf-8', errors='replace', timeout=60)
-        dur = json.loads(res.stdout).get('format', {}).get('duration')
-        return float(dur) if dur else 0.0
+        data = json.loads(res.stdout)
+        dur = data.get('format', {}).get('duration')
+        if dur and float(dur) > 0:
+            return float(dur)
+        # 2. per-stream duration (present when the container's is not)
+        best = 0.0
+        for st in data.get('streams', []):
+            try: best = max(best, float(st.get('duration') or 0))
+            except (TypeError, ValueError): pass
+        if best > 0:
+            return best
     except Exception:
-        return 0.0
+        pass
+    # 3. last resort for fragmented output: read the final packet timestamp.
+    #    Only reached when the cheap paths gave nothing, so the cost is rare.
+    try:
+        res = subprocess.run(
+            [FFPROBE_CMD, '-v', 'quiet', '-select_streams', 'v:0',
+             '-show_entries', 'packet=pts_time', '-of', 'csv=p=0', file_path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            encoding='utf-8', errors='replace', timeout=180)
+        times = [float(x) for x in (res.stdout or '').split() if x.strip() and x.strip() != 'N/A']
+        if times:
+            return max(times)
+    except Exception:
+        pass
+    return None
+
+_PROGRESS_KEYS = ('frame=', 'fps=', 'stream_', 'bitrate=', 'total_size=', 'out_time=',
+                  'out_time_us=', 'out_time_ms=', 'dup_frames=', 'drop_frames=',
+                  'speed=', 'progress=')
+
+def _error_tail(log_buffer, lines=25):
+    """The ffmpeg lines worth reporting: '-progress pipe:1' emits a key=value
+    block several times a second, so a raw tail of the buffer is pure progress
+    noise and the actual error scrolls out of the report. Keep real messages."""
+    real = [l.rstrip() for l in log_buffer
+            if l.strip() and not l.strip().startswith(_PROGRESS_KEYS)]
+    if not real:
+        real = [l.rstrip() for l in log_buffer if l.strip()]
+    return "\n".join(real[-lines:])
+
+def _probe_source_fps(src, is_local, http_headers):
+    """Return the source video's r_frame_rate as an 'N/D' string, or None.
+    Header-only probe: cheap even for a multi-GB remote source."""
+    try:
+        cmd = [FFPROBE_CMD, '-v', 'quiet']
+        if not is_local and http_headers:
+            cmd += ['-headers', http_headers]
+        cmd += ['-select_streams', 'v:0', '-show_entries', 'stream=r_frame_rate',
+                '-of', 'csv=p=0', src]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             encoding='utf-8', errors='replace', timeout=60)
+        val = (res.stdout or '').strip().splitlines()[0].strip() if res.stdout.strip() else ''
+        return val if re.fullmatch(r'[1-9]\d*/[1-9]\d*', val) else None
+    except Exception:
+        return None
+
+def _probe_local_duration(file_path):
+    """Duration in seconds, or 0.0 when unknown (legacy callers)."""
+    d = _media_duration(file_path)
+    return d if d is not None else 0.0
 
 def _save_resume_checkpoint(path, payload):
     """Atomically write a resume checkpoint JSON."""
@@ -1757,6 +1821,16 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
             # with and without this flag on ffmpeg 6.x.
             etb_flags = []
             _fr = str(chunk.get('fps') or '')
+            if not _fr:
+                # Safety net: an older manager (or a job whose stored stream
+                # layout predates the fps field) sends no frame rate. Read it
+                # from the source header — r_frame_rate lives at the START of
+                # the file, so this stays cheap even over HTTP, unlike a full
+                # probe. Without it libsvtav1 sees the container timebase
+                # (1000 fps on MKV) and refuses to start.
+                _fr = _probe_source_fps(dl_url, _is_local, ffmpeg_http_headers) or ''
+                if _fr:
+                    log(worker_id, f"Manager sent no frame rate; probed {_fr} from the source.", "WARN")
             _m = re.fullmatch(r'([1-9]\d*)/([1-9]\d*)', _fr)
             if _m:
                 _fn, _fd = int(_m.group(1)), int(_m.group(2))
@@ -1939,8 +2013,16 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                     _tol = max(10.0, _exp_dur * 0.10) if chunk.get('is_last') else max(2.0, _exp_dur * 0.05)
                 else:
                     _tol = max(10.0, _exp_dur * 0.05)
-                _odur = _probe_local_duration(out_path)
-                if _exp_dur > 0 and _odur < _exp_dur - _tol:
+                _odur = _media_duration(out_path)
+                if _odur is None:
+                    # Undeterminable != truncated. Never discard an encode that
+                    # ffmpeg reported as successful just because ffprobe could
+                    # not read the duration back (fragmented MP4 on some builds,
+                    # missing/!broken ffprobe). The manager verifies the upload
+                    # anyway, so a genuinely bad chunk is still caught there.
+                    log(worker_id, f"Could not read back chunk duration ({chunk_tag}); "
+                                   "skipping the local truncation check.", "WARN")
+                elif _exp_dur > 0 and _odur < _exp_dur - _tol:
                     _trunc_note = f"{_odur:.1f}s of {_exp_dur:.1f}s"
                     log(worker_id, f"Chunk output truncated ({_trunc_note}) — source stream likely "
                                    f"dropped mid-encode ({chunk_tag}). Retrying.", "WARN")
@@ -1983,8 +2065,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                 err_msg = f"FFmpeg exited with code {rc} ({chunk_tag})"
             log(worker_id, err_msg, "ERROR")
             report_chunk("failed", error_msg=err_msg)
-            report_error(job_id, "chunk_encode_failure", err_msg,
-                         "\n".join(l.rstrip() for l in log_buffer))
+            report_error(job_id, "chunk_encode_failure", err_msg, _error_tail(log_buffer))
             upload_chunk_log()
             cleanup()
             d = WORKER_DETAILS.get(worker_id)
@@ -2845,8 +2926,11 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                         # truncated file. The manager rejects those anyway —
                         # catching it locally saves the (large) upload and
                         # retries immediately. Same tolerance as the manager.
-                        if total_sec > 0:
-                            _wf_odur = _probe_local_duration(local_dst)
+                        _wf_odur = _media_duration(local_dst) if total_sec > 0 else None
+                        if total_sec > 0 and _wf_odur is None:
+                            log(worker_id, "Could not read back encode duration; skipping the "
+                                           "local truncation check.", "WARN")
+                        elif total_sec > 0:
                             _wf_tol = max(10.0, total_sec * 0.05)
                             if _wf_odur < total_sec - _wf_tol:
                                 _wf_trunc_note = f"{_wf_odur:.1f}s of {total_sec:.1f}s"
@@ -2997,8 +3081,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                     log(worker_id, "--------------------------", "ERROR")
                     post_status("failed", error_msg=err_msg)
                     if not SHUTDOWN_EVENT.is_set():
-                        report_error(job_id, "encode_failure", err_msg,
-                                     "\n".join(l.rstrip() for l in log_buffer))
+                        report_error(job_id, "encode_failure", err_msg, _error_tail(log_buffer))
                     upload_encode_log()
 
                 if os.path.exists(local_dst): os.remove(local_dst)
