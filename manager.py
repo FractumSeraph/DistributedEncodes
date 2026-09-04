@@ -679,7 +679,9 @@ def verify_upload(filepath, source_has_audio=None):
             return False, "FFprobe Error", 0.0
 
         data = json.loads(result.stdout)
-        duration = float(data.get('format', {}).get('duration') or 0)
+        # Robust: a duration the container omits would otherwise read as 0,
+        # which zeroes the worker's earned minutes for a perfectly good encode.
+        duration = _probe_duration_robust(filepath, data) or 0.0
         video_count = 0
         audio_count = 0
         for stream in data.get('streams', []):
@@ -1299,6 +1301,43 @@ def _assign_pending_chunk(worker_id, folder_filter, max_size_mb, video_only=Fals
         finally:
             conn.close()
 
+def _probe_duration_robust(filepath, probe_data=None):
+    """Duration of a media file in seconds, or None when it CANNOT be read.
+    None and 0.0 must stay distinguishable. Chunk/whole-file output is written
+    as a fragmented MP4 (empty_moov) whose container duration some ffprobe
+    builds report as absent — reading that "unknown" as "zero" made the
+    verifier REJECT complete uploads with "Duration mismatch (0.0s vs ...)",
+    throwing away finished encodes (one node's whole output, since it depends
+    on which ffmpeg wrote the file). Falls back to per-stream duration, then
+    to the last packet timestamp."""
+    try:
+        if probe_data is None:
+            res = subprocess.run(['ffprobe', '-v', 'error', '-print_format', 'json',
+                                  '-show_format', '-show_streams', filepath],
+                                 capture_output=True, text=True, timeout=120)
+            probe_data = json.loads(res.stdout) if res.returncode == 0 else {}
+        d = probe_data.get('format', {}).get('duration')
+        if d and float(d) > 0:
+            return float(d)
+        best = 0.0
+        for st in probe_data.get('streams', []):
+            try: best = max(best, float(st.get('duration') or 0))
+            except (TypeError, ValueError): pass
+        if best > 0:
+            return best
+    except Exception:
+        pass
+    try:
+        res = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                              '-show_entries', 'packet=pts_time', '-of', 'csv=p=0', filepath],
+                             capture_output=True, text=True, timeout=300)
+        times = [float(x) for x in (res.stdout or '').split() if x.strip() and x.strip() != 'N/A']
+        if times:
+            return max(times)
+    except Exception:
+        pass
+    return None
+
 def _verify_chunk(filepath, kind, expected_dur, is_last):
     """Validate an uploaded chunk with ffprobe."""
     try:
@@ -1308,7 +1347,8 @@ def _verify_chunk(filepath, kind, expected_dur, is_last):
             return False, "FFprobe Error"
         data = json.loads(result.stdout)
         streams = data.get('streams', [])
-        dur = float(data.get('format', {}).get('duration') or 0)
+        # None = unreadable; do NOT conflate that with a zero-length upload.
+        dur = _probe_duration_robust(filepath, data)
 
         if kind == 'video':
             video = [s for s in streams if s.get('codec_type') == 'video']
@@ -1319,7 +1359,10 @@ def _verify_chunk(filepath, kind, expected_dur, is_last):
             if int(video[0].get('height', 0)) != 480:
                 return False, "Invalid Height"
             tolerance = max(10.0, expected_dur * 0.10) if is_last else max(2.0, expected_dur * 0.05)
-            if expected_dur > 0 and abs(dur - expected_dur) > tolerance:
+            if dur is None:
+                log_event("WARN", f"Could not read the duration of an uploaded {kind} chunk; "
+                                  "accepting it on the codec/resolution checks alone.")
+            elif expected_dur > 0 and abs(dur - expected_dur) > tolerance:
                 return False, f"Duration mismatch ({dur:.1f}s vs expected {expected_dur:.1f}s)"
         else:
             audio = [s for s in streams if s.get('codec_type') == 'audio']
@@ -1332,7 +1375,7 @@ def _verify_chunk(filepath, kind, expected_dur, is_last):
             # A truncated audio track must not slip into the final mux.
             # (Duration is only meaningful when an audio stream exists —
             # subtitle-only files end at the last cue.)
-            if audio and expected_dur > 0:
+            if audio and expected_dur > 0 and dur is not None:
                 tolerance = max(10.0, expected_dur * 0.05)
                 if abs(dur - expected_dur) > tolerance:
                     return False, f"Audio duration mismatch ({dur:.1f}s vs expected {expected_dur:.1f}s)"
