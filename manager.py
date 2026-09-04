@@ -376,6 +376,12 @@ def _git(*args, timeout=180):
     return subprocess.run(['git'] + list(args), cwd=_REPO_DIR,
                           capture_output=True, text=True, timeout=timeout)
 
+_STARTUP_GIT_HEAD = None
+try:
+    _STARTUP_GIT_HEAD = (_git('rev-parse', 'HEAD', timeout=20).stdout or '').strip() or None
+except Exception:
+    pass
+
 def _restart_self():
     """Restart the manager so the freshly pulled code takes effect.
     Returns True when a restart was initiated. Tried in order:
@@ -422,9 +428,39 @@ def _auto_update_loop():
     fast-forwards — a diverged history is reported, not force-reset."""
     interval = max(1, int(MANAGER_UPDATE_INTERVAL_HOURS)) * 3600
     branch = MANAGER_UPDATE_BRANCH
+    stale_check_sec = 300
+    last_fetch = time.monotonic()
+    warned_no_restart = False
     while True:
-        time.sleep(interval)
+        time.sleep(stale_check_sec)
         try:
+            # The working tree can move WITHOUT us pulling it — an operator
+            # running `git pull` by hand. The process keeps serving the code it
+            # imported at startup, and the scheduled pull below then sees
+            # local == remote and does nothing, so nothing ever restarts it:
+            # new files on disk, old code in memory, indefinitely. Compare the
+            # on-disk HEAD against the commit we actually started from.
+            if _STARTUP_GIT_HEAD:
+                cur = (_git('rev-parse', 'HEAD').stdout or '').strip()
+                if cur and cur != _STARTUP_GIT_HEAD:
+                    log_event("WARN", f"On-disk code moved {_STARTUP_GIT_HEAD[:7]} -> {cur[:7]} since "
+                                      "startup (external git pull?) — restarting to load it.")
+                    try:
+                        db_handler.sync_to_disk()
+                    except Exception:
+                        pass
+                    if _restart_self():
+                        continue
+                    if not warned_no_restart:
+                        warned_no_restart = True
+                        log_event("WARN", "No automatic restart path available — restart the manager "
+                                          "manually to load the new code.")
+                    continue
+
+            if time.monotonic() - last_fetch < interval:
+                continue
+            last_fetch = time.monotonic()
+
             if _git('fetch', 'origin', branch).returncode != 0:
                 continue  # network/remote hiccup — try again next cycle
             local  = _git('rev-parse', 'HEAD').stdout.strip()
@@ -643,7 +679,9 @@ def verify_upload(filepath, source_has_audio=None):
             return False, "FFprobe Error", 0.0
 
         data = json.loads(result.stdout)
-        duration = float(data.get('format', {}).get('duration') or 0)
+        # Robust: a duration the container omits would otherwise read as 0,
+        # which zeroes the worker's earned minutes for a perfectly good encode.
+        duration = _probe_duration_robust(filepath, data) or 0.0
         video_count = 0
         audio_count = 0
         for stream in data.get('streams', []):
@@ -1263,6 +1301,43 @@ def _assign_pending_chunk(worker_id, folder_filter, max_size_mb, video_only=Fals
         finally:
             conn.close()
 
+def _probe_duration_robust(filepath, probe_data=None):
+    """Duration of a media file in seconds, or None when it CANNOT be read.
+    None and 0.0 must stay distinguishable. Chunk/whole-file output is written
+    as a fragmented MP4 (empty_moov) whose container duration some ffprobe
+    builds report as absent — reading that "unknown" as "zero" made the
+    verifier REJECT complete uploads with "Duration mismatch (0.0s vs ...)",
+    throwing away finished encodes (one node's whole output, since it depends
+    on which ffmpeg wrote the file). Falls back to per-stream duration, then
+    to the last packet timestamp."""
+    try:
+        if probe_data is None:
+            res = subprocess.run(['ffprobe', '-v', 'error', '-print_format', 'json',
+                                  '-show_format', '-show_streams', filepath],
+                                 capture_output=True, text=True, timeout=120)
+            probe_data = json.loads(res.stdout) if res.returncode == 0 else {}
+        d = probe_data.get('format', {}).get('duration')
+        if d and float(d) > 0:
+            return float(d)
+        best = 0.0
+        for st in probe_data.get('streams', []):
+            try: best = max(best, float(st.get('duration') or 0))
+            except (TypeError, ValueError): pass
+        if best > 0:
+            return best
+    except Exception:
+        pass
+    try:
+        res = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                              '-show_entries', 'packet=pts_time', '-of', 'csv=p=0', filepath],
+                             capture_output=True, text=True, timeout=300)
+        times = [float(x) for x in (res.stdout or '').split() if x.strip() and x.strip() != 'N/A']
+        if times:
+            return max(times)
+    except Exception:
+        pass
+    return None
+
 def _verify_chunk(filepath, kind, expected_dur, is_last):
     """Validate an uploaded chunk with ffprobe."""
     try:
@@ -1272,7 +1347,8 @@ def _verify_chunk(filepath, kind, expected_dur, is_last):
             return False, "FFprobe Error"
         data = json.loads(result.stdout)
         streams = data.get('streams', [])
-        dur = float(data.get('format', {}).get('duration') or 0)
+        # None = unreadable; do NOT conflate that with a zero-length upload.
+        dur = _probe_duration_robust(filepath, data)
 
         if kind == 'video':
             video = [s for s in streams if s.get('codec_type') == 'video']
@@ -1283,7 +1359,10 @@ def _verify_chunk(filepath, kind, expected_dur, is_last):
             if int(video[0].get('height', 0)) != 480:
                 return False, "Invalid Height"
             tolerance = max(10.0, expected_dur * 0.10) if is_last else max(2.0, expected_dur * 0.05)
-            if expected_dur > 0 and abs(dur - expected_dur) > tolerance:
+            if dur is None:
+                log_event("WARN", f"Could not read the duration of an uploaded {kind} chunk; "
+                                  "accepting it on the codec/resolution checks alone.")
+            elif expected_dur > 0 and abs(dur - expected_dur) > tolerance:
                 return False, f"Duration mismatch ({dur:.1f}s vs expected {expected_dur:.1f}s)"
         else:
             audio = [s for s in streams if s.get('codec_type') == 'audio']
@@ -1296,7 +1375,7 @@ def _verify_chunk(filepath, kind, expected_dur, is_last):
             # A truncated audio track must not slip into the final mux.
             # (Duration is only meaningful when an audio stream exists —
             # subtitle-only files end at the last cue.)
-            if audio and expected_dur > 0:
+            if audio and expected_dur > 0 and dur is not None:
                 tolerance = max(10.0, expected_dur * 0.05)
                 if abs(dur - expected_dur) > tolerance:
                     return False, f"Audio duration mismatch ({dur:.1f}s vs expected {expected_dur:.1f}s)"

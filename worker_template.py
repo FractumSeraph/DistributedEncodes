@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.5.0"
+WORKER_VERSION = "3.6.0"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -1084,6 +1084,105 @@ def _error_tail(log_buffer, lines=25):
         real = [l.rstrip() for l in log_buffer if l.strip()]
     return "\n".join(real[-lines:])
 
+def _http_input_flags(headers):
+    """ffmpeg input options for pulling a source over HTTPS.
+
+    -reconnect_on_http_error is the important one: the source sits behind
+    Cloudflare, and a 522 (origin unreachable) or a 429 on one Range request
+    otherwise aborts the whole encode with "Server returned 5XX Server Error
+    reply" - work thrown away over a blip. Reconnecting inside ffmpeg fixes it
+    before the job ever notices. -rw_timeout turns a silently wedged socket
+    into a reconnect instead of an encode that hangs until the lease expires,
+    and -multiple_requests reuses the connection across chunk seeks."""
+    return [
+        '-headers', headers,
+        '-reconnect', '1', '-reconnect_streamed', '1',
+        '-reconnect_delay_max', '60', '-reconnect_on_network_error', '1',
+        '-reconnect_on_http_error', '5xx,429',
+        '-multiple_requests', '1',
+        '-rw_timeout', '60000000',
+    ]
+
+# AVERROR values ffmpeg exits with, by their exact 32-bit value.
+_AVERROR_NAMES = {
+    -1094995529: "Invalid data found when processing input",
+    -1482175992: "source server returned 5xx",
+    -1482175736: "source server returned 4xx",
+    -858797304:  "source server returned 403 Forbidden",
+    -875574520:  "source server returned 404 Not Found",
+    -541478725:  "End of file",
+    -1313558101: "Unknown error",
+    -22:         "Invalid argument",
+    -5:          "Input/output error",
+    -32:         "Broken pipe",
+    -104:        "Connection reset by peer",
+    -110:        "Connection timed out",
+}
+# POSIX exit() keeps only the low byte, so several AVERRORs collapse onto the
+# same status. Only name the byte where the collapse is unambiguous enough to
+# be worth saying; 8 covers every AVERROR_HTTP_* at once, so say that much.
+_AVERROR_LOW_BYTE = {
+    183: "Invalid data found when processing input",
+    234: "Invalid argument",
+    8:   "source/HTTP error",
+    251: "Input/output error",
+    224: "Broken pipe",
+    152: "Connection reset by peer",
+    146: "Connection timed out",
+}
+
+def _ffmpeg_rc_text(rc):
+    """Human-readable form of an ffmpeg exit status.
+
+    ffmpeg exits with the raw AVERROR it failed on. Windows keeps the whole
+    32-bit value, POSIX truncates it to the low byte, so the SAME failure is
+    reported as 3199971767 on one node and 183 on another and neither number
+    means anything to someone reading the admin panel."""
+    try:
+        rc = int(rc)
+    except (TypeError, ValueError):
+        return str(rc)
+    for signed, text in _AVERROR_NAMES.items():
+        if rc == signed or rc == (signed & 0xFFFFFFFF):
+            return f"{rc} ({text})"
+    if rc == 3:
+        # MSVCRT abort(); on our nodes that means an ffmpeg assertion fired.
+        return f"{rc} (aborted \u2014 assertion failure)"
+    if rc in _AVERROR_LOW_BYTE:
+        return f"{rc} ({_AVERROR_LOW_BYTE[rc]})"
+    return str(rc)
+
+# Substrings that mean "we could not READ THE SOURCE", not "this encode is
+# bad". The source is served over HTTPS through Cloudflare, so a 522 (origin
+# unreachable) or a Range response cut short mid-transfer shows up as an
+# ffmpeg failure even though nothing is wrong with the job. Those are worth
+# waiting out: a chunk given up on here is a chunk another node has to redo.
+# Deliberately excludes 4xx other than 429: a 403/404 is the source being
+# permanently wrong, and backing off for minutes before failing anyway only
+# delays the report.
+_SOURCE_READ_ERRORS = (
+    'server returned 5xx',
+    'http error 5',
+    'http error 429',
+    'server returned 429',
+    'cannot determine format of input',
+    'connection reset by peer',
+    'connection timed out',
+    'error in the pull function',
+    'i/o error',
+    'input/output error',
+    'stream ends prematurely',
+    'error opening input: end of file',
+)
+
+def _is_source_read_failure(log_buffer):
+    """True when the ffmpeg log blames reading the input, not the encode."""
+    for line in log_buffer[-60:]:
+        low = line.lower()
+        if any(tok in low for tok in _SOURCE_READ_ERRORS):
+            return True
+    return False
+
 def _probe_source_fps(src, is_local, http_headers):
     """Return the source video's r_frame_rate as an 'N/D' string, or None.
     Header-only probe: cheap even for a multi-GB remote source."""
@@ -1784,11 +1883,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
             except: pass
 
         ffmpeg_http_headers = f"X-Worker-Token: {WORKER_SECRET}\r\n"
-        input_flags = [] if _is_local else [
-            '-headers', ffmpeg_http_headers,
-            '-reconnect', '1', '-reconnect_streamed', '1',
-            '-reconnect_delay_max', '60', '-reconnect_on_network_error', '1',
-        ]
+        input_flags = [] if _is_local else _http_input_flags(ffmpeg_http_headers)
         # Per-chunk output name: a leaked/killed ffmpeg from a previous chunk
         # must never share an output path with the current one.
         _co_safe = re.sub(r'[^a-zA-Z0-9_-]', '_', f"{job_id}_{kind}_{idx}")[:80]
@@ -1938,15 +2033,36 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                     '-progress', 'pipe:1', out_path]
             prog_total = src_dur if src_dur > 0 else dur_sec
 
-        # ---- Encode (2 attempts) ----
+        # ---- Encode (2 attempts, more when the SOURCE is what failed) ----
+        # A transient source-read failure (Cloudflare 522, a Range response cut
+        # short) is not a bad job, and two attempts 15s apart land inside the
+        # same outage. Wait it out instead of handing the chunk back as failed.
+        _MAX_ATT = 5
         proc = None; log_buffer = []; _trunc_note = None
+        _src_retry_delays = [30, 120, 300]
+        _src_retries = 0
         report_chunk("processing", 0)
-        for _att in range(2):
+        for _att in range(_MAX_ATT):
             if SHUTDOWN_EVENT.is_set(): break
             if _att > 0:
-                log(worker_id, f"Chunk encode failed (rc={proc.returncode if proc else '?'}). Retrying in 15s...", "WARN")
+                _source_blamed = _is_source_read_failure(log_buffer) and not _trunc_note
+                if _att >= 2 and not _source_blamed:
+                    break  # a real encode failure: don't grind on it
+                if _source_blamed and _src_retries < len(_src_retry_delays):
+                    _delay = _src_retry_delays[_src_retries]
+                    _src_retries += 1
+                    log(worker_id, f"Could not read the source (rc="
+                                   f"{_ffmpeg_rc_text(proc.returncode) if proc else '?'}) \u2014 "
+                                   f"waiting {_delay}s for it to come back ({chunk_tag}).", "WARN")
+                elif _source_blamed:
+                    break  # source still down after every backoff step
+                else:
+                    _delay = 15
+                    log(worker_id, f"Chunk encode failed (rc="
+                                   f"{_ffmpeg_rc_text(proc.returncode) if proc else '?'}). "
+                                   f"Retrying in {_delay}s...", "WARN")
                 update_status("Retrying")
-                for _ in range(15):
+                for _ in range(_delay):
                     if SHUTDOWN_EVENT.is_set(): break
                     time.sleep(1)
                 if SHUTDOWN_EVENT.is_set(): break
@@ -2061,8 +2177,11 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
             rc = proc.returncode if proc else -1
             if _trunc_note:
                 err_msg = f"Truncated output ({_trunc_note}) — source stream interrupted ({chunk_tag})"
+            elif _is_source_read_failure(log_buffer):
+                err_msg = (f"Could not read the source \u2014 "
+                           f"FFmpeg exited with code {_ffmpeg_rc_text(rc)} ({chunk_tag})")
             else:
-                err_msg = f"FFmpeg exited with code {rc} ({chunk_tag})"
+                err_msg = f"FFmpeg exited with code {_ffmpeg_rc_text(rc)} ({chunk_tag})"
             log(worker_id, err_msg, "ERROR")
             report_chunk("failed", error_msg=err_msg)
             report_error(job_id, "chunk_encode_failure", err_msg, _error_tail(log_buffer))
@@ -2306,11 +2425,8 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                     _r_input_args = (
                         ['-ss', str(_r_p1_dur), '-y', '-i', _r_dl]
                         if _r_is_local_src else
-                        ['-headers', _r_hdrs,
-                         '-reconnect', '1', '-reconnect_streamed', '1',
-                         '-reconnect_delay_max', '60', '-reconnect_on_network_error', '1',
-                         '-ss', str(_r_p1_dur),
-                         '-y', '-i', _r_dl]
+                        _http_input_flags(_r_hdrs) +
+                        ['-ss', str(_r_p1_dur), '-y', '-i', _r_dl]
                     )
                     _r_rem_cmd = (
                         [FFMPEG_CMD] + _r_input_args
@@ -2787,11 +2903,8 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                 if _is_local:
                     cmd = [FFMPEG_CMD, '-y', '-i', dl_url, '-map', '0:v:0'] + audio_map
                 else:
-                    cmd = [FFMPEG_CMD,
-                           '-headers', ffmpeg_http_headers,
-                           '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '60',
-                           '-reconnect_on_network_error', '1',
-                           '-y', '-i', dl_url, '-map', '0:v:0'] + audio_map
+                    cmd = ([FFMPEG_CMD] + _http_input_flags(ffmpeg_http_headers)
+                           + ['-y', '-i', dl_url, '-map', '0:v:0'] + audio_map)
                 _sub_map_args = [x for idx in subtitle_indices for x in ('-map', f'0:{idx}')]
                 cmd.extend(_sub_map_args)
                 
@@ -2858,8 +2971,19 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                             _subs_dropped = True
                             log(worker_id, "mp4 muxer assertion (bad subtitle timestamps) — "
                                            "retrying WITHOUT subtitles.", "WARN")
-                        _retry_delay = 30
-                        log(worker_id, f"Encode failed (attempt {_enc_attempt}/3, rc={proc.returncode if proc else '?'}). Retrying in {_retry_delay}s...", "WARN")
+                        # Same reasoning as the chunk path: a source we could
+                        # not read is worth waiting out, an encode that failed
+                        # on its own is not.
+                        if _is_source_read_failure(log_buffer) and not _wf_trunc_note:
+                            _retry_delay = 120 * _enc_attempt
+                            log(worker_id, f"Could not read the source (rc="
+                                           f"{_ffmpeg_rc_text(proc.returncode) if proc else '?'}) "
+                                           f"\u2014 waiting {_retry_delay}s for it to come back.", "WARN")
+                        else:
+                            _retry_delay = 30
+                            log(worker_id, f"Encode failed (attempt {_enc_attempt}/3, rc="
+                                           f"{_ffmpeg_rc_text(proc.returncode) if proc else '?'}). "
+                                           f"Retrying in {_retry_delay}s...", "WARN")
                         update_status("Retrying")
                         for _ in range(_retry_delay):
                             if SHUTDOWN_EVENT.is_set(): break
@@ -3086,7 +3210,10 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
 
                 else:
                     rc = proc.returncode if proc else -1
-                    err_msg = f"FFmpeg exited with code {rc}"
+                    err_msg = f"FFmpeg exited with code {_ffmpeg_rc_text(rc)}"
+                    if _is_source_read_failure(log_buffer):
+                        err_msg = (f"Could not read the source — "
+                                   f"FFmpeg exited with code {_ffmpeg_rc_text(rc)}")
                     if _wf_trunc_note:
                         err_msg = f"Truncated output ({_wf_trunc_note}) — source stream interrupted"
                     if SHUTDOWN_EVENT.is_set(): err_msg = "Aborted by user/update"
