@@ -3770,6 +3770,16 @@ def maintenance_loop():
                         if cursor.rowcount > 0:
                             logs_to_write.append(("INFO", f"Pruned {cursor.rowcount} old system_logs row(s).", None))
 
+                    # Prune error_reports the same way. Unlike system_logs and
+                    # encode_logs this table had no pruning at all, so the admin
+                    # panel accumulated every failure ever seen — weeks-old,
+                    # already-recovered ones included — which reads as "lots of
+                    # ffmpeg errors" even when the queue is healthy. Keep 14 days.
+                    cursor.execute("DELETE FROM error_reports WHERE timestamp < ?",
+                                   (now - timedelta(days=14),))
+                    if cursor.rowcount > 0:
+                        logs_to_write.append(("INFO", f"Pruned {cursor.rowcount} error report(s) older than 14 days.", None))
+
                     conn.commit()
                 finally:
                     conn.close()

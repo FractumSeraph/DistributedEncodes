@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.4.9"
+WORKER_VERSION = "3.5.0"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -2792,7 +2792,8 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                            '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '60',
                            '-reconnect_on_network_error', '1',
                            '-y', '-i', dl_url, '-map', '0:v:0'] + audio_map
-                for idx in subtitle_indices: cmd.extend(['-map', f'0:{idx}'])
+                _sub_map_args = [x for idx in subtitle_indices for x in ('-map', f'0:{idx}')]
+                cmd.extend(_sub_map_args)
                 
                 cmd.extend([
                     '-fps_mode', 'passthrough',
@@ -2832,11 +2833,31 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                 })
 
                 proc = None; enc_time = 0; _wf_trunc_note = None
+                _subs_dropped = False
                 log_buffer = []  # defined before the loop: a pre-first-attempt
                                  # shutdown must not NameError the failure dump
                 for _enc_attempt in range(3):
                     if SHUTDOWN_EVENT.is_set(): break
                     if _enc_attempt > 0:
+                        # An mp4-muxer assertion (movenc "next_dts <= 0x7fffffff")
+                        # is data-dependent and NOT fixed by re-running: it comes
+                        # from a bad timestamp/duration in a mapped stream, and in
+                        # practice from the tx3g subtitle track built out of the
+                        # source's subrip cues. Retrying identically burned all 3
+                        # attempts and left the job permanently_failed 51 minutes
+                        # into an 86-minute encode. Drop the subtitles and retry:
+                        # video+audio is worth far more than a failed job.
+                        if (not _subs_dropped and _sub_map_args
+                                and any('movenc' in l or 'next_dts' in l for l in log_buffer)):
+                            for _pair in range(0, len(_sub_map_args), 2):
+                                _flag, _val = _sub_map_args[_pair], _sub_map_args[_pair + 1]
+                                for _i in range(len(cmd) - 1):
+                                    if cmd[_i] == _flag and cmd[_i + 1] == _val:
+                                        del cmd[_i:_i + 2]
+                                        break
+                            _subs_dropped = True
+                            log(worker_id, "mp4 muxer assertion (bad subtitle timestamps) — "
+                                           "retrying WITHOUT subtitles.", "WARN")
                         _retry_delay = 30
                         log(worker_id, f"Encode failed (attempt {_enc_attempt}/3, rc={proc.returncode if proc else '?'}). Retrying in {_retry_delay}s...", "WARN")
                         update_status("Retrying")
