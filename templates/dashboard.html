@@ -247,6 +247,9 @@
         </div>
     </div>
 
+    <div id="code-rev" style="text-align:center; color:#555; font-size:0.72em;
+         letter-spacing:0.08em; padding:14px 10px 24px;"></div>
+
     <div class="modal-overlay" id="helpModal">
         <div class="modal">
             <span class="modal-close" onclick="closeModal()">&times;</span>
@@ -448,6 +451,23 @@
                             </div>
                         </div>`;
                     }).join('') : '<div style="color:var(--text-dim); padding:10px;">// QUEUE EMPTY</div>';
+                }
+
+                // Which code the manager PROCESS is running. A manual
+                // `git pull` used to leave new files on disk and the old code
+                // in memory with nothing to show it, so say so out loud.
+                const rev = rawData.code;
+                const revEl = document.getElementById('code-rev');
+                if (rev && revEl) {
+                    if (rev.stale) {
+                        revEl.style.color = '#ffb000';
+                        revEl.innerText = `// RUNNING ${rev.running} \u2014 ${rev.on_disk} IS ON DISK. `
+                                        + `RESTART THE MANAGER TO LOAD IT.`;
+                    } else {
+                        revEl.style.color = '#555';
+                        revEl.innerText = `// rev ${rev.running || '?'}`
+                                        + (rev.started_at ? ` \u00b7 up since ${rev.started_at.replace('T', ' ')}` : '');
+                    }
                 }
 
             } catch (e) { console.error(e); }
