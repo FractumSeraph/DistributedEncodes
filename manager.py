@@ -376,6 +376,12 @@ def _git(*args, timeout=180):
     return subprocess.run(['git'] + list(args), cwd=_REPO_DIR,
                           capture_output=True, text=True, timeout=timeout)
 
+_STARTUP_GIT_HEAD = None
+try:
+    _STARTUP_GIT_HEAD = (_git('rev-parse', 'HEAD', timeout=20).stdout or '').strip() or None
+except Exception:
+    pass
+
 def _restart_self():
     """Restart the manager so the freshly pulled code takes effect.
     Returns True when a restart was initiated. Tried in order:
@@ -422,9 +428,39 @@ def _auto_update_loop():
     fast-forwards — a diverged history is reported, not force-reset."""
     interval = max(1, int(MANAGER_UPDATE_INTERVAL_HOURS)) * 3600
     branch = MANAGER_UPDATE_BRANCH
+    stale_check_sec = 300
+    last_fetch = time.monotonic()
+    warned_no_restart = False
     while True:
-        time.sleep(interval)
+        time.sleep(stale_check_sec)
         try:
+            # The working tree can move WITHOUT us pulling it — an operator
+            # running `git pull` by hand. The process keeps serving the code it
+            # imported at startup, and the scheduled pull below then sees
+            # local == remote and does nothing, so nothing ever restarts it:
+            # new files on disk, old code in memory, indefinitely. Compare the
+            # on-disk HEAD against the commit we actually started from.
+            if _STARTUP_GIT_HEAD:
+                cur = (_git('rev-parse', 'HEAD').stdout or '').strip()
+                if cur and cur != _STARTUP_GIT_HEAD:
+                    log_event("WARN", f"On-disk code moved {_STARTUP_GIT_HEAD[:7]} -> {cur[:7]} since "
+                                      "startup (external git pull?) — restarting to load it.")
+                    try:
+                        db_handler.sync_to_disk()
+                    except Exception:
+                        pass
+                    if _restart_self():
+                        continue
+                    if not warned_no_restart:
+                        warned_no_restart = True
+                        log_event("WARN", "No automatic restart path available — restart the manager "
+                                          "manually to load the new code.")
+                    continue
+
+            if time.monotonic() - last_fetch < interval:
+                continue
+            last_fetch = time.monotonic()
+
             if _git('fetch', 'origin', branch).returncode != 0:
                 continue  # network/remote hiccup — try again next cycle
             local  = _git('rev-parse', 'HEAD').stdout.strip()
