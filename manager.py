@@ -381,6 +381,27 @@ try:
     _STARTUP_GIT_HEAD = (_git('rev-parse', 'HEAD', timeout=20).stdout or '').strip() or None
 except Exception:
     pass
+_PROCESS_START_ISO = datetime.now().isoformat(timespec='seconds')
+
+def _code_revision():
+    """What code this PROCESS is running vs what is on disk.
+
+    "Did the manager actually load what I pulled?" has been unanswerable
+    without reading the logs for a side effect of the new code, and guessing
+    wrong wastes hours: a manual `git pull` leaves new files on disk and the
+    old code in memory, and until the staleness check below existed nothing
+    ever restarted it. `stale: true` means restart me."""
+    disk = None
+    try:
+        disk = (_git('rev-parse', 'HEAD', timeout=20).stdout or '').strip() or None
+    except Exception:
+        pass
+    return {
+        "running": (_STARTUP_GIT_HEAD or '')[:7] or None,
+        "on_disk": (disk or '')[:7] or None,
+        "stale": bool(_STARTUP_GIT_HEAD and disk and _STARTUP_GIT_HEAD != disk),
+        "started_at": _PROCESS_START_ISO,
+    }
 
 def _restart_self():
     """Restart the manager so the freshly pulled code takes effect.
@@ -3284,7 +3305,7 @@ def api_stats():
             total_completed = c.fetchone()[0]
         finally:
             conn.close()
-    return jsonify({"scoreboard": sb, "active": act, "active_jobs": active_jobs, "history": hist, "queue_depth": queue_depth, "queue_items": queue_items, "total_jobs": total_count, "total_completed": total_completed})
+    return jsonify({"scoreboard": sb, "active": act, "active_jobs": active_jobs, "history": hist, "queue_depth": queue_depth, "queue_items": queue_items, "total_jobs": total_count, "total_completed": total_completed, "code": _code_revision()})
 
 @app.route('/api/all_jobs')
 @requires_auth

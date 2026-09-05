@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.6.0"
+WORKER_VERSION = "3.7.0"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -256,6 +256,8 @@ if HAS_TEXTUAL:
             "Idle":       "dim",
             "Starting":   "dim",
             "Probe":      "cyan",
+            "Opening":    "bold cyan",
+            "Stalled":    "bold orange3",
             "Verifying":  "cyan",
             "DL":         "bold cyan",
             "Encoding":   "bold yellow",
@@ -268,7 +270,7 @@ if HAS_TEXTUAL:
             "Retrying":   "bold orange3",
         }.get(phase, "white")
 
-    def _make_bar(pct: int, width: int = 12) -> str:
+    def _make_bar(pct: int, width: int = 10) -> str:
         pct = max(0, min(100, pct))
         filled = int(width * pct / 100)
         return "▓" * filled + "░" * (width - filled) + f" {pct:3d}%"
@@ -436,12 +438,12 @@ if HAS_TEXTUAL:
             w_worker = max(6, min(18, max((len(w) for w in self._worker_ids), default=6)))
             # Fixed columns + per-cell padding + table chrome; whatever is left
             # of the terminal goes to the file name column.
-            fixed = w_worker + 10 + 17 + 8 + 7 + 8 + (2 * 7) + 6
+            fixed = w_worker + 10 + 21 + 8 + 7 + 8 + (2 * 7) + 6
             self._file_w = max(20, min(64, get_term_width() - fixed))
             _cw               = table.add_column("Worker",       width=w_worker)
             self._col_file    = table.add_column("Current File", width=self._file_w)
             self._col_phase   = table.add_column("Phase",        width=10)
-            self._col_bar     = table.add_column("Progress",     width=17)
+            self._col_bar     = table.add_column("Progress",     width=21)
             self._col_elapsed = table.add_column("Elapsed",      width=8)
             self._col_done    = table.add_column("Done",         width=7)
             self._col_eta     = table.add_column("ETA",          width=8)
@@ -551,7 +553,24 @@ if HAS_TEXTUAL:
 
                 style = _phase_style(phase)
                 phase_text = Text(phase, style=style)
-                bar_text   = Text(_make_bar(pct) if phase not in {"Idle", "Starting"} else " " * 17, style=style)
+                # "Opening" has no percentage to show - ffmpeg is still pulling
+                # the header and seeking - so the bar is replaced by a ticking
+                # clock. A frozen 0% bar is exactly what made a slow link look
+                # like a hung worker.
+                note = d.get("note", "")
+                if phase == "Opening":
+                    spin = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int(now * 8) % 10]
+                    bar_body = f"{spin} reading src {note}"
+                elif phase in {"Idle", "Starting"}:
+                    bar_body = ""
+                else:
+                    bar_body = _make_bar(pct)
+                    speed = d.get("speed", "")
+                    if phase == "Stalled" and note:
+                        bar_body += f" {note}"
+                    elif speed:
+                        bar_body += f" {speed}"
+                bar_text = Text(bar_body.ljust(21)[:21], style=style)
 
                 # Middle truncation: keep the identifying start AND the chunk
                 # tag at the end (previously only the tail was kept, so every
@@ -1183,6 +1202,120 @@ def _is_source_read_failure(log_buffer):
             return True
     return False
 
+class _StreamWatch:
+    """Keeps the display honest while ffmpeg is quiet.
+
+    There is no separate download step to put a progress bar on: the worker
+    hands ffmpeg the URL and ffmpeg streams the source as it encodes. What
+    looked like a frozen worker is the gap BEFORE the first frame - ffmpeg
+    connecting, pulling the matroska header, then seeking to the chunk's
+    offset over HTTP Range. On a slow link that is minutes long, and the read
+    loop cannot tick the display through it because readline() is blocked
+    waiting for output that has not been produced yet. So tick from here:
+    count up while we wait for the source, and once frames are flowing, say
+    so when they stop."""
+
+    OPEN_GRACE_SEC = 3.0    # a fast open should not flash "reading src"
+    STALL_SEC      = 20.0   # no progress for this long = say something
+    BEAT_SEC       = 60.0   # keep the manager's stale-chunk sweeper off us
+
+    def __init__(self, update_status, single_mode=False, heartbeat=None):
+        self._update = update_status
+        self._single = single_mode
+        # The chunk read loop only reports to the manager from inside its
+        # out_time branch, so a long source-open sends NOTHING for its whole
+        # duration and CHUNK_STALE_SECONDS can hand the chunk to another node
+        # while this worker is still legitimately fetching it. Beat here too.
+        self._heartbeat = heartbeat
+        self._last_beat = time.time()
+        self._lock = threading.Lock()
+        self._started = time.time()
+        self._last_progress = 0.0   # 0 = no frame has ever landed
+        self._pct = 0
+        self._stop = threading.Event()
+        self._thread = None
+        self._last_said = 0.0
+
+    def note_progress(self, pct):
+        """Called from the read loop each time ffmpeg reports real output."""
+        with self._lock:
+            self._last_progress = time.time()
+            self._pct = pct
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self):
+        self._stop.set()
+
+    def _run(self):
+        while not self._stop.wait(1.0):
+            if SHUTDOWN_EVENT.is_set() or PAUSE_REQUESTED:
+                continue
+            self._beat()
+            with self._lock:
+                last, pct, started = self._last_progress, self._pct, self._started
+            now = time.time()
+            if not last:
+                waited = now - started
+                if waited >= self.OPEN_GRACE_SEC:
+                    self._say(f"Open {_fmt_mmss(waited)}",
+                              f"waiting for source... {_fmt_mmss(waited)}")
+            else:
+                stalled = now - last
+                if stalled >= self.STALL_SEC:
+                    self._say(f"Stall {_fmt_mmss(stalled)}",
+                              f"stalled {_fmt_mmss(stalled)} at {pct}%")
+
+    def _beat(self):
+        if not self._heartbeat or time.time() - self._last_beat < self.BEAT_SEC:
+            return
+        self._last_beat = time.time()
+        try:
+            self._heartbeat()
+        except Exception:
+            pass
+
+    def _say(self, status, single_line):
+        if not self._single:
+            self._update(status)
+            return
+        # No TUI row to update in single mode, and one line a second would
+        # bury the log, so speak up only occasionally.
+        now = time.time()
+        if now - self._last_said >= 15.0:
+            self._last_said = now
+            safe_print(f"    ... {single_line}")
+
+def _set_speed(worker_id, line):
+    """Stash ffmpeg's own 'speed=' figure for the display.
+
+    On a slow link this is the number that explains everything: an encode
+    creeping along at 0.2x is waiting on the network, not on the CPU, and
+    without it the only visible symptom is a bar that barely moves."""
+    try:
+        val = line.split('=', 1)[1].strip()
+        if not val or val == 'N/A':
+            return
+        # ffmpeg prints anything from "0.0578x" to "112x"; normalise so the
+        # column cannot be cut mid-number (truncating "0.0578x" to six chars
+        # produced a bare "0.0578" that read like a percentage).
+        num = float(val.rstrip('xX'))
+        if num >= 10:    txt = f"{num:.0f}x"
+        elif num >= 1:   txt = f"{num:.1f}x"
+        else:            txt = f"{num:.2f}x"
+        d = WORKER_DETAILS.get(worker_id)
+        if d is not None:
+            d["speed"] = txt
+    except Exception:
+        pass
+
+def _fmt_mmss(sec):
+    sec = int(max(0, sec))
+    return f"{sec // 60}:{sec % 60:02d}" if sec >= 60 else f"{sec}s"
+
 def _probe_source_fps(src, is_local, http_headers):
     """Return the source video's r_frame_rate as an 'N/D' string, or None.
     Header-only probe: cheap even for a multi-GB remote source."""
@@ -1776,6 +1909,8 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
             WORKER_PROGRESS[worker_id] = msg
         d = WORKER_DETAILS.get(worker_id)
         if d is not None:
+            if not msg.startswith(("Open ", "Stall ")):
+                d["note"] = ""
             if msg.startswith("DL "):
                 d["phase"] = "DL"
                 try: d["pct"] = int(msg[3:].rstrip('%'))
@@ -1790,6 +1925,13 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                 except: pass
             elif msg == "Idle":
                 d.update({"phase": "Idle", "pct": 0, "file": "-", "job_start": 0.0})
+            elif msg.startswith("Open "):
+                d["phase"] = "Opening"
+                d["note"] = msg[5:]
+                d["pct"] = 0
+            elif msg.startswith("Stall "):
+                d["phase"] = "Stalled"
+                d["note"] = msg[6:]
             elif msg == "Probing":
                 d["phase"] = "Probe"
             elif msg == "Quota Limit":
@@ -2079,6 +2221,10 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
 
             last_rep = 0; last_pct = 0; last_hb = time.time()
             log_buffer = []
+            # Ticks the display while ffmpeg opens and seeks the source, which
+            # this loop cannot do: readline() below is blocked the whole time.
+            watch = _StreamWatch(update_status, single_mode,
+                                 heartbeat=lambda: report_chunk("processing", last_pct)).start()
             # try/finally: an exception mid-loop (e.g. disk-full on the log
             # write) must still deregister and kill ffmpeg — a leaked encoder
             # blocks forever on a full stdout pipe once nobody reads it.
@@ -2101,13 +2247,17 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                                 curr_sec = get_seconds(line.split('=')[1].strip())
                                 pct = min(100, int((curr_sec / prog_total) * 100))
                                 last_pct = pct
+                                watch.note_progress(pct)
                                 if single_mode: print_progress(worker_id, curr_sec, prog_total, prefix='Enc')
                                 else: update_status(f"Enc {pct}%")
                                 if time.time() - last_rep > 10:
                                     report_chunk("processing", pct)
                                     last_rep = time.time(); last_hb = last_rep
                             except: pass
+                        elif line.startswith("speed="):
+                            _set_speed(worker_id, line)
             finally:
+                watch.stop()
                 with PROC_LOCK:
                     if worker_id in ACTIVE_PROCS: del ACTIVE_PROCS[worker_id]
                 if proc.poll() is None:
@@ -2994,6 +3144,9 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
 
                     start_enc = time.time(); last_rep = 0; last_enc_pct = 0; last_hb = 0
                     log_buffer = []
+                    # See the chunk path: readline() blocks while ffmpeg opens
+                    # the source, so the ticking has to come from elsewhere.
+                    watch = _StreamWatch(update_status, single_mode).start()
 
                     popen_kwargs = {}
                     if platform.system() == 'Windows':
@@ -3047,6 +3200,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                                         last_enc_pct = pct
                                         _hb["pct"] = pct
 
+                                        watch.note_progress(pct)
                                         if single_mode: print_progress(worker_id, curr_sec, total_sec, prefix='Enc')
                                         else: update_status(f"Enc {pct}%")
 
@@ -3055,7 +3209,10 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                                             last_rep = time.time()
                                             last_hb = last_rep
                                     except: pass
+                                elif line.startswith("speed="):
+                                    _set_speed(worker_id, line)
                     finally:
+                        watch.stop()
                         _hb_stop.set()
                         with PROC_LOCK:
                             if worker_id in ACTIVE_PROCS: del ACTIVE_PROCS[worker_id]
