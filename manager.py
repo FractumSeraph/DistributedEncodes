@@ -3295,8 +3295,35 @@ def api_stats():
             c.execute("SELECT COUNT(*) FROM jobs WHERE status='queued'")
             queue_depth = c.fetchone()[0]
             
-            c.execute("SELECT id, filename, file_size FROM jobs WHERE status='queued' ORDER BY id ASC LIMIT 50")
+            # "Up Next" has to answer "what gets picked up next", and a bare
+            # ORDER BY id over everything queued does not: the chunk assigner
+            # skips fail_count>=5 and chunkable=0, and orders remote sources
+            # first. Those skipped jobs cluster at the alphabetical front, so
+            # the panel was listing rows no chunk worker would ever take while
+            # the swarm worked several letters ahead. Mirror the assigner.
+            c.execute("SELECT id, filename, file_size FROM jobs "
+                      "WHERE status='queued' AND COALESCE(fail_count,0) < 5 "
+                      "  AND COALESCE(chunkable,1)=1 "
+                      "ORDER BY CASE WHEN source_type='remote' THEN 0 ELSE 1 END, id ASC LIMIT 50")
             queue_items = [dict(r) for r in c.fetchall()]
+
+            # Queued, but invisible to the chunk assigner: only a whole-file
+            # worker can take these, and while any chunkable job remains every
+            # worker takes chunks instead, so they can sit for months. Counting
+            # them is the difference between "3287 queued" and knowing that N
+            # of them are going nowhere.
+            c.execute("SELECT id, COALESCE(fail_count,0) AS fc, COALESCE(chunkable,1) AS ck "
+                      "FROM jobs WHERE status='queued' "
+                      "AND (COALESCE(fail_count,0) >= 5 OR COALESCE(chunkable,1)=0) "
+                      "ORDER BY id ASC")
+            _stalled_rows = c.fetchall()
+            queue_stalled = len(_stalled_rows)
+            queue_stalled_items = [
+                {"id": r["id"],
+                 # Say WHY, so the panel is a diagnosis and not just a number.
+                 "why": ("failed 5+ times" if r["fc"] >= 5 else "whole-file only")}
+                for r in _stalled_rows[:25]
+            ]
 
             c.execute("SELECT COUNT(*) FROM jobs")
             total_count = c.fetchone()[0]
@@ -3305,7 +3332,9 @@ def api_stats():
             total_completed = c.fetchone()[0]
         finally:
             conn.close()
-    return jsonify({"scoreboard": sb, "active": act, "active_jobs": active_jobs, "history": hist, "queue_depth": queue_depth, "queue_items": queue_items, "total_jobs": total_count, "total_completed": total_completed, "code": _code_revision()})
+    return jsonify({"scoreboard": sb, "active": act, "active_jobs": active_jobs, "history": hist, "queue_depth": queue_depth, "queue_items": queue_items, "total_jobs": total_count, "total_completed": total_completed,
+                    "queue_stalled": queue_stalled, "queue_stalled_items": queue_stalled_items,
+                    "code": _code_revision()})
 
 @app.route('/api/all_jobs')
 @requires_auth
