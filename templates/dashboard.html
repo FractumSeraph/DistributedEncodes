@@ -243,6 +243,12 @@
                 <div id="queue-list" style="max-height: 300px; overflow-y: auto;">
                     <div style="color:#888; padding:10px;">Loading...</div>
                 </div>
+                <div id="queue-stalled" style="display:none; border-top:1px solid rgba(255,176,0,0.25);
+                     margin-top:8px; padding-top:8px;">
+                    <div style="color:#ffb000; font-size:0.78em; letter-spacing:0.06em; padding:2px 10px 6px;"
+                         id="queue-stalled-head"></div>
+                    <div id="queue-stalled-list" style="max-height:160px; overflow-y:auto;"></div>
+                </div>
             </div>
         </div>
     </div>
@@ -451,6 +457,33 @@
                             </div>
                         </div>`;
                     }).join('') : '<div style="color:var(--text-dim); padding:10px;">// QUEUE EMPTY</div>';
+                }
+
+                // Queued, but no chunk worker will ever take them: they were
+                // marked whole-file-only or burned through their retries, and
+                // every worker keeps taking chunks while any chunkable job is
+                // left. Without this they were simply missing from the panel
+                // while still inflating the queue-depth count.
+                const stalled = rawData.queue_stalled || 0;
+                const sBox = document.getElementById('queue-stalled');
+                if (sBox) {
+                    if (stalled > 0) {
+                        sBox.style.display = 'block';
+                        document.getElementById('queue-stalled-head').innerText =
+                            `// ${stalled} STALLED \u2014 NEEDS A --no-chunks WORKER`;
+                        document.getElementById('queue-stalled-list').innerHTML =
+                            (rawData.queue_stalled_items || []).map(j => {
+                                const nm = j.id.split('/').pop();
+                                return `<div class="job-item" style="border-color:rgba(255,176,0,0.15); padding:6px 8px;">
+                                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                                      <div class="job-file" style="color:#8a7a4a; margin:0; flex:1;"
+                                           title="${escapeHTML(nm)}">${escapeHTML(nm)}</div>
+                                      <div style="color:#6b5c34; font-size:0.72em; flex-shrink:0; padding-left:8px;">${escapeHTML(j.why || '')}</div>
+                                    </div></div>`;
+                            }).join('');
+                    } else {
+                        sBox.style.display = 'none';
+                    }
                 }
 
                 // Which code the manager PROCESS is running. A manual
