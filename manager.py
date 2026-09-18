@@ -2,6 +2,7 @@ import os
 import sys
 import math
 import time
+import collections
 import signal
 import threading
 import contextlib
@@ -1067,6 +1068,69 @@ def _update_job_chunk_progress(conn, job_id):
     c.execute("UPDATE jobs SET progress=?, last_updated=? WHERE id=? AND status='processing'",
               (pct, datetime.now(), job_id))
 
+# ==============================================================================
+# SOURCE OUTAGE BREAKER
+# ==============================================================================
+# When the media host goes down, every worker fails instantly on every job it
+# is handed, and the failure is counted against the JOB: fail_count climbs to
+# permanently_failed and chunking gets disabled. A Cloudflare 526 on the source
+# for one morning turned 78 healthy movies into permanently_failed and demoted
+# ~1,000 more to whole-file-only. The queue was being eaten at the speed the
+# workers could poll.
+#
+# Nothing is wrong with those jobs, so nothing should be held against them, and
+# handing out more work during an outage only widens the damage. Recognise the
+# condition, stop counting it, and stop dealing.
+
+SOURCE_OUTAGE_THRESHOLD = 5     # distinct failures before we call it an outage
+SOURCE_OUTAGE_WINDOW_SEC = 180  # ...within this window
+SOURCE_OUTAGE_COOLDOWN_SEC = 300
+
+# The worker says so itself (worker >= 3.6.0 classifies this before reporting);
+# the rest are for older workers and for the manager's own probe failures.
+_SOURCE_DOWN_MARKERS = (
+    'could not read the source',
+    'server returned 5xx',
+    'http error 5',
+    'error opening input',
+    'server returned 429',
+)
+
+_source_fail_times = collections.deque(maxlen=64)
+_source_outage_until = 0.0
+_source_lock = threading.Lock()
+
+def _is_source_failure(reason):
+    low = (reason or '').lower()
+    return any(m in low for m in _SOURCE_DOWN_MARKERS)
+
+def _note_source_failure():
+    """Record a source-read failure; open the breaker once they cluster."""
+    global _source_outage_until
+    now = time.time()
+    with _source_lock:
+        _source_fail_times.append(now)
+        recent = [t for t in _source_fail_times if now - t <= SOURCE_OUTAGE_WINDOW_SEC]
+        if len(recent) >= SOURCE_OUTAGE_THRESHOLD and now >= _source_outage_until:
+            _source_outage_until = now + SOURCE_OUTAGE_COOLDOWN_SEC
+            log_event("ERROR", f"Source appears to be DOWN ({len(recent)} read failures in "
+                               f"{SOURCE_OUTAGE_WINDOW_SEC}s). Pausing job hand-out for "
+                               f"{SOURCE_OUTAGE_COOLDOWN_SEC}s; jobs are NOT being penalised.")
+
+def _note_source_ok():
+    """Something was read successfully — the source is back."""
+    global _source_outage_until
+    with _source_lock:
+        was_down = _source_outage_until > time.time()
+        _source_fail_times.clear()
+        _source_outage_until = 0.0
+    if was_down:
+        log_event("INFO", "Source is reachable again; resuming job hand-out.")
+
+def _source_is_down():
+    with _source_lock:
+        return time.time() < _source_outage_until
+
 def _register_chunk_failure(job_id, kind, chunk_index, worker_id, reason):
     """A worker reported a chunk failure (or its upload failed verification)."""
     with db_lock:
@@ -1083,6 +1147,18 @@ def _register_chunk_failure(job_id, kind, chunk_index, worker_id, reason):
             # ignores stray/duplicate reports that could otherwise kill a healthy job.
             if row[1] != 'processing' or (row[2] and worker_id and row[2] != worker_id):
                 conn.commit()
+                return
+            # A source we cannot read is not this chunk's fault. Hand it back
+            # unpenalised so the outage cannot exhaust CHUNK_MAX_FAILS and drag
+            # the whole job out of chunked mode.
+            if _is_source_failure(reason):
+                c.execute("UPDATE chunks SET status='pending', worker_id=NULL, progress=0, "
+                          "last_updated=? WHERE job_id=? AND kind=? AND chunk_index=?",
+                          (datetime.now(), job_id, kind, chunk_index))
+                conn.commit()
+                _note_source_failure()
+                log_event("WARN", f"Chunk {kind}#{chunk_index} returned unpenalised "
+                                  f"(source unreadable): {reason}", job_id)
                 return
             new_fc = row[0] + 1
             if new_fc >= CHUNK_MAX_FAILS:
@@ -2368,6 +2444,12 @@ def download_media():
 @app.route('/get_job', methods=['GET'])
 @requires_worker_auth
 def get_job():
+    # Handing out work while the media host is unreachable just converts the
+    # queue into failures at polling speed. Idle instead; the breaker clears
+    # itself as soon as anything reads successfully.
+    if _source_is_down():
+        return jsonify({"status": "empty", "message": "Source unreachable — paused"})
+
     max_size_mb = request.args.get('max_size_mb')
     series_id = request.args.get('series_id')
     worker_id = sanitize_input(request.args.get('worker_id'))
@@ -2487,6 +2569,11 @@ def get_chunk():
     when this returns empty."""
     if not CHUNKED_ENCODING:
         return jsonify({"status": "empty", "message": "Chunking disabled"})
+    if _source_is_down():
+        # "retry" (not "empty") so the worker waits instead of falling through
+        # to /get_job, which is paused for the same reason.
+        return jsonify({"status": "retry", "wait": 10,
+                        "message": "Source unreachable — paused"})
 
     max_size_mb = request.args.get('max_size_mb')
     series_id = request.args.get('series_id')
@@ -2735,6 +2822,8 @@ def upload_chunk():
         finally:
             conn.close()
 
+    # A chunk that arrived means the source was readable: clear the breaker.
+    _note_source_ok()
     log_event("INFO", f"Chunk {kind}#{chunk_index} received from {worker_id}", job_id)
     if all_done:
         _maybe_start_assembly(job_id)
@@ -2870,6 +2959,8 @@ def upload_result():
 
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         shutil.move(temp_path, save_path)
+        # A whole-file encode landed, so the source was readable.
+        _note_source_ok()
 
         with db_lock:
             conn = db_handler.get_connection()
@@ -3178,6 +3269,7 @@ def report_status():
         err_msg = d.get('error', 'Unknown Error')
         log_event("WARN", f"Worker {worker_id} (v{worker_version}) reported failure: {err_msg}", d.get('job_id'))
 
+    _source_unreadable = False
     with db_lock:
         conn = db_handler.get_connection()
         try:
@@ -3197,7 +3289,17 @@ def report_status():
                 sql = f"UPDATE jobs SET status=?, progress=?, last_updated=?, duration=? {base_where}"
                 params.insert(3, d.get('duration'))
             conn.execute(sql, tuple(params))
-            if status == 'failed':
+            # Workers post the reason as "error" (not "error_msg"); accept
+            # both so an older or hand-rolled client is classified too.
+            if status == 'failed' and _is_source_failure(d.get('error') or d.get('error_msg')):
+                # No fault of the job's: straight back to the queue, fail_count
+                # untouched, so an outage cannot march it to permanently_failed.
+                conn.execute("UPDATE jobs SET status='queued', progress=0, worker_id=NULL, "
+                             "started_at=NULL, last_updated=? "
+                             "WHERE id=? AND COALESCE(chunked, 0)=0 AND worker_id=?",
+                             (datetime.now(), job_id_val, worker_id))
+                _source_unreadable = True
+            elif status == 'failed':
                 # Only count the failure if this worker actually owned the job
                 # (the UPDATE above changed the row). Re-read to confirm.
                 conn.execute("UPDATE jobs SET fail_count = COALESCE(fail_count, 0) + 1 "
@@ -3207,6 +3309,8 @@ def report_status():
             conn.commit()
         finally:
             conn.close()
+    if _source_unreadable:
+        _note_source_failure()
     return jsonify({"status": "received"})
 
 @app.route('/api/stats')
