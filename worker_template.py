@@ -113,10 +113,13 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.8.0"
+WORKER_VERSION = "3.9.0"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
+# Set whenever the encoders are killed (Stop, a signal, a forced update). With
+# SHUTDOWN_EVENT alone the worker is draining: active work is allowed to finish.
+ABORT_EVENT = threading.Event()
 UPDATE_AVAILABLE = False
 LAST_UPDATE_CHECK = 0
 CHECK_LOCK = threading.Lock()
@@ -899,6 +902,7 @@ def toggle_processes(suspend=True):
                 except: pass
 
 def kill_processes():
+    ABORT_EVENT.set()
     with PROC_LOCK:
         for wid, proc in ACTIVE_PROCS.items():
             try:
@@ -1149,6 +1153,60 @@ _AVERROR_LOW_BYTE = {
     152: "Connection reset by peer",
     146: "Connection timed out",
 }
+
+# A finished encode is hours of work. Three quick attempts used to be all it
+# got, so a manager restart or a wedged manager threw the result away. Keep
+# trying for roughly twenty minutes before giving up.
+_UPLOAD_RETRY_DELAYS = (10, 30, 60, 120, 300, 300, 300)
+
+def _upload_with_retry(url, open_file, upload_name, data, worker_id, what, keepalive=None):
+    """POST a finished encode to the manager, retrying while it is unreachable.
+
+    Returns (outcome, detail). outcome is 'ok', 'final' (the manager answered
+    and has already settled the matter: do not report a failure on top), or
+    'failed'. open_file() must return a context manager yielding a file object.
+    keepalive(), when given, is called about every 30s while waiting so the
+    manager does not hand the work to someone else in the meantime.
+    """
+    total = len(_UPLOAD_RETRY_DELAYS) + 1
+    last = "no attempt made"
+    for attempt in range(total):
+        if attempt > 0:
+            # A draining or stopping worker delivers once, without retries, so
+            # a dead network cannot hold up the exit for twenty minutes.
+            if SHUTDOWN_EVENT.is_set(): break
+            delay = _UPLOAD_RETRY_DELAYS[attempt - 1]
+            log(worker_id, f"{what} upload failed ({last}). Retrying in {delay}s "
+                           f"(attempt {attempt + 1}/{total})...", "WARN")
+            waited = 0
+            while waited < delay and not SHUTDOWN_EVENT.is_set():
+                time.sleep(1); waited += 1
+                if keepalive and waited % 30 == 0:
+                    try: keepalive()
+                    except Exception: pass
+            if SHUTDOWN_EVENT.is_set(): break
+        try:
+            with open_file() as f:
+                r = requests.post(url, files={'file': (upload_name, f)}, data=data,
+                                  headers=get_auth_headers(), timeout=300)
+        except Exception as e:
+            last = str(e)[:200] or e.__class__.__name__
+            continue
+        if r.status_code == 200:
+            return 'ok', ''
+        if r.status_code in (400, 404, 409):
+            # 409: reassigned/reset while we encoded. 400: failed the manager's
+            # verification, which it has already recorded. 404: job is gone.
+            msg = ''
+            try: msg = str(r.json().get('message', ''))
+            except Exception: pass
+            return 'final', f"HTTP {r.status_code} {msg}".strip()
+        if r.status_code in (401, 403, 413):
+            # Retrying cannot change these.
+            hint = " (file exceeds the manager proxy's upload size limit)" if r.status_code == 413 else ""
+            return 'failed', f"HTTP {r.status_code}{hint}"
+        last = f"HTTP {r.status_code}"
+    return 'failed', last
 
 def _ffmpeg_rc_text(rc):
     """Human-readable form of an ffmpeg exit status.
@@ -2441,43 +2499,21 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                 d["jobs_failed"] = d.get("jobs_failed", 0) + 1
             return
 
-        # ---- Upload (3 attempts) ----
+        # ---- Upload ----
         chunk_bytes = os.path.getsize(out_path)
         log(worker_id, f"Chunk done ({chunk_bytes/1024/1024:.2f} MB). Uploading...")
         update_status("Up 0%")
-        upload_ok = False
-        upload_final = False  # 409/400: manager already resolved this chunk, don't re-report
-        for up_attempt in range(3):
-            # Graceful drain ("Finish") must still deliver a finished encode —
-            # only the RETRIES are skipped on shutdown, so a dead network can't
-            # stall the exit for minutes.
-            if SHUTDOWN_EVENT.is_set() and up_attempt > 0: break
-            try:
-                with open(out_path, 'rb') as f:
-                    r = requests.post(f"{manager_url}/upload_chunk",
-                                      files={'file': (f"chunk_{kind}_{idx}.mp4", f)},
-                                      data={'job_id': job_id, 'chunk_index': idx,
-                                            'kind': kind, 'worker_id': worker_id,
-                                            'wallet': wallet or ''},
-                                      headers=get_auth_headers(), timeout=300)
-                if r.status_code == 200:
-                    upload_ok = True; break
-                elif r.status_code == 409:
-                    # Job was reassigned/reset while we encoded — drop it quietly
-                    log(worker_id, f"Chunk no longer needed by manager ({chunk_tag}).", "WARN")
-                    upload_final = True; break
-                elif r.status_code == 400:
-                    # Failed manager-side verification; failure already registered there
-                    _msg = ""
-                    try: _msg = r.json().get('message', '')
-                    except: pass
-                    log(worker_id, f"Chunk rejected by manager: {_msg}", "WARN")
-                    upload_final = True; break
-                else:
-                    log(worker_id, f"Chunk upload rejected: {r.status_code}", "WARN")
-            except Exception as e:
-                log(worker_id, f"Chunk upload attempt {up_attempt+1} failed: {e}", "WARN")
-                time.sleep(10)
+        _up_outcome, _up_detail = _upload_with_retry(
+            f"{manager_url}/upload_chunk", lambda: open(out_path, 'rb'),
+            f"chunk_{kind}_{idx}.mp4",
+            {'job_id': job_id, 'chunk_index': idx, 'kind': kind,
+             'worker_id': worker_id, 'wallet': wallet or ''},
+            worker_id, f"Chunk ({chunk_tag})",
+            keepalive=lambda: report_chunk("processing", 100))
+        upload_ok = (_up_outcome == 'ok')
+        upload_final = (_up_outcome == 'final')  # manager already resolved this chunk, don't re-report
+        if upload_final:
+            log(worker_id, f"Chunk not accepted by manager ({chunk_tag}): {_up_detail}", "WARN")
 
         if upload_ok:
             log(worker_id, f"Chunk complete ({chunk_tag}).")
@@ -2491,7 +2527,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
         elif SHUTDOWN_EVENT.is_set():
             report_chunk("abandoned")
         elif not upload_final:
-            err_msg = "Chunk upload failed after 3 attempts"
+            err_msg = f"Chunk upload failed: {_up_detail}"
             log(worker_id, err_msg, "ERROR")
             report_chunk("failed", error_msg=err_msg)
             d = WORKER_DETAILS.get(worker_id)
@@ -2644,6 +2680,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                 _r_merged = _r_partial + '.merged.mp4'
                 _r_tmps   = [_r_p1, _r_p2, _r_clist, _r_merged]
                 _resume_ok = False
+                _r_fail_reason = "unknown"
                 try:
                     if _r_total_sec > 0 and _r_partial_dur >= _r_total_sec - 20.0:
                         # The checkpoint already holds the whole film bar its
@@ -2747,8 +2784,13 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                     # Concatenate part1 + part2 into the final merged file
                     log(worker_id, "Concatenating resume parts...")
                     with open(_r_clist, 'w', encoding='utf-8') as _cf:
-                        _cf.write(f"file '{_r_p1.replace(os.sep, '/')}'\n")
-                        _cf.write(f"file '{_r_p2.replace(os.sep, '/')}'\n")
+                        # ABSOLUTE paths: the concat demuxer resolves a relative
+                        # entry against the list file's own folder, and the temp
+                        # dir is itself relative ("./temp_encode_..."), so every
+                        # resume used to fail right here with "No such file".
+                        for _cp in (_r_p1, _r_p2):
+                            _cp_abs = os.path.abspath(_cp).replace(os.sep, '/').replace("'", "'\\''")
+                            _cf.write(f"file '{_cp_abs}'\n")
                     _r_cat_rc = subprocess.run(
                         [FFMPEG_CMD, '-y', '-f', 'concat', '-safe', '0',
                          '-i', _r_clist, '-c', 'copy', '-movflags', '+faststart', _r_merged],
@@ -2764,6 +2806,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                     pass
                 except Exception as _r_err:
                     log(worker_id, f"Resume failed for {_r_job_id}: {_r_err}. Discarding.", "ERROR")
+                    _r_fail_reason = str(_r_err)[:300]
                 finally:
                     for _fp in _r_tmps:
                         try:
@@ -2775,6 +2818,10 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                         try:
                             if os.path.exists(_fp): os.remove(_fp)
                         except: pass
+                    # Hand the job back now. Saying nothing left it assigned to
+                    # this worker, untouched, until the manager's 6h reclaim.
+                    post_status("failed", error_msg=f"Resume failed: {_r_fail_reason}")
+                    job_id = None
                     continue
 
                 # Upload the resumed, fully merged file
@@ -2782,27 +2829,14 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                 log(worker_id, f"Resume complete ({_r_file_bytes/1024/1024:.2f} MB). Uploading...")
                 post_status("uploading", 0)
                 update_status("Up 0%")
-                _r_up_ok = False
-                for _r_up_att in range(3):
-                    # A merged resume file is finished work — deliver it even
-                    # during a graceful drain (only retries are skipped), since
-                    # the cleanup below deletes it either way.
-                    if SHUTDOWN_EVENT.is_set() and _r_up_att > 0: break
-                    try:
-                        with open(_r_partial, 'rb') as _r_f:
-                            _r_resp = requests.post(
-                                f"{manager_url}/upload_result",
-                                files={'file': (_r_job_id, _r_f)},
-                                data={'job_id': _r_job_id, 'worker_id': worker_id,
-                                      'duration': _r_total_min, 'wallet': wallet or ''},
-                                headers=get_auth_headers(), timeout=300)
-                            if _r_resp.status_code == 200:
-                                _r_up_ok = True; break
-                            else:
-                                log(worker_id, f"Resume upload rejected: {_r_resp.status_code}", "WARN")
-                    except Exception as _r_ue:
-                        log(worker_id, f"Resume upload attempt {_r_up_att+1} failed: {_r_ue}", "WARN")
-                        time.sleep(10)
+                _r_outcome, _r_detail = _upload_with_retry(
+                    f"{manager_url}/upload_result", lambda: open(_r_partial, 'rb'),
+                    _r_job_id,
+                    {'job_id': _r_job_id, 'worker_id': worker_id,
+                     'duration': _r_total_min, 'wallet': wallet or ''},
+                    worker_id, "Resumed job",
+                    keepalive=lambda: post_status("uploading", 100))
+                _r_up_ok = (_r_outcome == 'ok')
 
                 if _r_up_ok:
                     log(worker_id, f"Resumed job {_r_job_id} complete.")
@@ -2813,9 +2847,12 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                     with STATS_LOCK:
                         SESSION_STATS["jobs_done"] += 1
                         SESSION_STATS["bytes_uploaded"] += _r_file_bytes
+                elif _r_outcome == 'final':
+                    # The manager answered and has settled the job itself.
+                    log(worker_id, f"Resumed job {_r_job_id} not accepted by manager: {_r_detail}", "WARN")
                 else:
-                    log(worker_id, f"Resume upload failed for {_r_job_id}.", "ERROR")
-                    post_status("failed", error_msg="Resume upload failed after 3 attempts")
+                    log(worker_id, f"Resume upload failed for {_r_job_id}: {_r_detail}", "ERROR")
+                    post_status("failed", error_msg=f"Resume upload failed: {_r_detail}")
 
                 # Always clean up the checkpoint and partial file after an upload attempt
                 for _fp in [_r_chk_path, _r_partial]:
@@ -2827,6 +2864,10 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                 # against it (same guarantee as the per-iteration reset above).
                 job_id = None
             # ========================================================
+
+            # Shutdown arrived during a resume: do not go on to claim new work
+            # only to abort it a moment later.
+            if SHUTDOWN_EVENT.is_set(): break
 
             if check_version(manager_url):
                 UPDATE_AVAILABLE = True; SHUTDOWN_EVENT.set(); break
@@ -2943,6 +2984,10 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                             head_r = requests.head(dl_url, headers=get_auth_headers(), timeout=10)
                             src_size = int(head_r.headers.get('content-length', 0))
                         if quota_tracker.check_cap():
+                            # Another thread used up the quota after this job
+                            # was claimed: give it back before sleeping on it.
+                            post_status("failed", error_msg="Aborted: daily quota reached")
+                            job_id = None
                             wait_sec = quota_tracker.get_wait_time()
                             update_status("Quota Limit")
                             log(worker_id, f"Daily Quota Reached. Reset in {wait_sec/3600:.1f} hours.")
@@ -3396,6 +3441,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
 
                 if single_mode: print_progress(worker_id, total_sec, total_sec, prefix='Enc', suffix='OK')
 
+                _keep_partial = False
                 if proc and (proc.returncode == 0 or _wf_stall_salvaged) and os.path.exists(local_dst):
                     final_size_bytes = os.path.getsize(local_dst)
                     final_size = final_size_bytes / 1024 / 1024
@@ -3429,41 +3475,16 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
 
                     def upload_cb(pct): post_status("uploading", pct)
 
-                    # RETRY LOOP for Uploads
-                    upload_success = False
-                    upload_final = False  # 409/400: manager already resolved the job — don't re-send or re-report
-                    for up_attempt in range(3):
-                        try:
-                            with ProgressFileReader(local_dst, upload_cb) as f:
-                                # Timeout = 300s (5 minutes) for socket silence
-                                r = requests.post(f"{manager_url}/upload_result",
-                                              files={'file': (job_id, f)},
-                                              data={'job_id': job_id, 'worker_id': worker_id, 'duration': total_min, 'wallet': wallet or ''},
-                                              headers=get_auth_headers(),
-                                              timeout=300)
-                                if r.status_code == 200:
-                                    upload_success = True
-                                    break
-                                elif r.status_code == 409:
-                                    # Job was reset/chunked/completed elsewhere while we
-                                    # encoded — the manager no longer wants this file.
-                                    log(worker_id, "Job no longer accepts a whole-file upload (reassigned). Dropping.", "WARN")
-                                    upload_final = True; break
-                                elif r.status_code == 400:
-                                    # Failed manager-side verification; the manager has
-                                    # already registered the failure. Re-sending the
-                                    # same file twice more can't change the verdict.
-                                    _msg = ""
-                                    try: _msg = r.json().get('message', '')
-                                    except: pass
-                                    log(worker_id, f"Upload rejected by manager: {_msg}", "WARN")
-                                    upload_final = True; break
-                                else:
-                                    log(worker_id, f"Upload rejected by server: {r.status_code}", "WARN")
-                                    time.sleep(10)
-                        except Exception as e:
-                            log(worker_id, f"Upload attempt {up_attempt+1} failed/timed out: {e}", "WARN")
-                            time.sleep(10) # Wait 10s before retry
+                    _up_outcome, _up_detail = _upload_with_retry(
+                        f"{manager_url}/upload_result",
+                        lambda: ProgressFileReader(local_dst, upload_cb), job_id,
+                        {'job_id': job_id, 'worker_id': worker_id, 'duration': total_min, 'wallet': wallet or ''},
+                        worker_id, "Job",
+                        keepalive=lambda: post_status("uploading", 100))
+                    upload_success = (_up_outcome == 'ok')
+                    upload_final = (_up_outcome == 'final')  # manager already resolved the job — don't re-report
+                    if upload_final:
+                        log(worker_id, f"Upload not accepted by manager: {_up_detail}", "WARN")
 
                     if upload_success:
                         if single_mode: print_progress(worker_id, 100, 100, prefix='Up', suffix='OK')
@@ -3492,7 +3513,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                         if d is not None:
                             d["phase"] = "Failed"
                             d["jobs_failed"] = d.get("jobs_failed", 0) + 1
-                        err_msg = "Upload failed after 3 attempts"
+                        err_msg = f"Upload failed: {_up_detail}"
                         log(worker_id, err_msg, "ERROR")
                         post_status("failed", error_msg=err_msg)
                         upload_encode_log()
@@ -3520,8 +3541,21 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                     if not SHUTDOWN_EVENT.is_set():
                         report_error(job_id, "encode_failure", err_msg, _error_tail(log_buffer))
                     upload_encode_log()
+                    # Stopped mid-encode: leave the partial file and its
+                    # checkpoint so the next start resumes instead of starting
+                    # over. (Deleting it here defeated resume on every clean
+                    # stop; only a crash or power cut ever resumed.)
+                    try:
+                        _keep_partial = (SHUTDOWN_EVENT.is_set() and os.path.exists(local_dst)
+                                         and os.path.getsize(local_dst) > 0)
+                    except OSError:
+                        _keep_partial = False
 
-                if os.path.exists(local_dst): os.remove(local_dst)
+                if not _keep_partial:
+                    try:
+                        if os.path.exists(_chk_path): os.remove(_chk_path)
+                    except OSError: pass
+                if os.path.exists(local_dst) and not _keep_partial: os.remove(local_dst)
                 if os.path.exists(raw_log_path): os.remove(raw_log_path)
                 if os.path.exists(gz_log_path): os.remove(gz_log_path)
             else:
@@ -3541,6 +3575,15 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                     report_error(job_id, "exception", err_str, err_tb)
             except: pass
             time.sleep(10)
+
+def _grace_join(threads, seconds):
+    """Give worker threads a few seconds to tell the manager they stopped."""
+    deadline = time.time() + seconds
+    for t in threads:
+        left = deadline - time.time()
+        if left <= 0: break
+        try: t.join(timeout=left)
+        except Exception: pass
 
 def run_worker(args):
     print("==================================================")
@@ -3772,7 +3815,12 @@ def run_worker(args):
                 for t in threads:
                     if t.is_alive(): all_dead = False; break
                 if all_dead: break
-                if SHUTDOWN_EVENT.is_set() and not PAUSE_REQUESTED: break
+                # Draining ("Finish", or an update) waits for the active work,
+                # as the TUI does. Only an abort leaves early, after a moment
+                # for the threads to hand their work back to the manager.
+                if SHUTDOWN_EVENT.is_set() and ABORT_EVENT.is_set():
+                    _grace_join(threads, 8)
+                    break
                 time.sleep(0.5)
                 continue
 
@@ -3824,9 +3872,10 @@ def run_worker(args):
                     elif choice == 's':
                         print("[*] Aborting...")
                         toggle_processes(suspend=False)
-                        kill_processes()
                         SHUTDOWN_EVENT.set()
+                        kill_processes()
                         PAUSE_REQUESTED = False
+                        _grace_join(threads, 8)
                         if _input_src:
                             try: _input_src.close()
                             except: pass
@@ -3835,9 +3884,10 @@ def run_worker(args):
                     # Second Ctrl+C while paused = force stop
                     print("\n[*] Force abort.")
                     toggle_processes(suspend=False)
-                    kill_processes()
                     SHUTDOWN_EVENT.set()
+                    kill_processes()
                     PAUSE_REQUESTED = False
+                    _grace_join(threads, 8)
                     if _input_src:
                         try: _input_src.close()
                         except: pass
@@ -3846,9 +3896,10 @@ def run_worker(args):
                     # stdin fully exhausted and /dev/tty unavailable — can't prompt
                     print("\n[!] No input available — aborting.")
                     toggle_processes(suspend=False)
-                    kill_processes()
                     SHUTDOWN_EVENT.set()
+                    kill_processes()
                     PAUSE_REQUESTED = False
+                    _grace_join(threads, 8)
                     sys.exit(0)
                 except Exception:
                     time.sleep(0.5)

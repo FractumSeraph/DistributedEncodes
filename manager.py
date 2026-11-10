@@ -1263,6 +1263,13 @@ def _is_source_failure(reason):
     low = (reason or '').lower()
     return any(m in low for m in _SOURCE_DOWN_MARKERS)
 
+def _is_worker_abort(reason):
+    """A worker giving a whole-file job back through no fault of the job's:
+    it was stopped, restarted for an update, hit its quota, or could not
+    resume a partial encode. These must not count toward permanently_failed."""
+    low = (reason or '').strip().lower()
+    return low.startswith('aborted') or low.startswith('resume failed')
+
 def _note_source_failure():
     """Record a source-read failure; open the breaker once they cluster."""
     global _source_outage_until
@@ -3183,6 +3190,7 @@ def upload_result():
         # this closes the same gap for whole-file uploads.)
         if is_valid and verified_dur > 0:
             src_dur = _get_or_probe_source_duration(job_id, _src_type, _src_url, _src_dur)
+            _src_dur = src_dur or _src_dur   # the credit cap below uses it
             if src_dur and src_dur > 0:
                 # Generous tolerance (5% + 10s floor) so encoder rounding / a
                 # dropped final frame never false-rejects a good encode; it only
@@ -3236,7 +3244,13 @@ def upload_result():
                 # would be a double payout).
                 _completed_now = (c.rowcount == 1)
                 if _completed_now and prev is not None and prev[0] != 'completed':
-                    _record_earning(conn, wallet, worker_id, job_id, 'full', None, verified_dur / 60.0)
+                    # Never credit more than the source is long: the length
+                    # check above only rejects files that are too SHORT, so a
+                    # padded upload would otherwise be paid for its padding.
+                    _credit_sec = verified_dur
+                    if _src_dur and _src_dur > 0:
+                        _credit_sec = min(verified_dur, float(_src_dur))
+                    _record_earning(conn, wallet, worker_id, job_id, 'full', None, _credit_sec / 60.0)
                 conn.commit()
             finally:
                 conn.close()
@@ -3546,14 +3560,18 @@ def report_status():
             conn.execute(sql, tuple(params))
             # Workers post the reason as "error" (not "error_msg"); accept
             # both so an older or hand-rolled client is classified too.
-            if status == 'failed' and _is_source_failure(d.get('error') or d.get('error_msg')):
+            _fail_reason = (d.get('error') or d.get('error_msg')) if status == 'failed' else None
+            if status == 'failed' and (_is_source_failure(_fail_reason) or _is_worker_abort(_fail_reason)):
                 # No fault of the job's: straight back to the queue, fail_count
-                # untouched, so an outage cannot march it to permanently_failed.
+                # untouched, so an outage (or a worker that was simply stopped
+                # or updated mid-encode) cannot march it to permanently_failed.
+                # status='failed' in the guard: only the row this worker just
+                # failed above, never a job that is already completed.
                 conn.execute("UPDATE jobs SET status='queued', progress=0, worker_id=NULL, "
                              "started_at=NULL, last_updated=? "
-                             "WHERE id=? AND COALESCE(chunked, 0)=0 AND worker_id=?",
+                             "WHERE id=? AND COALESCE(chunked, 0)=0 AND worker_id=? AND status='failed'",
                              (datetime.now(), job_id_val, worker_id))
-                _source_unreadable = True
+                _source_unreadable = _is_source_failure(_fail_reason)
             elif status == 'failed':
                 # Only count the failure if this worker actually owned the job
                 # (the UPDATE above changed the row). Re-read to confirm.
@@ -3828,10 +3846,14 @@ def api_payouts_mark_paid():
     Idempotent: rows already paid update nothing, and a pure retry (updated=0)
     writes no history row, so daemon retries after a lost response converge."""
     data = request.json or {}
+    if not isinstance(data, dict):
+        return jsonify({"status": "error", "message": "JSON object required"}), 400
     txid = sanitize_txid(data.get('txid'))
     try:
         rate = float(data.get('rate_frct_per_min') or 0)
     except (TypeError, ValueError):
+        rate = 0
+    if not math.isfinite(rate):
         rate = 0
     entries = data.get('payouts')
     if not isinstance(entries, list) or not entries:
@@ -3846,15 +3868,19 @@ def api_payouts_mark_paid():
     clean = []
     total_ids = 0
     for entry in entries:
-        wallet = sanitize_wallet((entry or {}).get('wallet'))
-        ids = (entry or {}).get('earning_ids')
+        if not isinstance(entry, dict):
+            return jsonify({"status": "error", "message": "each payout must be an object"}), 400
+        wallet = sanitize_wallet(entry.get('wallet'))
+        ids = entry.get('earning_ids')
         if not wallet or not isinstance(ids, list) or not ids:
             return jsonify({"status": "error", "message": "each payout needs wallet and earning_ids"}), 400
         norm_ids = []
         for i in ids:
             # bool is an int subclass — reject it explicitly, and reject floats
             # so a daemon bug can't settle the wrong rows via silent int().
-            if isinstance(i, bool) or not isinstance(i, int):
+            # Range: SQLite integers are 64-bit; a larger id raised inside
+            # the transaction and rolled back a batch already broadcast.
+            if isinstance(i, bool) or not isinstance(i, int) or not (0 < i < 2**63):
                 return jsonify({"status": "error", "message": "earning_ids must be integers"}), 400
             norm_ids.append(i)
         total_ids += len(norm_ids)
@@ -3863,7 +3889,9 @@ def api_payouts_mark_paid():
         try:
             minutes = round(float(entry.get('minutes') or 0), 3)
             frct = round(float(entry.get('frct') or 0), 8)
-        except (TypeError, ValueError):
+            if not (math.isfinite(minutes) and math.isfinite(frct)):
+                minutes, frct = 0, 0
+        except (TypeError, ValueError, OverflowError):
             minutes, frct = 0, 0
         clean.append({"wallet": wallet, "ids": norm_ids, "minutes": minutes,
                       "frct": frct, "mode": sanitize_input(entry.get('mode')) or 'auto'})
@@ -3924,6 +3952,8 @@ def api_payouts_approve():
     Covered by the csrf_protect origin check (Basic-auth browsers auto-send
     credentials)."""
     data = request.json or {}
+    if not isinstance(data, dict):
+        return jsonify({"status": "error", "message": "JSON object required"}), 400
     wallet = sanitize_wallet(data.get('wallet'))
     if not wallet:
         return jsonify({"status": "error", "message": "wallet required"}), 400
@@ -3948,6 +3978,8 @@ def api_payouts_report():
     """Daemon telemetry: heartbeat JSON plus per-wallet address problems, so
     dry-run state, treasury balance, and invalid addresses show in the UI."""
     data = request.json or {}
+    if not isinstance(data, dict):
+        return jsonify({"status": "error", "message": "JSON object required"}), 400
     heartbeat = data.get('heartbeat')
     statuses = data.get('wallet_status')
     if not isinstance(statuses, list):
@@ -3965,7 +3997,9 @@ def api_payouts_report():
                 c.execute("INSERT OR REPLACE INTO payout_meta (key, value) VALUES ('daemon_heartbeat', ?)",
                           (json.dumps(heartbeat),))
             for s in statuses:
-                wallet = sanitize_wallet((s or {}).get('wallet'))
+                if not isinstance(s, dict):
+                    continue
+                wallet = sanitize_wallet(s.get('wallet'))
                 if not wallet:
                     continue
                 status = sanitize_input(s.get('status')) or 'ok'

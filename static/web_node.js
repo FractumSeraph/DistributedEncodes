@@ -245,7 +245,14 @@ async function processJob(job) {
         postMessage({type: 'log', level: 'sys', msg: "Downloading source (via manager)..."});
         const mediaUrl = '/download_media?job_id=' + encodeURIComponent(job.id);
         const resp = await fetch(mediaUrl, { headers: job.token ? { 'X-Worker-Token': job.token } : {} });
-        if (!resp.ok) throw new Error("Download failed: " + resp.status);
+        if (!resp.ok) {
+            // Worded so the manager recognises a source outage (no strike
+            // against the job) rather than a failed encode.
+            if (resp.status >= 500 || resp.status === 429) {
+                throw new Error("Could not read the source (HTTP error " + resp.status + ")");
+            }
+            throw new Error("Download failed: " + resp.status);
+        }
         
         const buf = await resp.arrayBuffer();
         const data = new Uint8Array(buf);
@@ -355,6 +362,12 @@ async function processJob(job) {
         // Sent as a header so it isn't logged in the URL.
         const upHeaders = job.token ? { 'X-Worker-Token': job.token } : {};
         const up = await fetch('/upload_result', { method: 'POST', body: formData, headers: upHeaders });
+        if (up.status === 400 || up.status === 409) {
+            let why = "HTTP " + up.status;
+            try { const j = await up.json(); if (j && j.message) why += " " + j.message; } catch (e) {}
+            postMessage({type: 'upload_rejected', msg: why});
+            return;
+        }
         if (!up.ok) throw new Error("Upload failed: " + up.status + " " + up.statusText);
         
         postMessage({type: 'done'});
