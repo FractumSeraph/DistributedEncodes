@@ -7,3 +7,4 @@ encode_logs/
 *.db
 *.db-wal
 *.db-shm
+wedge_dumps/
