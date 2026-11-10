@@ -156,6 +156,20 @@ except ImportError:
     print("[!] Critical Error: config.py not found.")
     exit(1)
 
+# The admin panel can change REMOTE_SOURCE_URL at runtime. That used to live
+# only in memory, so every restart (now automatic) silently reverted it.
+_RUNTIME_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'runtime_config.json')
+try:
+    with open(_RUNTIME_CONFIG_FILE) as _f:
+        _rc = json.load(_f)
+    if isinstance(_rc, dict) and 'REMOTE_SOURCE_URL' in _rc:
+        REMOTE_SOURCE_URL = _rc['REMOTE_SOURCE_URL'] or None
+        print(f"[*] REMOTE_SOURCE_URL overridden by runtime_config.json: {REMOTE_SOURCE_URL}")
+except FileNotFoundError:
+    pass
+except Exception as _e:
+    print(f"[!] Could not read runtime_config.json: {_e}")
+
 # Sanity clamp: chunks shorter than 60s waste more overhead than they parallelize
 try:
     CHUNK_DURATION_SEC = max(60, int(CHUNK_DURATION_SEC))
@@ -4106,6 +4120,24 @@ def admin_action():
         return jsonify({"status": "ok", "requeued": purged})
     return jsonify({"status": "ok"})
 
+@app.route('/api/wedge_dumps')
+@requires_auth
+def api_wedge_dumps():
+    """List the watchdog's thread dumps, or return one with ?name=."""
+    name = request.args.get('name')
+    if name:
+        if not re.fullmatch(r'wedge-\d{8}-\d{6}\.txt', name):
+            return abort(400)
+        path = os.path.join(WEDGE_DUMP_DIR, name)
+        if not os.path.isfile(path):
+            return abort(404)
+        return send_file(path, mimetype='text/plain')
+    try:
+        names = sorted((n for n in os.listdir(WEDGE_DUMP_DIR) if n.startswith('wedge-')), reverse=True)
+    except OSError:
+        names = []
+    return jsonify({"dumps": [{"name": n, "size": os.path.getsize(os.path.join(WEDGE_DUMP_DIR, n))} for n in names]})
+
 @app.route('/api/get_config')
 @requires_auth
 def get_config():
@@ -4122,6 +4154,13 @@ def update_config():
         new_url = str(data['REMOTE_SOURCE_URL'] or '').strip()
         if not new_url: new_url = None
         REMOTE_SOURCE_URL = new_url
+        try:
+            _tmp = _RUNTIME_CONFIG_FILE + '.tmp'
+            with open(_tmp, 'w') as f:
+                json.dump({"REMOTE_SOURCE_URL": REMOTE_SOURCE_URL}, f)
+            os.replace(_tmp, _RUNTIME_CONFIG_FILE)
+        except OSError as e:
+            log_event("WARN", f"Could not persist Remote Source URL: {e}")
         log_event("WARN", f"Admin updated Remote Source URL to: {REMOTE_SOURCE_URL}")
     return jsonify({"status": "ok", "new_value": REMOTE_SOURCE_URL})
 
@@ -4160,6 +4199,57 @@ def sweep_quarantine():
     if count > 0:
         print(f"[*] Temp sweep: removed {count} stale file(s).")
 
+# A worker can keep heartbeating a job it is no longer advancing (ffmpeg stuck
+# in a reconnect loop near end-of-file, a hung thread). The stale sweeps only
+# look at last contact, so such a job was held indefinitely: in September one
+# chunk sat at 98% for 28 hours and a whole file at 0% for 51. Track when each
+# in-flight item's percentage last CHANGED and reclaim it when that is too old.
+# Kept in memory: a manager restart just restarts the clocks.
+CHUNK_NO_PROGRESS_SEC = 90 * 60        # a 5-minute chunk moves 1% every few minutes even on a Pi
+WHOLEFILE_NO_PROGRESS_SEC = 6 * 3600   # 1% of a long film can take hours on a slow node
+_PROGRESS_SEEN = {}                    # key -> (progress, worker_id, since)
+
+def _no_progress_keys(rows, limit_sec, now_ts):
+    """rows: (key, progress, worker_id). Returns the keys stuck past limit_sec
+    and refreshes the tracker for the rest."""
+    stuck = []
+    for key, progress, worker in rows:
+        seen = _PROGRESS_SEEN.get(key)
+        if seen is None or seen[0] != progress or seen[1] != worker:
+            _PROGRESS_SEEN[key] = (progress, worker, now_ts)
+        elif now_ts - seen[2] > limit_sec:
+            stuck.append(key)
+    return stuck
+
+def _reclaim_stuck_work(cursor, now, logs):
+    now_ts = time.time()
+    live = set()
+    cursor.execute("SELECT job_id, kind, chunk_index, COALESCE(progress,0), worker_id FROM chunks WHERE status='processing'")
+    rows = [(('c', r[0], r[1], r[2]), r[3], r[4]) for r in cursor.fetchall()]
+    live.update(k for k, _, _ in rows)
+    for key in _no_progress_keys(rows, CHUNK_NO_PROGRESS_SEC, now_ts):
+        _, job_id, kind, idx = key
+        seen = _PROGRESS_SEEN.pop(key)
+        cursor.execute("UPDATE chunks SET status='pending', worker_id=NULL, progress=0, last_updated=? "
+                       "WHERE job_id=? AND kind=? AND chunk_index=? AND status='processing'", (now, job_id, kind, idx))
+        logs.append(("WARN", f"Chunk {kind}#{idx} made no progress for {CHUNK_NO_PROGRESS_SEC // 60} min "
+                             f"(stuck at {seen[0]}% on {seen[1]}) — returned to the pool.", job_id))
+    # Whole files: only 'processing' (a paused worker is idle on purpose), and
+    # not at 100% (encode finished; the upload has its own timeout).
+    cursor.execute("SELECT id, COALESCE(progress,0), worker_id FROM jobs WHERE status='processing' "
+                   "AND COALESCE(chunked,0)=0 AND worker_id IS NOT NULL AND worker_id NOT LIKE '(%' "
+                   "AND COALESCE(progress,0) < 100")
+    rows = [(('j', r[0]), r[1], r[2]) for r in cursor.fetchall()]
+    live.update(k for k, _, _ in rows)
+    for key in _no_progress_keys(rows, WHOLEFILE_NO_PROGRESS_SEC, now_ts):
+        seen = _PROGRESS_SEEN.pop(key)
+        cursor.execute("UPDATE jobs SET status='queued', progress=0, worker_id=NULL, started_at=NULL, last_updated=? "
+                       "WHERE id=? AND status='processing' AND COALESCE(chunked,0)=0", (now, key[1]))
+        logs.append(("WARN", f"No progress for {WHOLEFILE_NO_PROGRESS_SEC // 3600}h (stuck at {seen[0]}% on "
+                             f"{seen[1]}) — returned to the queue.", key[1]))
+    for key in [k for k in _PROGRESS_SEEN if k not in live]:
+        _PROGRESS_SEEN.pop(key, None)
+
 def maintenance_loop():
     while True:
         try:
@@ -4195,6 +4285,8 @@ def maintenance_loop():
                     cursor.execute("UPDATE chunks SET status='pending', worker_id=NULL, progress=0, last_updated=? WHERE status='processing' AND last_updated < ?", (now, chunk_cutoff))
                     if cursor.rowcount > 0:
                         logs_to_write.append(("WARN", f"Reset {cursor.rowcount} stale chunk(s) to pending.", None))
+
+                    _reclaim_stuck_work(cursor, now, logs_to_write)
 
                     # Chunked jobs with every chunk completed but no final file yet
                     # (e.g. the manager restarted mid-assembly) — re-trigger assembly
