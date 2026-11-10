@@ -8,3 +8,4 @@ encode_logs/
 *.db-wal
 *.db-shm
 wedge_dumps/
+runtime_config.json
