@@ -171,8 +171,18 @@
                 if(type === 'err') colorClass = 'log-err';
                 if(type === 'succ') colorClass = 'log-succ';
                 
-                const span = `<span class="log-time">[${time}]</span> <span class="${colorClass}">${msg}</span>`;
-                box.innerHTML += span + "\n";
+                // Text nodes, not innerHTML: filenames and ffmpeg output are
+                // not markup, and re-parsing the whole log on every line made
+                // long sessions crawl. Capped so the DOM cannot grow forever.
+                const line = document.createElement('div');
+                const t = document.createElement('span');
+                t.className = 'log-time'; t.textContent = `[${time}] `;
+                const m = document.createElement('span');
+                if (colorClass) m.className = colorClass;
+                m.textContent = String(msg);
+                line.appendChild(t); line.appendChild(m);
+                box.appendChild(line);
+                while (box.childNodes.length > 500) box.removeChild(box.firstChild);
                 box.scrollTop = box.scrollHeight;
             }
             console.log(msg);
@@ -238,7 +248,7 @@
     let currentChunk = null;   // {job_id, chunk_index} of an in-flight chunk, for release + heartbeat
 
     // Must be >= manager MIN_CLIENT_VERSION or /get_job returns "Update Required".
-    const WEB_WORKER_VERSION = "3.4.1";
+    const WEB_WORKER_VERSION = "3.4.2";
 
     // Worker token: injected by the manager (/web) so the page authenticates
     // out of the box; ?token= in the URL overrides. Empty only if the manager
@@ -251,6 +261,55 @@
 
     async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+    // Each EXECUTE gets a generation number. A loop from an earlier EXECUTE
+    // that is still asleep sees the number has moved on and exits, so a quick
+    // TERMINATE then EXECUTE can never run two loops on one worker.
+    let loopGen = 0;
+    // Stops the heartbeat and settles the promise of the work in flight.
+    let cancelActive = null;
+
+    const _tokenQS = WORKER_TOKEN ? ('?token=' + encodeURIComponent(WORKER_TOKEN)) : '';
+
+    // Best-effort report to the manager. keepalive lets it survive the tab
+    // closing; the catch stops a failed send becoming an unhandled rejection.
+    function postReport(path, body) {
+        try {
+            return fetch(path + _tokenQS, {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(body), keepalive: true
+            }).catch(() => {});
+        } catch (e) { return Promise.resolve(); }
+    }
+
+    // fetch() with a deadline, so a stalled connection cannot freeze the loop.
+    function fetchWithTimeout(url, ms) {
+        const ctl = new AbortController();
+        const timer = setTimeout(() => ctl.abort(), ms);
+        return fetch(url, { signal: ctl.signal }).finally(() => clearTimeout(timer));
+    }
+
+    function releaseActive(reason) {
+        if (currentJobId) {
+            postReport('/report_status', { job_id: currentJobId, worker_id: currentWorkerId,
+                                           status: 'failed', error: reason,
+                                           version: WEB_WORKER_VERSION });
+            currentJobId = null;
+        }
+        if (currentChunk) {
+            postReport('/report_chunk', { job_id: currentChunk.job_id, chunk_index: currentChunk.chunk_index,
+                                          kind: 'video', worker_id: currentWorkerId,
+                                          status: 'abandoned', version: WEB_WORKER_VERSION });
+            currentChunk = null;
+        }
+    }
+
+    // Closing or reloading the tab mid-encode used to leave the work assigned
+    // until the manager's sweeps (30 min for a chunk, hours for a file).
+    window.addEventListener('pagehide', () => {
+        if (cancelActive) { try { cancelActive(null); } catch (e) {} }
+        releaseActive('Aborted: browser tab closed');
+    });
+
     function toggleButtons(active) {
         document.getElementById('btnStart').style.display = active ? 'none' : 'inline-block';
         document.getElementById('btnStop').style.display = active ? 'inline-block' : 'none';
@@ -260,38 +319,20 @@
 
     function stopLoop() {
         isRunning = false;
-        log("STOP command received. Finishing current job...", 'err');
-        // Release the in-flight job immediately so it doesn't sit 'processing'
-        // until the manager's dead-job timeout before another worker takes it.
-        if (currentJobId) {
-            try {
-                fetch('/report_status' + (WORKER_TOKEN ? ('?token=' + encodeURIComponent(WORKER_TOKEN)) : ''), {
-                    method: 'POST', headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ job_id: currentJobId, worker_id: currentWorkerId,
-                                           status: 'failed', error: 'Browser worker stopped',
-                                           version: WEB_WORKER_VERSION })
-                });
-            } catch (e) { /* best effort */ }
-            currentJobId = null;
-        }
-        // Release an in-flight chunk so the manager reassigns it promptly.
-        if (currentChunk) {
-            try {
-                fetch('/report_chunk' + (WORKER_TOKEN ? ('?token=' + encodeURIComponent(WORKER_TOKEN)) : ''), {
-                    method: 'POST', headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ job_id: currentChunk.job_id, chunk_index: currentChunk.chunk_index,
-                                           kind: 'video', worker_id: currentWorkerId,
-                                           status: 'abandoned', version: WEB_WORKER_VERSION })
-                });
-            } catch (e) { /* best effort */ }
-            currentChunk = null;
-        }
+        loopGen++;
+        log("STOP command received.", 'err');
+        // Stop the heartbeat FIRST. Left running, it kept posting "processing"
+        // for a job this node had just given up, which held the job on a dead
+        // worker for hours.
+        if (cancelActive) { try { cancelActive(new Error("Stopped by user")); } catch (e) {} }
+        // Release the in-flight work so another worker can take it now.
+        releaseActive('Aborted: browser worker stopped');
         if (worker) {
             worker.terminate();
             worker = null;
             log("Worker terminated immediately.", 'err');
-            toggleButtons(false);
         }
+        toggleButtons(false);
     }
 
     // While a chunk encodes (wasm callMain blocks the Worker thread), the page
@@ -328,14 +369,23 @@
     function runChunkInWorker(chunk) {
         return new Promise((resolve, reject) => {
             if (!worker) { reject(new Error("Worker not initialized")); return; }
-            const stopHb = startChunkHeartbeat(chunk.job_id, chunk.chunk_index);
+            const hb = startChunkHeartbeat(chunk.job_id, chunk.chunk_index);
+            const stopHb = () => { hb(); cancelActive = null; };
+            cancelActive = (err) => { stopHb(); if (err) reject(err); };
             worker.onmessage = (e) => {
                 const msg = e.data;
                 if (msg.type === 'log') log(msg.msg, msg.level);
                 else if (msg.type === 'chunk_done' || msg.type === 'chunk_stale') { stopHb(); resolve(); }
                 else if (msg.type === 'chunk_error') { stopHb(); reject(new Error(msg.msg)); }
             };
-            worker.onerror = (e) => { stopHb(); worker = null; reject(new Error("Worker Crashed: " + e.message)); };
+            worker.onerror = (e) => {
+                stopHb();
+                // An uncaught error does not end a Web Worker: terminate it,
+                // or its wasm heap stays allocated for the life of the page.
+                try { if (worker) worker.terminate(); } catch (te) {}
+                worker = null;
+                reject(new Error("Worker Crashed: " + e.message));
+            };
             worker.postMessage({type: 'run_chunk', chunk: chunk});
         });
     }
@@ -392,13 +442,15 @@
         }
 
         isRunning = true;
+        const myGen = ++loopGen;
+        const alive = () => isRunning && myGen === loopGen;
         toggleButtons(true);
         
         log(`Worker [${currentWorkerId}] Started. Polling for jobs...`, 'succ');
 
         const _authQS = WORKER_TOKEN ? ('&token=' + encodeURIComponent(WORKER_TOKEN)) : '';
 
-        while (isRunning) {
+        while (alive()) {
             try {
                 // A. CHUNK FIRST — take a slice of a large video via a pre-cut
                 // segment (video_only: browsers can't do the whole-file audio
@@ -406,7 +458,7 @@
                 // worker_id MUST be sent: assignments recorded with a NULL
                 // worker_id can never be released by our stop/failure reports
                 // (the manager's ownership guards are `AND worker_id=?`).
-                const cres = await fetch(`/get_chunk?video_only=1&worker_id=${encodeURIComponent(currentWorkerId)}&max_size_mb=${currentMaxSizeMb}&max_chunk_sec=${currentMaxChunkSec}&version=${encodeURIComponent(WEB_WORKER_VERSION)}${_authQS}`);
+                const cres = await fetchWithTimeout(`/get_chunk?video_only=1&worker_id=${encodeURIComponent(currentWorkerId)}&max_size_mb=${currentMaxSizeMb}&max_chunk_sec=${currentMaxChunkSec}&version=${encodeURIComponent(WEB_WORKER_VERSION)}${_authQS}`, 45000);
                 if (cres.status === 200) {
                     const cdata = await cres.json();
                     if (cdata.status === 'ok' && cdata.chunk) {
@@ -415,6 +467,9 @@
                         ch.wallet = currentWallet;
                         ch.token = WORKER_TOKEN;
                         currentChunk = { job_id: ch.job_id, chunk_index: ch.chunk_index };
+                        // Stopped while the request was in flight: hand the
+                        // chunk straight back, without a penalty.
+                        if (!alive()) { releaseActive('Aborted: browser worker stopped'); break; }
                         log(`CHUNK ${ch.chunk_index} of ${ch.filename}`, 'sys');
                         await runChunkInWorker(ch);
                         currentChunk = null;
@@ -427,14 +482,20 @@
 
                 // B. GET JOB (whole small files) — must send the version param or
                 // the manager's MIN_CLIENT_VERSION gate returns "Update Required".
-                const res = await fetch(`/get_job?worker_id=${encodeURIComponent(currentWorkerId)}&max_size_mb=${currentMaxSizeMb}&version=${encodeURIComponent(WEB_WORKER_VERSION)}${_authQS}`);
-                const data = await res.json();
+                const res = await fetchWithTimeout(`/get_job?worker_id=${encodeURIComponent(currentWorkerId)}&max_size_mb=${currentMaxSizeMb}&version=${encodeURIComponent(WEB_WORKER_VERSION)}${_authQS}`, 45000);
 
                 if (res.status === 401) {
                     log("Manager rejected the worker token. Open this page via the manager's /web URL, or append ?token=YOUR_SECRET.", 'err');
                     await sleep(15000);
                     continue;
                 }
+                if (!res.ok) {
+                    // Manager erroring or restarting: wait, do not hammer it.
+                    log("Manager returned HTTP " + res.status + ". Waiting...", 'err');
+                    await sleep(15000);
+                    continue;
+                }
+                const data = await res.json();
 
                 if (data.status === 'empty') {
                     // Distinguish a real empty queue from a version rejection.
@@ -449,6 +510,7 @@
                     job.wallet = currentWallet;
                     job.token = WORKER_TOKEN;
                     currentJobId = job.id;
+                    if (!alive()) { releaseActive('Aborted: browser worker stopped'); break; }
 
                     log(`STARTING JOB: ${job.filename} (${job.id})`, 'sys');
 
@@ -459,45 +521,46 @@
 
                     // Optional: Restart worker every few jobs to clear fragmentation?
                     // For now, let's keep it running unless it crashes.
+                } else {
+                    // Unknown status: never loop back without a pause.
+                    await sleep(10000);
                 }
 
             } catch (e) {
-                log("LOOP ERROR: " + e.message, 'err');
+                if (!alive()) break;   // stopLoop already released everything
+                const emsg = String((e && e.message) || e);
+                log("LOOP ERROR: " + emsg, 'err');
                 // Report the failure so the manager releases the work NOW and
                 // counts the strike (3 chunk failures → whole-file fallback) —
                 // silence would leave it assigned until the 30-min/4-h sweeps.
+                const hadWork = !!(currentChunk || currentJobId);
                 if (currentChunk) {
-                    try {
-                        fetch('/report_chunk' + (WORKER_TOKEN ? ('?token=' + encodeURIComponent(WORKER_TOKEN)) : ''), {
-                            method: 'POST', headers: {'Content-Type': 'application/json'},
-                            body: JSON.stringify({ job_id: currentChunk.job_id, chunk_index: currentChunk.chunk_index,
-                                                   kind: 'video', worker_id: currentWorkerId,
-                                                   status: 'failed', error: String(e.message || e).slice(0, 500),
-                                                   version: WEB_WORKER_VERSION })
-                        });
-                    } catch (re) { /* best effort */ }
+                    await postReport('/report_chunk', { job_id: currentChunk.job_id, chunk_index: currentChunk.chunk_index,
+                                                        kind: 'video', worker_id: currentWorkerId,
+                                                        status: 'failed', error: emsg.slice(0, 500),
+                                                        version: WEB_WORKER_VERSION });
                     currentChunk = null;
                 }
                 if (currentJobId) {
-                    try {
-                        fetch('/report_status' + (WORKER_TOKEN ? ('?token=' + encodeURIComponent(WORKER_TOKEN)) : ''), {
-                            method: 'POST', headers: {'Content-Type': 'application/json'},
-                            body: JSON.stringify({ job_id: currentJobId, worker_id: currentWorkerId,
-                                                   status: 'failed', error: String(e.message || e).slice(0, 500),
-                                                   version: WEB_WORKER_VERSION })
-                        });
-                    } catch (re) { /* best effort */ }
+                    await postReport('/report_status', { job_id: currentJobId, worker_id: currentWorkerId,
+                                                         status: 'failed', error: emsg.slice(0, 500),
+                                                         version: WEB_WORKER_VERSION });
                     currentJobId = null;
                 }
-                // If the error implies worker crash, restart it
-                if (worker === null) {
-                    log("Worker seems dead. Restarting...", 'err');
+                // Restart the wasm worker when it died, and also after any
+                // failure that was not a plain download/upload error: an
+                // aborted FFmpeg runtime fails every later job it is handed.
+                const transferErr = /download failed|upload failed|could not read the source|failed to fetch|aborted/i.test(emsg);
+                if (alive() && (worker === null || (hadWork && !transferErr))) {
+                    log("Restarting the encoder...", 'err');
                     try { await initWorker(); } catch(err) { isRunning = false; }
                 }
-                await sleep(5000);
+                await sleep(hadWork ? 5000 : 15000);
             }
         }
 
+        // A newer EXECUTE owns the buttons now; leave them alone.
+        if (myGen !== loopGen) return;
         toggleButtons(false);
         log("Worker Stopped.", 'err');
     }
@@ -509,7 +572,9 @@
                 return;
             }
 
-            const stopHb = startJobHeartbeat(job.id);
+            const hb = startJobHeartbeat(job.id);
+            const stopHb = () => { hb(); cancelActive = null; };
+            cancelActive = (err) => { stopHb(); if (err) reject(err); };
 
             worker.onmessage = (e) => {
                 const msg = e.data;
@@ -517,6 +582,13 @@
                     log(msg.msg, msg.level);
                 } else if (msg.type === 'done') {
                     stopHb();
+                    resolve();
+                } else if (msg.type === 'upload_rejected') {
+                    // The manager refused the upload and has already recorded
+                    // the outcome; a failure report on top would count twice.
+                    stopHb();
+                    log("Upload not accepted by manager: " + msg.msg, 'err');
+                    currentJobId = null;
                     resolve();
                 } else if (msg.type === 'error') {
                     stopHb();
@@ -527,8 +599,9 @@
             // If worker crashes/terminates during job
             worker.onerror = (e) => {
                 stopHb();
-                reject(new Error("Worker Crashed: " + e.message));
+                try { if (worker) worker.terminate(); } catch (te) {}
                 worker = null; // Mark as dead
+                reject(new Error("Worker Crashed: " + e.message));
             };
 
             worker.postMessage({type: 'run_job', job: job});
