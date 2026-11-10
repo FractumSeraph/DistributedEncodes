@@ -635,7 +635,21 @@ _inflight = {}                  # thread ident -> (route, start time)
 _inflight_lock = threading.Lock()
 _last_completion = time.time()
 
+REQUEST_IO_TIMEOUT_SEC = 300
+
 def _track_request_start():
+    # gunicorn's threaded worker reads and writes each request on a blocking
+    # socket with NO timeout, so a peer that vanishes mid-upload or
+    # mid-download (no FIN, no RST) pins its request thread forever. Give
+    # every request's socket an idle limit: this is per read/write, not a
+    # total, so a slow but live transfer is unaffected. gunicorn resets the
+    # socket itself between keep-alive requests.
+    try:
+        sock = request.environ.get('gunicorn.socket')
+        if sock is not None:
+            sock.settimeout(REQUEST_IO_TIMEOUT_SEC)
+    except Exception:
+        pass
     try:
         rule = request.url_rule.rule if request.url_rule is not None else request.path
         with _inflight_lock:
@@ -1310,7 +1324,13 @@ def _register_chunk_failure(job_id, kind, chunk_index, worker_id, reason):
 # PERMANENTLY and silently — no log line — and since a worker only reaches
 # /get_job when /get_chunk is empty, those jobs then sat untouched for months.
 PROBE_FAILS_BEFORE_WHOLE = 3
+PROBE_RETRY_DELAY_SEC = 600
 _PROBE_FAILS = {}
+# job_id -> time before which it must not be picked for a split again. Without
+# this the same job sits at the head of the queue and is re-probed on every
+# poll: its three misses land inside one short blip, and nothing else can be
+# split while it hogs the turn.
+_PROBE_RETRY_AT = {}
 
 # Whole-file-only jobs (genuinely unchunkable: VFR, >240 fps, A/V start skew)
 # get a share of NORMAL workers instead of waiting for a --no-chunks worker.
@@ -1359,6 +1379,14 @@ def _claim_job_for_split(folder_filter, max_size_mb):
             if folder_filter:
                 query_parts.append("id LIKE ?")
                 params.append(f"{folder_filter}%")
+            # Skip jobs whose last probe missed until their retry time comes up.
+            _now = time.time()
+            for _jid in [j for j, t in _PROBE_RETRY_AT.items() if t <= _now]:
+                _PROBE_RETRY_AT.pop(_jid, None)
+            _deferred = list(_PROBE_RETRY_AT)[:500]
+            if _deferred:
+                query_parts.append(f"id NOT IN ({','.join('?' * len(_deferred))})")
+                params.extend(_deferred)
             # Prefer remote sources first, mirroring /get_job's search order
             sql = ("SELECT id, filename, file_size, source_type, source_url, content_profile "
                    f"FROM jobs WHERE {' AND '.join(query_parts)} "
@@ -1396,7 +1424,8 @@ def _split_claimed_job(job):
         _PROBE_FAILS[job_id] = fails
         _note_source_failure()   # feeds the outage breaker if the source is really down
         if fails < PROBE_FAILS_BEFORE_WHOLE:
-            # Hand it back still chunkable; the next split attempt probes again.
+            _PROBE_RETRY_AT[job_id] = time.time() + PROBE_RETRY_DELAY_SEC
+            # Hand it back still chunkable; it is probed again after the delay.
             with db_lock:
                 conn = db_handler.get_connection()
                 try:
@@ -1411,6 +1440,7 @@ def _split_claimed_job(job):
             return False
         log_event("WARN", f"Could not probe the source {fails} times in a row — encoding whole.", job_id)
     _PROBE_FAILS.pop(job_id, None)
+    _PROBE_RETRY_AT.pop(job_id, None)
     ranges = None
     if probe and probe['fps'] > 240:
         # SVT-AV1 caps at 240 fps — a "faster" rate is broken container
@@ -2138,7 +2168,14 @@ def _save_series_ids(id_map):
 
 def get_series_list(force_refresh=False):
     global _SERIES_CACHE, _SERIES_CACHE_TIME
-    with _SERIES_CACHE_LOCK:
+    # The refresh lists SOURCE_DIRECTORY while holding the lock. If that
+    # listing is slow or hangs (a network mount), callers used to pile up
+    # behind it, one request thread each. Serve the last known list instead.
+    if not _SERIES_CACHE_LOCK.acquire(blocking=False):
+        if _SERIES_CACHE is not None:
+            return _SERIES_CACHE
+        _SERIES_CACHE_LOCK.acquire()
+    try:
         now = time.time()
         if not force_refresh and _SERIES_CACHE is not None and now - _SERIES_CACHE_TIME < 60:
             return _SERIES_CACHE
@@ -2184,6 +2221,8 @@ def get_series_list(force_refresh=False):
             return result
         except:
             return _SERIES_CACHE if _SERIES_CACHE is not None else ([], [])
+    finally:
+        _SERIES_CACHE_LOCK.release()
 
 # ==============================================================================
 # DATABASE INIT
@@ -4076,9 +4115,11 @@ def get_config():
 @requires_auth
 def update_config():
     global REMOTE_SOURCE_URL
-    data = request.json
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"status": "error", "message": "JSON body required"}), 400
     if 'REMOTE_SOURCE_URL' in data:
-        new_url = data['REMOTE_SOURCE_URL'].strip()
+        new_url = str(data['REMOTE_SOURCE_URL'] or '').strip()
         if not new_url: new_url = None
         REMOTE_SOURCE_URL = new_url
         log_event("WARN", f"Admin updated Remote Source URL to: {REMOTE_SOURCE_URL}")
