@@ -608,6 +608,134 @@ def is_worker_banned(worker_id):
             _BANNED_CACHE_TIME = now
         return worker_id.strip().lower() in _BANNED_CACHE
 
+# ==============================================================================
+# REQUEST-PATH WATCHDOG
+# ==============================================================================
+# The manager runs as ONE gunicorn worker with a small, fixed pool of request
+# threads. When every one of those threads is stuck inside a request that never
+# finishes, new connections just queue behind them: workers can't fetch or
+# report, their heartbeats stop arriving, and the manager looks dead. It isn't —
+# the background threads keep running (maintenance happily logs "Reset N stale
+# chunk(s)" and "Worker X timed out" the whole time, because from its point of
+# view every worker has gone silent). Nothing recovers until someone restarts
+# gunicorn by hand. On 2026-11-10 that was ~7.5 hours of serving nothing.
+#
+# So: track which requests are in flight, notice when the pool has stopped
+# completing anything, write down exactly where every thread is stuck (so the
+# root cause can be fixed rather than guessed at), and restart — which is the
+# same thing that was being done manually, minus the hours of waiting for it.
+
+WEDGE_MIN_INFLIGHT = 4      # at least this many requests in flight...
+WEDGE_DUMP_SEC = 600        # ...and none completed for 10 min -> record why
+WEDGE_RESTART_SEC = 1200    # ...for 20 min -> restart to recover
+WEDGE_DUMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'wedge_dumps')
+WEDGE_DUMP_KEEP = 20
+
+_inflight = {}                  # thread ident -> (route, start time)
+_inflight_lock = threading.Lock()
+_last_completion = time.time()
+
+def _track_request_start():
+    try:
+        rule = request.url_rule.rule if request.url_rule is not None else request.path
+        with _inflight_lock:
+            _inflight[threading.get_ident()] = (f"{request.method} {rule}", time.time())
+    except Exception:
+        pass
+
+# First in line, so a request another before_request hook answers early
+# (e.g. the CSRF guard) is still tracked.
+app.before_request_funcs.setdefault(None, []).insert(0, _track_request_start)
+
+@app.teardown_request
+def _track_request_end(exc):
+    # teardown_request runs even when the handler raised, and for streamed
+    # responses only once the stream has finished — so a long download counts
+    # as in flight for exactly as long as it really holds a thread.
+    global _last_completion
+    with _inflight_lock:
+        _inflight.pop(threading.get_ident(), None)
+        _last_completion = time.time()
+
+def _bounded(fn, timeout, *args):
+    """Run fn on a side thread and give up waiting after `timeout` seconds.
+    The watchdog must never block on the thing it is watching: log_event takes
+    db_lock, and the dump and the DB sync both touch the disk."""
+    box = {}
+    def run():
+        try: box['r'] = fn(*args)
+        except Exception as e: box['e'] = e
+    t = threading.Thread(target=run, daemon=True)
+    t.start(); t.join(timeout)
+    return box.get('r')
+
+def _watchdog_note(level, message):
+    print(f"[{level}] [watchdog] {message}", flush=True)   # never blocks
+    _bounded(log_event, 10, level, f"[watchdog] {message}")
+
+def _dump_thread_stacks(inflight, idle):
+    """Write every thread's current stack to a file; return its path."""
+    os.makedirs(WEDGE_DUMP_DIR, exist_ok=True)
+    path = os.path.join(WEDGE_DUMP_DIR, f"wedge-{datetime.now().strftime('%Y%m%d-%H%M%S')}.txt")
+    names = {t.ident: t.name for t in threading.enumerate()}
+    now = time.time()
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(f"Request threads wedged: {len(inflight)} in flight, "
+                f"none completed for {idle:.0f}s\n\n")
+        for ident, (route, start) in sorted(inflight.items(), key=lambda kv: kv[1][1]):
+            f.write(f"  {now - start:8.0f}s  {route}   (thread {names.get(ident, ident)})\n")
+        f.write("\n")
+        for ident, frame in sys._current_frames().items():
+            mark = "  <-- IN A REQUEST" if ident in inflight else ""
+            f.write(f"===== {names.get(ident, ident)} ({ident}){mark}\n")
+            f.write("".join(traceback.format_stack(frame)))
+            f.write("\n")
+    old = sorted(x for x in os.listdir(WEDGE_DUMP_DIR) if x.startswith('wedge-'))
+    for x in old[:-WEDGE_DUMP_KEEP]:
+        try: os.remove(os.path.join(WEDGE_DUMP_DIR, x))
+        except OSError: pass
+    return path
+
+def _summarise_inflight(inflight):
+    now = time.time()
+    by_route = collections.defaultdict(list)
+    for route, start in inflight.values():
+        by_route[route].append(now - start)
+    parts = [f"{r} x{len(a)} (oldest {max(a)/60:.0f}m)"
+             for r, a in sorted(by_route.items(), key=lambda kv: -len(kv[1]))]
+    return "; ".join(parts)
+
+def _request_watchdog():
+    diagnosed = False
+    while True:
+        time.sleep(30)
+        try:
+            now = time.time()
+            with _inflight_lock:
+                inflight = dict(_inflight)
+                idle = now - _last_completion
+            wedged = len(inflight) >= WEDGE_MIN_INFLIGHT and idle >= WEDGE_DUMP_SEC
+            if not wedged:
+                if diagnosed:
+                    _watchdog_note("INFO", "Request threads are completing again.")
+                diagnosed = False
+                continue
+            if not diagnosed:
+                diagnosed = True
+                path = _bounded(_dump_thread_stacks, 30, inflight, idle) or "(dump failed)"
+                _watchdog_note("ERROR", f"Request threads WEDGED: {len(inflight)} in flight, none "
+                                        f"completed for {idle/60:.0f} min. {_summarise_inflight(inflight)}. "
+                                        f"Thread stacks: {path}")
+            if idle >= WEDGE_RESTART_SEC:
+                _watchdog_note("ERROR", f"Still wedged after {idle/60:.0f} min — restarting to recover.")
+                _bounded(db_handler.sync_to_disk, 30)
+                if _restart_self():
+                    return   # this process is on its way out
+                _watchdog_note("ERROR", "No automatic restart path available — restart the manager manually.")
+                time.sleep(WEDGE_RESTART_SEC)   # don't repeat that every 30s
+        except Exception as e:
+            print(f"[!] watchdog error: {e}", flush=True)
+
 @app.after_request
 def add_security_headers(response):
     response.headers['Cross-Origin-Opener-Policy'] = 'same-origin'
@@ -696,7 +824,10 @@ def verify_upload(filepath, source_has_audio=None):
     so a silent upload can be rejected. None = unknown (skip that check)."""
     try:
         cmd = ['ffprobe', '-v', 'error', '-print_format', 'json', '-show_streams', '-show_format', filepath]
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        # Bounded: this runs inside the /upload_result request handler, and an
+        # ffprobe that never returns (a stalled filesystem, a pathological file)
+        # used to pin one of gunicorn's few request threads for good.
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if result.returncode != 0:
             return False, "FFprobe Error", 0.0
 
@@ -4045,6 +4176,7 @@ sweep_quarantine()
 # FIXED: Run startup scan in thread to allow Gunicorn to bind immediately
 threading.Thread(target=scan_and_queue, daemon=True).start()
 threading.Thread(target=maintenance_loop, daemon=True).start()
+threading.Thread(target=_request_watchdog, daemon=True, name="request-watchdog").start()
 if DB_BACKUP_ENABLED:
     threading.Thread(target=_backup_loop, daemon=True).start()
 if MANAGER_AUTO_UPDATE:
