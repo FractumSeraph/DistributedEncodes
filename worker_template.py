@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.7.0"
+WORKER_VERSION = "3.8.0"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -1202,6 +1202,45 @@ def _is_source_read_failure(log_buffer):
             return True
     return False
 
+def _clean_stopped_output(path):
+    """Make the output of an ffmpeg that was stopped mid-encode safe to use.
+
+    Fragmented MP4 keeps everything already written, but the file ends in a
+    half-written fragment: stream-copying it into the final assembly produced
+    an unreadable file. Remux it, cutting just before the last readable frame.
+    Returns the cleaned duration in seconds, or None if it could not be done
+    (the caller then treats the encode as failed)."""
+    try:
+        res = subprocess.run([FFPROBE_CMD, '-v', 'error', '-select_streams', 'v:0',
+                              '-show_entries', 'packet=pts_time', '-of', 'csv=p=0', path],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             encoding='utf-8', errors='replace', timeout=900)
+        times = []
+        for tok in (res.stdout or '').split():
+            try: times.append(float(tok.strip(',')))
+            except ValueError: pass
+        if not times:
+            return None
+        keep = max(times) - 0.25
+        if keep <= 0:
+            return None
+        tmp = path + '.clean.mp4'
+        rc = subprocess.run([FFMPEG_CMD, '-v', 'error', '-y', '-i', path, '-map', '0', '-c', 'copy',
+                             '-t', f'{keep:.3f}',
+                             '-movflags', 'frag_keyframe+empty_moov+default_base_moof', tmp],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=1800)
+        if rc.returncode != 0 or not os.path.exists(tmp) or os.path.getsize(tmp) == 0:
+            try: os.remove(tmp)
+            except OSError: pass
+            return None
+        os.replace(tmp, path)
+        return keep
+    except Exception:
+        return None
+
+class _ResumeDone(Exception):
+    """Raised inside the resume block when the checkpoint needs no more work."""
+
 class _StreamWatch:
     """Keeps the display honest while ffmpeg is quiet.
 
@@ -1216,8 +1255,15 @@ class _StreamWatch:
     so when they stop."""
 
     OPEN_GRACE_SEC = 3.0    # a fast open should not flash "reading src"
-    STALL_SEC      = 20.0   # no progress for this long = say something
+    STALL_SEC      = 120.0  # no progress for this long = say something
     BEAT_SEC       = 60.0   # keep the manager's stale-chunk sweeper off us
+    # Encodes have been seen frozen within the last seconds of a source for
+    # hours or days: ffmpeg keeps printing progress with the SAME out_time, so
+    # the job heartbeats and nothing ever times it out. Past these limits the
+    # watch stops ffmpeg; the caller then keeps the output if it is complete
+    # to within a few seconds, or retries.
+    STALL_KILL_SEC = 900.0   # frames were flowing, then none for 15 min
+    OPEN_KILL_SEC  = 1800.0  # never produced a first frame in 30 min
 
     def __init__(self, update_status, single_mode=False, heartbeat=None):
         self._update = update_status
@@ -1235,11 +1281,26 @@ class _StreamWatch:
         self._stop = threading.Event()
         self._thread = None
         self._last_said = 0.0
+        self._pos = -1.0
+        self._proc = None
+        self._was_paused = False
+        self.stall_killed = False
 
-    def note_progress(self, pct):
-        """Called from the read loop each time ffmpeg reports real output."""
+    def attach(self, proc):
+        """Let the watch stop this ffmpeg if it stalls for good."""
+        self._proc = proc
+        return self
+
+    def note_progress(self, pct, pos=None):
+        """Called from the read loop for each progress line. `pos` is the
+        output position in seconds: ffmpeg repeats its progress block even
+        when nothing new was encoded, so only an ADVANCING position counts —
+        without it a frozen encode looked alive forever."""
         with self._lock:
-            self._last_progress = time.time()
+            if pos is None or pos > self._pos + 0.001 or not self._last_progress:
+                self._last_progress = time.time()
+                if pos is not None:
+                    self._pos = pos
             self._pct = pct
 
     def start(self):
@@ -1252,8 +1313,18 @@ class _StreamWatch:
 
     def _run(self):
         while not self._stop.wait(1.0):
-            if SHUTDOWN_EVENT.is_set() or PAUSE_REQUESTED:
+            if SHUTDOWN_EVENT.is_set():
                 continue
+            if PAUSE_REQUESTED:
+                self._was_paused = True
+                continue
+            if self._was_paused:
+                # Time spent paused is not a stall: restart both clocks.
+                self._was_paused = False
+                with self._lock:
+                    self._started = time.time()
+                    if self._last_progress:
+                        self._last_progress = time.time()
             self._beat()
             with self._lock:
                 last, pct, started = self._last_progress, self._pct, self._started
@@ -1263,11 +1334,23 @@ class _StreamWatch:
                 if waited >= self.OPEN_GRACE_SEC:
                     self._say(f"Open {_fmt_mmss(waited)}",
                               f"waiting for source... {_fmt_mmss(waited)}")
+                if waited >= self.OPEN_KILL_SEC:
+                    self._kill()
             else:
                 stalled = now - last
                 if stalled >= self.STALL_SEC:
                     self._say(f"Stall {_fmt_mmss(stalled)}",
                               f"stalled {_fmt_mmss(stalled)} at {pct}%")
+                if stalled >= self.STALL_KILL_SEC:
+                    self._kill()
+
+    def _kill(self):
+        proc = self._proc
+        if proc is None or self.stall_killed or proc.poll() is not None:
+            return
+        self.stall_killed = True
+        try: proc.kill()
+        except Exception: pass
 
     def _beat(self):
         if not self._heartbeat or time.time() - self._last_beat < self.BEAT_SEC:
@@ -2180,7 +2263,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
         # short) is not a bad job, and two attempts 15s apart land inside the
         # same outage. Wait it out instead of handing the chunk back as failed.
         _MAX_ATT = 5
-        proc = None; log_buffer = []; _trunc_note = None
+        proc = None; log_buffer = []; _trunc_note = None; _stall_salvaged = False
         _src_retry_delays = [30, 120, 300]
         _src_retries = 0
         report_chunk("processing", 0)
@@ -2224,7 +2307,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
             # Ticks the display while ffmpeg opens and seeks the source, which
             # this loop cannot do: readline() below is blocked the whole time.
             watch = _StreamWatch(update_status, single_mode,
-                                 heartbeat=lambda: report_chunk("processing", last_pct)).start()
+                                 heartbeat=lambda: report_chunk("processing", last_pct)).start().attach(proc)
             # try/finally: an exception mid-loop (e.g. disk-full on the log
             # write) must still deregister and kill ffmpeg — a leaked encoder
             # blocks forever on a full stdout pipe once nobody reads it.
@@ -2247,7 +2330,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                                 curr_sec = get_seconds(line.split('=')[1].strip())
                                 pct = min(100, int((curr_sec / prog_total) * 100))
                                 last_pct = pct
-                                watch.note_progress(pct)
+                                watch.note_progress(pct, curr_sec)
                                 if single_mode: print_progress(worker_id, curr_sec, prog_total, prefix='Enc')
                                 else: update_status(f"Enc {pct}%")
                                 if time.time() - last_rep > 10:
@@ -2264,6 +2347,21 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                     try: proc.kill()
                     except Exception: pass
             if SHUTDOWN_EVENT.is_set(): break
+            if watch.stall_killed:
+                log_buffer.append("Stream ends prematurely (no progress; ffmpeg stopped by the stall watchdog)\n")
+                # A freeze in the last moments of the LAST chunk is the common
+                # case, and re-encoding just freezes at the same spot. The
+                # output is a fragmented MP4, so what was written is intact:
+                # keep it when it is complete to within a few seconds.
+                _s_exp = max(0.0, src_dur - start_sec) if src_dur > 0 else dur_sec
+                _s_dur = _clean_stopped_output(out_path) if (kind == 'video' and chunk.get('is_last')) else None
+                if _s_dur is not None and _s_exp > 0 and _s_dur >= _s_exp - 20.0:
+                    log(worker_id, f"Encode stalled {max(0.0, _s_exp - _s_dur):.1f}s before the end of the "
+                                   f"source ({chunk_tag}); keeping the {_s_dur:.1f}s already encoded.", "WARN")
+                    _stall_salvaged = True; _trunc_note = None
+                    break
+                log(worker_id, f"Encode stalled with no progress for {int(watch.STALL_KILL_SEC // 60)} min "
+                               f"({chunk_tag}); stopped ffmpeg.", "WARN")
             if proc.returncode == 0:
                 # Self-check BEFORE uploading: a dropped source stream can make
                 # ffmpeg see a premature EOF and finish "successfully" with only
@@ -2323,7 +2421,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
             cleanup()
             return
 
-        if proc is None or proc.returncode != 0 or not os.path.exists(out_path):
+        if proc is None or (proc.returncode != 0 and not _stall_salvaged) or not os.path.exists(out_path):
             rc = proc.returncode if proc else -1
             if _trunc_note:
                 err_msg = f"Truncated output ({_trunc_note}) — source stream interrupted ({chunk_tag})"
@@ -2547,6 +2645,14 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                 _r_tmps   = [_r_p1, _r_p2, _r_clist, _r_merged]
                 _resume_ok = False
                 try:
+                    if _r_total_sec > 0 and _r_partial_dur >= _r_total_sec - 20.0:
+                        # The checkpoint already holds the whole film bar its
+                        # last seconds: an encode that froze at the very end.
+                        # Re-encoding that sliver just freezes again.
+                        log(worker_id, f"Checkpoint is complete to within {max(0.0, _r_total_sec - _r_partial_dur):.1f}s; "
+                                       "uploading it as is.", "WARN")
+                        _resume_ok = True
+                        raise _ResumeDone()
                     # Trim part1 to a clean keyframe boundary using stream-copy (no re-encode)
                     _r_trim_pt = max(0.0, _r_partial_dur - 5.0)
                     _r_trim_rc = subprocess.run(
@@ -2608,13 +2714,21 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                     assert _r_rem.stdout is not None
                     with PROC_LOCK: ACTIVE_PROCS[worker_id] = _r_rem
                     _r_last_rep = 0
+                    _r_pos = -1.0; _r_adv = time.time(); _r_stalled = False
                     while True:
                         if SHUTDOWN_EVENT.is_set(): _r_rem.terminate(); break
+                        if not PAUSE_REQUESTED and time.time() - _r_adv > _StreamWatch.STALL_KILL_SEC:
+                            _r_stalled = True
+                            try: _r_rem.kill()
+                            except Exception: pass
+                            break
                         _r_ln = _r_rem.stdout.readline()
                         if not _r_ln and _r_rem.poll() is not None: break
                         if "out_time=" in _r_ln and "N/A" not in _r_ln and _r_total_sec > 0:
                             try:
                                 _r_cur = get_seconds(_r_ln.split('=')[1].strip())
+                                if _r_cur > _r_pos + 0.001:
+                                    _r_pos = _r_cur; _r_adv = time.time()
                                 _r_ov  = min(100, int((_r_p1_dur + _r_cur) / _r_total_sec * 100))
                                 update_status(f"Enc {_r_ov}%")
                                 if time.time() - _r_last_rep > 10:
@@ -2625,6 +2739,8 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                         if worker_id in ACTIVE_PROCS: del ACTIVE_PROCS[worker_id]
                     if SHUTDOWN_EVENT.is_set():
                         break  # keep partial + checkpoint for the next run
+                    if _r_stalled:
+                        raise RuntimeError("Remainder encode stalled with no progress")
                     if _r_rem.returncode != 0 or not os.path.exists(_r_p2):
                         raise RuntimeError(f"Remainder encode failed (rc={_r_rem.returncode})")
 
@@ -2644,6 +2760,8 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                     _r_tmps.remove(_r_merged)  # already moved, skip final-cleanup
                     _resume_ok = True
 
+                except _ResumeDone:
+                    pass
                 except Exception as _r_err:
                     log(worker_id, f"Resume failed for {_r_job_id}: {_r_err}. Discarding.", "ERROR")
                 finally:
@@ -3095,7 +3213,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                     "created_at":       time.time(),
                 })
 
-                proc = None; enc_time = 0; _wf_trunc_note = None
+                proc = None; enc_time = 0; _wf_trunc_note = None; _wf_stall_salvaged = False
                 _subs_dropped = False
                 log_buffer = []  # defined before the loop: a pre-first-attempt
                                  # shutdown must not NameError the failure dump
@@ -3156,6 +3274,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
 
                     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, encoding='utf-8', errors='replace', **popen_kwargs)
                     assert proc.stdout is not None
+                    watch.attach(proc)
 
                     with PROC_LOCK: ACTIVE_PROCS[worker_id] = proc
 
@@ -3200,7 +3319,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                                         last_enc_pct = pct
                                         _hb["pct"] = pct
 
-                                        watch.note_progress(pct)
+                                        watch.note_progress(pct, curr_sec)
                                         if single_mode: print_progress(worker_id, curr_sec, total_sec, prefix='Enc')
                                         else: update_status(f"Enc {pct}%")
 
@@ -3222,6 +3341,19 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
 
                     enc_time = time.time() - start_enc
                     if SHUTDOWN_EVENT.is_set(): break
+                    if watch.stall_killed:
+                        log_buffer.append("Stream ends prematurely (no progress; ffmpeg stopped by the stall watchdog)\n")
+                        # See the chunk path. Tighter than the manager's own
+                        # tolerance on purpose: never ship a film knowingly
+                        # missing more than its last few seconds.
+                        _s_dur = _clean_stopped_output(local_dst) if total_sec > 0 else None
+                        if _s_dur is not None and _s_dur >= total_sec - 20.0:
+                            log(worker_id, f"Encode stalled {max(0.0, total_sec - _s_dur):.1f}s before the end of "
+                                           f"the source; keeping the {_s_dur:.1f}s already encoded.", "WARN")
+                            _wf_stall_salvaged = True; _wf_trunc_note = None
+                            break
+                        log(worker_id, f"Encode stalled with no progress for {int(watch.STALL_KILL_SEC // 60)} min; "
+                                       "stopped ffmpeg.", "WARN")
                     if proc.returncode == 0:
                         # Self-check BEFORE uploading: a dropped source stream
                         # can make ffmpeg see a premature EOF and exit 0 with a
@@ -3264,7 +3396,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
 
                 if single_mode: print_progress(worker_id, total_sec, total_sec, prefix='Enc', suffix='OK')
 
-                if proc and proc.returncode == 0 and os.path.exists(local_dst):
+                if proc and (proc.returncode == 0 or _wf_stall_salvaged) and os.path.exists(local_dst):
                     final_size_bytes = os.path.getsize(local_dst)
                     final_size = final_size_bytes / 1024 / 1024
                     log(worker_id, f"Encode done ({enc_time:.0f}s, {final_size:.2f}MB). Uploading...")
