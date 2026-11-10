@@ -470,7 +470,7 @@
                     if (stalled > 0) {
                         sBox.style.display = 'block';
                         document.getElementById('queue-stalled-head').innerText =
-                            `// ${stalled} STALLED \u2014 NEEDS A --no-chunks WORKER`;
+                            `// ${stalled} WHOLE-FILE ONLY \u2014 NORMAL WORKERS TAKE THESE A FEW AT A TIME`;
                         document.getElementById('queue-stalled-list').innerHTML =
                             (rawData.queue_stalled_items || []).map(j => {
                                 const nm = j.id.split('/').pop();

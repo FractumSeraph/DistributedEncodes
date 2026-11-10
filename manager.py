@@ -1303,6 +1303,47 @@ def _register_chunk_failure(job_id, kind, chunk_index, worker_id, reason):
             conn.close()
     log_event("WARN", f"Chunk {kind}#{chunk_index} failed on {worker_id}: {reason}", job_id)
 
+# A source that could not be probed this time is not a property of the file.
+# The probe runs over HTTP with a 20s budget (it sits inside a /get_chunk
+# request), and a slow origin, a Cloudflare 522 or a big matroska header can
+# miss that on a perfectly chunkable file. That miss used to set chunkable=0
+# PERMANENTLY and silently — no log line — and since a worker only reaches
+# /get_job when /get_chunk is empty, those jobs then sat untouched for months.
+PROBE_FAILS_BEFORE_WHOLE = 3
+_PROBE_FAILS = {}
+
+# Whole-file-only jobs (genuinely unchunkable: VFR, >240 fps, A/V start skew)
+# get a share of NORMAL workers instead of waiting for a --no-chunks worker.
+# Capped so the swarm keeps chunking: at most this many whole-file jobs run at
+# once, counting every whole-file job in flight, whoever is encoding it.
+WHOLEFILE_SHARE_SLOTS = 2
+
+def _wholefile_share_available(folder_filter, max_size_mb):
+    """True when this worker should take a whole-file-only job instead of
+    splitting another: one is queued (and fits the worker's filters) and
+    fewer than WHOLEFILE_SHARE_SLOTS whole-file jobs are already running."""
+    try:
+        with read_lock():
+            conn = db_handler.get_connection()
+            try:
+                c = conn.cursor()
+                c.execute("SELECT COUNT(*) FROM jobs WHERE status IN ('processing','downloading','uploading') "
+                          "AND COALESCE(chunked,0)=0 AND worker_id IS NOT NULL AND worker_id NOT LIKE '(%'")
+                if c.fetchone()[0] >= WHOLEFILE_SHARE_SLOTS:
+                    return False
+                q = ["status='queued'", "COALESCE(chunkable,1)=0", "COALESCE(fail_count,0) < 5"]
+                params = []
+                if max_size_mb and str(max_size_mb).isdigit():
+                    q.append("file_size <= ?"); params.append(int(max_size_mb) * 1024 * 1024)
+                if folder_filter:
+                    q.append("id LIKE ?"); params.append(f"{folder_filter}%")
+                c.execute(f"SELECT 1 FROM jobs WHERE {' AND '.join(q)} LIMIT 1", tuple(params))
+                return c.fetchone() is not None
+            finally:
+                conn.close()
+    except Exception:
+        return False
+
 def _claim_job_for_split(folder_filter, max_size_mb):
     """Pick the next queued, chunk-eligible job and mark it as being split.
     Returns the job row dict or None. Runs entirely under db_lock."""
@@ -1350,6 +1391,26 @@ def _split_claimed_job(job):
     # Probe with a short timeout: this runs inside a /get_chunk request and
     # workers give up waiting after ~30s.
     probe = _probe_media(src, timeout=20) if src else None
+    if src and probe is None:
+        fails = _PROBE_FAILS.get(job_id, 0) + 1
+        _PROBE_FAILS[job_id] = fails
+        _note_source_failure()   # feeds the outage breaker if the source is really down
+        if fails < PROBE_FAILS_BEFORE_WHOLE:
+            # Hand it back still chunkable; the next split attempt probes again.
+            with db_lock:
+                conn = db_handler.get_connection()
+                try:
+                    conn.execute("UPDATE jobs SET status='queued', worker_id=NULL, started_at=NULL, "
+                                 "last_updated=? WHERE id=? AND status='processing' AND worker_id='(chunking)'",
+                                 (datetime.now(), job_id))
+                    conn.commit()
+                finally:
+                    conn.close()
+            log_event("WARN", f"Could not probe the source (attempt {fails}/{PROBE_FAILS_BEFORE_WHOLE}); "
+                              "leaving it chunkable and retrying.", job_id)
+            return False
+        log_event("WARN", f"Could not probe the source {fails} times in a row — encoding whole.", job_id)
+    _PROBE_FAILS.pop(job_id, None)
     ranges = None
     if probe and probe['fps'] > 240:
         # SVT-AV1 caps at 240 fps — a "faster" rate is broken container
@@ -2645,7 +2706,10 @@ def get_job():
                             params.append(f"{folder_filter}%")
                         
                         # [ADDED] content_profile to SELECT query
-                        sql = f"SELECT id, filename, file_size, source_type, source_url, content_profile, source_hash, stream_meta FROM jobs WHERE {' AND '.join(query_parts)} ORDER BY id ASC LIMIT 1"
+                        # Whole-file-only jobs first: they are the ones only /get_job can serve.
+                        sql = (f"SELECT id, filename, file_size, source_type, source_url, content_profile, source_hash, stream_meta "
+                               f"FROM jobs WHERE {' AND '.join(query_parts)} "
+                               f"ORDER BY CASE WHEN COALESCE(chunkable,1)=0 THEN 0 ELSE 1 END, id ASC LIMIT 1")
                         c.execute(sql, tuple(params)); row = c.fetchone()
                         if row: job = dict(row); break
                 
@@ -2733,6 +2797,13 @@ def get_chunk():
             # eventually wedging the whole queue behind the 6-hour backstop.
             # Let the worker fall back to /get_job instead.
             return jsonify({"status": "empty"})
+        if chunk is None and not video_only and not max_chunk_sec \
+                and _wholefile_share_available(folder_filter, max_size_mb):
+            # Before splitting another job, let this worker take a whole-file-
+            # only one: "empty" makes it fall through to /get_job, which now
+            # hands out those jobs first. Browser/capped workers can't encode a
+            # whole file, so they never get diverted.
+            return jsonify({"status": "empty", "message": "Whole-file job available"})
         if chunk is None:
             if SPLIT_LOCK.acquire(blocking=False):
                 # No pending chunks anywhere — split the next queued job.
@@ -3939,6 +4010,15 @@ def admin_action():
             elif action == 'retry_all_failed':
                 c.execute("DELETE FROM chunks WHERE job_id IN (SELECT id FROM jobs WHERE status IN ('failed', 'permanently_failed'))")
                 c.execute("UPDATE jobs SET status='queued', progress=0, worker_id=NULL, fail_count=0, chunked=0, chunkable=NULL, started_at=NULL, last_updated=? WHERE status IN ('failed', 'permanently_failed')", (datetime.now(),))
+            elif action == 'recheck_stalled':
+                # Give every whole-file-only job another chance to be split.
+                # Most were demoted by a probe that merely timed out; the truly
+                # unchunkable ones are re-demoted on their next split attempt,
+                # this time with the reason logged.
+                c.execute("UPDATE jobs SET chunkable=NULL, last_updated=? "
+                          "WHERE status='queued' AND COALESCE(chunkable,1)=0", (datetime.now(),))
+                purged = c.rowcount
+                post_commit_logs.append(f"Admin re-checked {purged} whole-file-only job(s) for chunking.")
             elif action == 'clear_stale':
                 cutoff = datetime.now() - timedelta(minutes=10)
                 c.execute("UPDATE jobs SET status='queued', progress=0, worker_id=NULL, last_updated=?, started_at=NULL WHERE status IN ('processing', 'downloading', 'uploading', 'paused') AND COALESCE(chunked, 0)=0 AND last_updated < ?", (datetime.now(), cutoff))

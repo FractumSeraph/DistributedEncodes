@@ -84,6 +84,7 @@
             <div>
                 <button onclick="act('all','clear_stale')" style="border-color: var(--neon-orange); color: var(--neon-orange);">[ PRUNE DEAD WORKERS ]</button>
                 <button onclick="act('all','retry_all_failed')" style="border-color: var(--neon-red); color: var(--neon-red);">[ RESET FAILED ]</button>
+                <button onclick="act('all','recheck_stalled')" style="border-color: var(--neon-green); color: var(--neon-green);">[ RECHECK WHOLE-FILE JOBS ]</button>
                 <button onclick="act('all','archive_history')" style="border-color: var(--neon-pink); color: var(--neon-pink);">[ ARCHIVE HISTORY ]</button>
                 <button onclick="act('all','purge_queue')" style="border-color: var(--neon-red); color: var(--neon-red);">[ PURGE QUEUE ]</button>
                 <button onclick="act('all','clear_error_reports')" style="border-color: var(--neon-orange); color: var(--neon-orange);">[ CLEAR ERRORS ]</button>
@@ -608,12 +609,17 @@
             if (action === 'purge_queue') msg = "DELETE ALL QUEUED JOBS? (They will come back if files exist on disk)";
             if (action === 'clear_error_reports') msg = "Clear ALL error reports?";
             if (action === 'retry_purge') msg = "DELETE this job's finished encode and re-encode it from source?";
+            if (action === 'recheck_stalled') msg = "Give every whole-file-only job another chance to be chunked? Files that genuinely can't be split are re-marked automatically, with the reason logged.";
 
             if(!confirm(msg)) return;
             fetch('/api/admin_action', {
                 method:'POST', headers:{'Content-Type':'application/json'},
                 body:JSON.stringify({job_id:id, action:action})
-            }).then(() => { refreshAll(); });
+            }).then(r => r.json()).then(d => {
+                if (action === 'recheck_stalled' && d && d.requeued !== undefined)
+                    alert(`${d.requeued} job(s) returned to the chunked queue.`);
+                refreshAll();
+            }).catch(() => refreshAll());
         }
 
         function downloadLog(jobId) {
