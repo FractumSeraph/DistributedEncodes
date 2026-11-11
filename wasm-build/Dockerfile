@@ -14,9 +14,9 @@
 # Extract: docker run --rm -v "$PWD/static:/out" fractum-ffwasm cp -a \
 #            /build/dist/ffmpeg.js /build/dist/ffmpeg.wasm /build/dist/ffmpeg.worker.js /out/
 #
-# NOTE: This recipe has NOT been executed in the environment it was written in.
-# The two steps most likely to need a tweak are called out in wasm-build/README.md
-# (SVT-AV1's wasm CMake, and the Emscripten pthread output naming).
+# The same steps (same versions and flags) were run natively with emsdk 3.1.51
+# to produce the files in static/. The docker build itself has not been run;
+# see wasm-build/README.md for the pitfalls each workaround below addresses.
 # =============================================================================
 
 # Emscripten toolchain. 3.1.51 is a known-good era that still emits a separate
@@ -38,12 +38,17 @@ ENV CFLAGS="-O2 -pthread -fno-stack-protector -I${PREFIX}/include"
 ENV CXXFLAGS="${CFLAGS}"
 ENV LDFLAGS="-O2 -pthread -L${PREFIX}/lib"
 ENV PKG_CONFIG_PATH="${PREFIX}/lib/pkgconfig"
+# emconfigure points pkg-config at Emscripten's own sysroot and ignores
+# PKG_CONFIG_PATH; this is the variable it honours. Without it FFmpeg's
+# configure cannot find the opus / SVT-AV1 built below.
+ENV EM_PKG_CONFIG_PATH="${PREFIX}/lib/pkgconfig"
 
 RUN mkdir -p ${BUILD} ${PREFIX}
 WORKDIR ${BUILD}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      git cmake ninja-build build-essential pkg-config yasm && \
+      git cmake ninja-build build-essential pkg-config yasm \
+      autoconf automake libtool && \
     rm -rf /var/lib/apt/lists/*
 
 # -----------------------------------------------------------------------------
@@ -53,7 +58,8 @@ RUN git clone --depth 1 --branch ${OPUS_VERSION} https://github.com/xiph/opus.gi
     cd opus && ./autogen.sh && \
     emconfigure ./configure --prefix=${PREFIX} --disable-shared --enable-static \
       --disable-doc --disable-extra-programs \
-      --disable-asm --disable-rtcd --disable-intrinsics && \
+      --disable-asm --disable-rtcd --disable-intrinsics \
+      --disable-stack-protector && \
     emmake make -j"$(nproc)" && emmake make install
 
 # -----------------------------------------------------------------------------
@@ -74,10 +80,25 @@ RUN git clone --depth 1 --branch ${SVTAV1_VERSION} https://gitlab.com/AOMediaCod
     ninja -j"$(nproc)" && ninja install
 
 # -----------------------------------------------------------------------------
+# 2b. Stack-protector stub. SVT-AV1's CMake always adds -fstack-protector-strong
+#     and Emscripten ships no libssp, so the link needs these two symbols.
+# -----------------------------------------------------------------------------
+RUN printf '%s\n' '#include <stdint.h>' '#include <stdlib.h>' \
+      'uintptr_t __stack_chk_guard = (uintptr_t)0x595e9fbdu;' \
+      'void __stack_chk_fail(void) { abort(); }' > ssp_stub.c && \
+    emcc -O2 -pthread -c ssp_stub.c -o ssp_stub.o && \
+    emar rcs ${PREFIX}/lib/libssp_stub.a ssp_stub.o
+
+# -----------------------------------------------------------------------------
 # 3. FFmpeg  (mirrors the original configure line, components bumped)
+#    The sed: FFmpeg 7.x treats any clang that accepts "-?" as clang-cl and
+#    switches to MSVC flags (-nologo, -Fo). emcc accepts "-?", so drop the probe.
+#    `make` ends by linking a plain ffmpeg_g, which fails under Emscripten
+#    ("initial memory too small"); only the objects and archives are needed.
 # -----------------------------------------------------------------------------
 RUN git clone --depth 1 --branch ${FFMPEG_VERSION} https://git.ffmpeg.org/ffmpeg.git && \
     cd ffmpeg && \
+    sed -i 's/ || { \$_cc -v 2>&1 | grep -q clang \&\& \$_cc -? > \/dev\/null 2>&1; }//' configure && \
     emconfigure ./configure \
       --prefix=${PREFIX} \
       --target-os=none \
@@ -93,8 +114,10 @@ RUN git clone --depth 1 --branch ${FFMPEG_VERSION} https://git.ffmpeg.org/ffmpeg
       --enable-libopus  --enable-encoder=libopus --enable-decoder=opus \
       --nm=emnm --ar=emar --ranlib=emranlib --cc=emcc --cxx=em++ \
       --extra-cflags="${CFLAGS}" --extra-cxxflags="${CXXFLAGS}" --extra-ldflags="${LDFLAGS}" \
+      --extra-libs="-lssp_stub" \
       --pkg-config=pkg-config --pkg-config-flags="--static" && \
-    emmake make -j"$(nproc)"
+    (emmake make -j"$(nproc)" || true) && \
+    ls fftools/ffmpeg.o libavcodec/libavcodec.a libavfilter/libavfilter.a libavformat/libavformat.a
 
 # -----------------------------------------------------------------------------
 # 4. Final Emscripten link into the browser-loadable ffmpeg.js/.wasm/.worker.js
@@ -105,8 +128,8 @@ RUN mkdir -p ${BUILD}/dist && cd ${BUILD}/ffmpeg && \
     emcc -O2 -pthread \
       -o ${BUILD}/dist/ffmpeg.js \
       fftools/*.o libavcodec/*.a libavfilter/*.a libavformat/*.a \
-      libavutil/*.a libswresample/*.a libswscale/*.a \
-      ${PREFIX}/lib/libSvtAv1Enc.a ${PREFIX}/lib/libopus.a \
+      libavdevice/*.a libpostproc/*.a libavutil/*.a libswresample/*.a libswscale/*.a \
+      ${PREFIX}/lib/libSvtAv1Enc.a ${PREFIX}/lib/libopus.a ${PREFIX}/lib/libssp_stub.a \
       -sUSE_PTHREADS=1 \
       -sPTHREAD_POOL_SIZE=8 \
       -sPROXY_TO_PTHREAD=1 \

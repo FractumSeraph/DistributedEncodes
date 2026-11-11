@@ -137,6 +137,30 @@ self.onmessage = async function(e) {
 // keyframe-aligned segment (with an accurate lead offset in the response
 // headers); we seek into it and encode exactly [start, start+dur], matching
 // what a native chunk worker produces so assembly tiles perfectly.
+// FFmpeg runs on its own thread (PROXY_TO_PTHREAD), so this worker stays free
+// while it encodes. FFmpeg appends key=value progress blocks to a file in the
+// in-memory filesystem; read the latest encoded position from it and pass it
+// to the page, which shows it and sends it to the manager as real progress.
+// (-progress and -stats_period only control reporting, not the encode.)
+function startProgressPoll(FS, progPath, totalSec) {
+    let lastSec = -1;
+    const id = setInterval(() => {
+        try {
+            const txt = FS.readFile(progPath, { encoding: 'utf8' });
+            const at = txt.lastIndexOf('out_time_us=');
+            if (at < 0) return;
+            const us = parseInt(txt.slice(at + 12, at + 40), 10);
+            if (!Number.isFinite(us) || us < 0) return;
+            const sec = us / 1e6;
+            if (sec <= lastSec) return;
+            lastSec = sec;
+            const pct = (totalSec > 0) ? Math.max(0, Math.min(99, Math.floor(sec / totalSec * 100))) : null;
+            postMessage({ type: 'progress', sec: sec, pct: pct });
+        } catch (e) { /* file not created yet */ }
+    }, 5000);
+    return () => clearInterval(id);
+}
+
 async function processChunk(chunk) {
     const FS = self.Module.FS || self.FS;
     const callMain = self.Module.callMain || self.callMain;
@@ -144,6 +168,8 @@ async function processChunk(chunk) {
 
     const segPath = "/tmp/seg_" + Date.now() + ".mkv";
     const outPath = "/tmp/cout_" + Date.now() + ".mp4";
+    const progPath = "/tmp/cprog_" + Date.now() + ".txt";
+    let stopProgress = () => {};
     const crf = (chunk.content_profile === 'live_action') ? '57' : '63';
 
     postMessage({type: 'log', level: 'sys', msg: `Chunk ${chunk.chunk_index} of ${chunk.filename}: downloading segment...`});
@@ -185,12 +211,15 @@ async function processChunk(chunk) {
             ...etbArgs,
             '-vf', 'setpts=PTS-STARTPTS,scale=-2:480',
             '-movflags', '+faststart',
+            '-progress', progPath, '-stats_period', '5',
             outPath
         ];
         currentOutputPath = outPath;
         const ffmpegPromise = new Promise((resolve, reject) => { self.resolveJob = resolve; self.rejectJob = reject; });
         callMain(args);
+        stopProgress = startProgressPoll(FS, progPath, dur);
         await ffmpegPromise;
+        stopProgress();
 
         let exists = false;
         try { FS.stat(outPath); exists = true; } catch(e) {}
@@ -214,9 +243,11 @@ async function processChunk(chunk) {
         if (!up.ok) throw new Error("Chunk upload failed: " + up.status);
         postMessage({type: 'chunk_done'});
     } finally {
+        stopProgress();
         currentOutputPath = null;
         try { FS.unlink(segPath); } catch(e) {}
         try { FS.unlink(outPath); } catch(e) {}
+        try { FS.unlink(progPath); } catch(e) {}
     }
 }
 
@@ -233,6 +264,8 @@ async function processJob(job) {
     const outputFilename = "output_" + Date.now() + ".mp4";
     const inputPath = "/tmp/" + inputFilename;
     const outputPath = "/tmp/" + outputFilename;
+    const progPath = "/tmp/prog_" + Date.now() + ".txt";
+    let stopProgress = () => {};
 
     postMessage({type: 'log', level: 'sys', msg: `Worker processing: ${job.filename}`});
 
@@ -309,6 +342,7 @@ async function processJob(job) {
             '-b:a', '24k',
             '-ac', '1',
             '-strict', '-2',
+            '-progress', progPath, '-stats_period', '5',
             outputPath
         ];
 
@@ -324,8 +358,11 @@ async function processJob(job) {
         // callMain might return immediately if proxied, or block. 
         // We await our custom promise which is triggered by Module.quit
         callMain(args);
-        
+        const totalSec = parseFloat((job.stream_meta && job.stream_meta.duration) || 0) || 0;
+        stopProgress = startProgressPoll(FS, progPath, totalSec);
+
         await ffmpegPromise;
+        stopProgress();
 
         // 4. Read Output
         postMessage({type: 'log', level: 'sys', msg: "Reading output..."});
@@ -375,10 +412,12 @@ async function processJob(job) {
     } catch (e) {
         throw e;
     } finally {
+        stopProgress();
         currentOutputPath = null;
         // Cleanup
         try {
             if (FS) {
+                try { FS.unlink(progPath); } catch(e) {}
                 try { FS.unlink(inputPath); } catch(e) {}
                 try { FS.unlink(outputPath); } catch(e) {}
             }
