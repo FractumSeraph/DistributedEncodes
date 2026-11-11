@@ -350,16 +350,33 @@ async function processJob(job) {
         //    mov_text is a common hard-failure, and bitmap subs can't convert.
         //  - lp=1 keeps browser memory down (native workers pass no
         //    -svtav1-params; lp only limits threading, not the bitstream).
-        //  - '-c:a opus' + '-strict -2' is FFmpeg's built-in Opus encoder.
-        //    The current wasm also contains libopus (what native workers
-        //    use), but the audio encoder is deliberately left as it was.
+        //  - Audio is encoded like the native workers do it: libopus, 24k,
+        //    mono. When the manager sent the source's stream layout, the same
+        //    track is picked and the same mono downmix is applied (centre
+        //    channel favoured on surround sources so dialogue stays clear).
+        //    Without that layout, the first audio track is taken if there is
+        //    one and FFmpeg's default downmix is used.
+        let audioMap = ['-map', '0:a:0?'];
+        let audioFilter = [];
+        const sm = job.stream_meta || null;
+        if (sm && sm.audio_index !== null && sm.audio_index !== undefined) {
+            const idx = parseInt(sm.audio_index, 10);
+            const ch = parseInt(sm.audio_channels, 10);
+            if (Number.isFinite(idx) && idx >= 0 && Number.isFinite(ch) && ch >= 1) {
+                audioMap = ['-map', `0:${idx}`];
+                const af = (ch > 2) ? 'pan=mono|c0=0.5*FC+0.25*FL+0.25*FR+0.1*BL+0.1*BR,aresample=async=1'
+                         : (ch === 2) ? 'pan=mono|c0=0.5*c0+0.5*c1,aresample=async=1'
+                         : 'aresample=async=1';
+                audioFilter = ['-af', af];
+            }
+        }
         const crf = (job.content_profile === 'live_action') ? '57' : '63';
         const args = [
             '-threads', '1',
             '-v', 'verbose',
             '-i', inputPath,
             '-map', '0:v:0',
-            '-map', '0:a:0?',
+            ...audioMap,
             '-sn',
             '-c:v', 'libsvtav1',
             '-preset', '2',
@@ -367,10 +384,10 @@ async function processJob(job) {
             '-pix_fmt', 'yuv420p',
             '-svtav1-params', 'lp=1',
             '-vf', 'scale=-2:480',
-            '-c:a', 'opus',
+            '-c:a', 'libopus',
             '-b:a', '24k',
             '-ac', '1',
-            '-strict', '-2',
+            ...audioFilter,
             '-progress', progPath, '-stats_period', '5',
             outputPath
         ];
