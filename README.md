@@ -411,7 +411,7 @@ Volunteers can encode small files directly in their browser — no Python, no FF
 - Subtitles are dropped in the browser (no `ffprobe` in the wasm build to filter subtitle types safely); output is video + Opus audio.
 - A `WALLET` field on the page credits FractumCoin earnings just like the native `--wallet` flag.
 
-> The dashboard's "Run worker app" dialog links to `/web` last, labelled as the slower option, and the `/web` page points back to the app instructions (`/#run-worker`). Native workers are preferred: the browser build runs at roughly a quarter of native single-thread speed, uses one encoder thread, and only works while the tab is open.
+> The dashboard's "Run worker app" dialog links to `/web` last, labelled as the slower option, and the `/web` page points back to the app instructions (`/#run-worker`). Native workers are preferred: the browser build is at least four times slower than a native worker (a quarter of native speed on a single thread, and it only uses one), and only works while the tab is open.
 
 ## Utility Scripts
 

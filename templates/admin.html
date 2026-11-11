@@ -47,7 +47,18 @@
         
         .scroll-box { max-height: 500px; overflow-y: auto; }
         table { width: 100%; border-collapse: collapse; font-size: 0.85em; table-layout: fixed; }
-        th, td { padding: 8px 10px; text-align: left; border-bottom: 1px dotted #333; }
+        /* overflow-wrap: long file names and job ids have no spaces, and in a
+           fixed-layout table they used to spill over the next column. */
+        th, td { padding: 8px 10px; text-align: left; border-bottom: 1px dotted #333; overflow-wrap: anywhere; }
+        .card { overflow-x: auto; }
+        .card-header { flex-wrap: wrap; gap: 8px; }
+        @media (max-width: 760px) {
+            .toolbar, .toolbar-group { flex-wrap: wrap; max-width: 100%; }
+            .toolbar-group { min-width: 0; border-right: none; padding-right: 0; }
+            #config-remote-url { width: 100% !important; }
+            .card table { min-width: 680px; }
+            input[type="text"] { width: 100%; max-width: 100%; }
+        }
         th { color: var(--neon-purple); position: sticky; top: 0; background: #0a0a0a; z-index: 2; }
         
         .st-failed { color: var(--neon-red); }
@@ -126,9 +137,9 @@
         </div>
 
         <div class="toolbar" style="margin-top: 20px;">
-            <div class="label">CONFIG:</div>
+            <div class="label">REMOTE SOURCE URL:</div>
             <div class="toolbar-group">
-                <input type="text" id="config-remote-url" placeholder="Remote Source URL..." style="width: 350px;">
+                <input type="text" id="config-remote-url" placeholder="Remote Source URL..." style="width: 350px; max-width: 100%;">
                 <button onclick="saveConfig()" style="border-color: var(--neon-purple); color: var(--neon-purple);">SAVE</button>
             </div>
         </div>
@@ -465,7 +476,7 @@
                     <td><span class="worker-tag">${escapeHTML(r.worker_id||'-')}</span></td>
                     <td style="font-size:0.82em; color:#aaa;" title="${escapeHTML(r.job_id||'')}">${escapeHTML(jobShort||r.job_id||'-')}</td>
                     <td><span class="et-badge ${etClass}">${escapeHTML(r.error_type||'?')}</span></td>
-                    <td style="word-break:break-all; font-size:0.85em;">${escapeHTML((r.message||'').slice(0,180))}${(r.message||'').length>180?'…':''}</td>
+                    <td style="font-size:0.85em;">${escapeHTML((r.message||'').slice(0,180))}${(r.message||'').length>180?'…':''}</td>
                 </tr>${detailRow}`;
             }).join('');
         }
@@ -507,7 +518,7 @@
                 if ((j.status === 'failed' || j.status === 'permanently_failed') && jobFilters.failed) statusMatch = true;
                 if (j.status === 'completed' && jobFilters.completed) statusMatch = true;
                 if (j.status === 'queued' && jobFilters.queued) statusMatch = true;
-                if (['processing', 'downloading', 'uploading'].includes(j.status) && jobFilters.processing) statusMatch = true;
+                if (['processing', 'downloading', 'uploading', 'paused'].includes(j.status) && jobFilters.processing) statusMatch = true;
                 if (!statusMatch) return false;
 
                 if (search) {
@@ -547,7 +558,7 @@
 
                     return `<tr>
                         <td title="${escapeHTML(j.id)}">${escapeHTML(cleanName)}</td>
-                        <td class="st-${j.status}">${j.status.toUpperCase()} ${warningBadge}</td>
+                        <td class="st-${j.status}" style="overflow-wrap: normal;">${j.status.toUpperCase().replace(/_/g, ' ')} ${warningBadge}</td>
                         <td>${workerDisplay}</td>
                         <td>${actions}</td>
                     </tr>`;
@@ -576,8 +587,8 @@
                     return `<tr>
                         <td style="color:#666; font-size:0.85em;">${fmtTs(l.timestamp)}</td>
                         <td class="${cssClass}">${l.level}</td>
-                        <td style="word-break: break-all;">${escapeHTML(l.message)}</td>
-                        <td style="font-size:0.8em; color:#888;">${escapeHTML(l.related_id || '')}</td>
+                        <td>${escapeHTML(l.message)}</td>
+                        <td style="font-size:0.8em; color:#888;" title="${escapeHTML(l.related_id || '')}">${escapeHTML(String(l.related_id || '').split('/').pop())}</td>
                     </tr>`;
                 }).join('');
             }

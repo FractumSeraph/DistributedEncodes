@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.9.1"
+WORKER_VERSION = "3.9.2"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -284,6 +284,13 @@ if HAS_TEXTUAL:
         drop the release-group boilerplate in the middle."""
         if width < 8 or len(name) <= width:
             return name if len(name) <= width else name[:max(0, width)]
+        # A trailing "[chunk 3]" / "[audio]" tag is kept whole: cut into, it
+        # read as "…hunk 3]".
+        _m = re.search(r'\s(\[[^\[\]]{1,16}\])$', name)
+        if _m and len(_m.group(1)) + 5 <= width:
+            tag = _m.group(1)
+            room = width - len(tag) - 2          # "…" and the space before the tag
+            return name[:room] + "… " + tag
         head = (width - 1) * 2 // 3
         tail = width - 1 - head
         return name[:head] + "…" + name[-tail:]
@@ -399,9 +406,12 @@ if HAS_TEXTUAL:
         """
 
         BINDINGS = [  # type: ignore[assignment]
-            Binding("p", "request_pause", "Pause  [P]", show=True, priority=True),
-            Binding("q", "request_quit",  "Quit   [Q]", show=True, priority=True),
+            Binding("p", "request_pause", "Pause", show=True, priority=True),
+            Binding("q", "request_quit",  "Quit", show=True, priority=True),
         ]
+        # Textual's command palette (ctrl+p) has nothing useful here and its
+        # footer hint sat next to the real keys.
+        ENABLE_COMMAND_PALETTE = False
 
         def __init__(self, worker_ids: list, threads: list,
                      quota_tracker=None, manager_url: str = "", **kwargs):
@@ -429,7 +439,10 @@ if HAS_TEXTUAL:
             # to be swallowed and the second press to actually trigger the App binding.
             yield DataTable(id="workers-table", show_cursor=False)
             yield Label("", id="stats-bar", markup=False)
-            yield RichLog(id="log-panel", highlight=True, markup=False, max_lines=1000)
+            # wrap: long lines (file names) used to run off the right edge
+            # behind a horizontal scrollbar. highlight off: it coloured stray
+            # numbers inside file names ("2019", "1080") for no reason.
+            yield RichLog(id="log-panel", highlight=False, markup=False, wrap=True, max_lines=1000)
             yield Footer()
 
         def on_mount(self) -> None:
@@ -438,26 +451,43 @@ if HAS_TEXTUAL:
             # to its header + the initial '-' placeholder and update_width=False
             # freezes that forever — "Current File" was stuck at 12 cells and
             # "ETA" at 3, clipping everything written into them later.
-            w_worker = max(6, min(18, max((len(w) for w in self._worker_ids), default=6)))
+            # Every row belongs to the same user, so the "username-" prefix is
+            # dropped from the row labels (it is in the title bar instead).
+            # With it, an 18-cell column showed "FractumSera…sair-1": the user
+            # name twice over and the worker name cut in half.
+            _prefix = ""
+            if self._worker_ids and '-' in self._worker_ids[0]:
+                _cand = self._worker_ids[0].split('-', 1)[0] + '-'
+                if all(w.startswith(_cand) and len(w) > len(_cand) for w in self._worker_ids):
+                    _prefix = _cand
+            self._row_labels = {w: w[len(_prefix):] for w in self._worker_ids}
+            w_worker = max(6, min(22, max((len(l) for l in self._row_labels.values()), default=6)))
             # Fixed columns + per-cell padding + table chrome; whatever is left
             # of the terminal goes to the file name column.
-            fixed = w_worker + 10 + 21 + 8 + 7 + 8 + (2 * 7) + 6
-            self._file_w = max(20, min(64, get_term_width() - fixed))
+            fixed = w_worker + 10 + 21 + 7 + 6 + 7 + (2 * 7) + 6
+            self._file_w = max(16, min(64, get_term_width() - fixed))
             _cw               = table.add_column("Worker",       width=w_worker)
             self._col_file    = table.add_column("Current File", width=self._file_w)
             self._col_phase   = table.add_column("Phase",        width=10)
             self._col_bar     = table.add_column("Progress",     width=21)
-            self._col_elapsed = table.add_column("Elapsed",      width=8)
-            self._col_done    = table.add_column("Done",         width=7)
-            self._col_eta     = table.add_column("ETA",          width=8)
+            self._col_elapsed = table.add_column("Elapsed",      width=7)
+            self._col_done    = table.add_column("Done",         width=6)
+            self._col_eta     = table.add_column("ETA",          width=7)
             for wid in self._worker_ids:
                 # Long worker ids get middle-truncated for display; the row KEY
                 # stays the full id, so updates and lookups are unaffected. The
                 # thread suffix (-1/-2) survives at the end.
-                table.add_row(_fit_name(wid, w_worker), "-", "Starting", _make_bar(0), "-", "0", "-", key=wid)
+                # Text(), not str: a plain string is parsed as Rich markup, and
+                # anything in [square brackets] silently disappears.
+                table.add_row(Text(_fit_name(self._row_labels[wid], w_worker)), "-", "Starting",
+                              _make_bar(0), "-", "0", "-", key=wid)
             self.title = "Fractum Distributed Worker"
             url_display = self._manager_url or "no manager"
-            self.sub_title = f"v{WORKER_VERSION}  \u2502  {len(self._worker_ids)} worker(s)  \u2502  {url_display}"
+            _who = _prefix.rstrip('-')
+            _n = len(self._worker_ids)
+            self.sub_title = (f"v{WORKER_VERSION}"
+                              + (f"  \u2502  {_who}" if _who else "")
+                              + f"  \u2502  {_n} job slot{'s' if _n != 1 else ''}  \u2502  {url_display}")
             self.set_interval(0.5, self._tick)
             self.set_interval(0.25, self._check_signals)
             self.set_interval(1.5, self._check_all_done)
@@ -582,7 +612,9 @@ if HAS_TEXTUAL:
                 done_display = f"{jobs_done}" if not jobs_failed else f"{jobs_done} \u2717{jobs_failed}"
 
                 try:
-                    table.update_cell(wid, self._col_file,    fn_display,              update_width=False)
+                    # Text(): "[chunk 3/31]" in a plain string is taken for
+                    # markup and dropped, so chunk rows showed only the file.
+                    table.update_cell(wid, self._col_file,    Text(fn_display),        update_width=False)
                     table.update_cell(wid, self._col_phase,   phase_text,              update_width=False)
                     table.update_cell(wid, self._col_bar,     bar_text,                update_width=False)
                     table.update_cell(wid, self._col_elapsed, _fmt_elapsed(elapsed),   update_width=False)
