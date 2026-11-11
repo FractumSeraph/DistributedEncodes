@@ -111,6 +111,8 @@
         #pending { color: var(--text-dim); }
         #processing { color: var(--neon-pink) !important; text-shadow: 0 0 5px var(--neon-pink); }
         #done { color: var(--neon-purple) !important; text-shadow: 0 0 5px var(--neon-purple); }
+        #eta { font-size: 1.5em; line-height: 1.34; white-space: nowrap; }
+        @media (max-width: 480px) { #eta { font-size: 1.15em; line-height: 1.75; } }
 
         /* Grid Layout */
         .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 25px; }
@@ -229,6 +231,7 @@
             <div class="kpi"><div class="val" id="processing">--</div><div class="label">Active Workers</div></div>
             <div class="kpi"><div class="val" id="done">--</div><div class="label">Completed</div></div>
             <div class="kpi"><div class="val" id="completion-pct">--%</div><div class="label">% Complete</div></div>
+            <div class="kpi" id="eta-tile" title=""><div class="val" id="eta">--</div><div class="label">Est. Time Left</div></div>
         </div>
         
         <div class="grid">
@@ -430,6 +433,27 @@
                 const totalCompleted = rawData.total_completed || 0;
                 const completionPct = totalAll > 0 ? Math.round(100 * totalCompleted / totalAll) : 0;
                 document.getElementById('completion-pct').innerText = completionPct + '%';
+
+                // Time left at the pace of the last 7 days (the last 24h alone
+                // swings too much with who happens to be online).
+                const tp = rawData.throughput || {};
+                const perDay = (tp.completed_7d || 0) / 7;
+                const remaining = (typeof data.queue.pending === 'number' ? data.queue.pending : 0)
+                                  + (rawData.active_jobs || 0);
+                let etaText = '\u2014', etaTitle = 'No videos finished in the last 7 days.';
+                if (remaining === 0) {
+                    etaText = 'DONE'; etaTitle = 'Nothing left in the queue.';
+                } else if (perDay > 0) {
+                    const days = remaining / perDay;
+                    etaText = days < 1.5 ? '~1 day'
+                            : days < 60 ? `~${Math.round(days)} days`
+                            : days < 730 ? `~${Math.round(days / 30.4)} months`
+                            : `~${(days / 365).toFixed(1)} years`;
+                    etaTitle = `${remaining} videos left at ${perDay.toFixed(1)} per day `
+                             + `(${tp.completed_7d} finished in the last 7 days, ${tp.completed_24h || 0} in the last 24 hours).`;
+                }
+                document.getElementById('eta').innerText = etaText;
+                document.getElementById('eta-tile').title = etaTitle;
                 
                 const lb = document.getElementById('lb-table');
                 lb.innerHTML = data.users.length ? data.users.map((u,i) => 

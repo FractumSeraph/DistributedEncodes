@@ -3752,10 +3752,22 @@ def api_stats():
 
             c.execute("SELECT COUNT(*) FROM jobs WHERE status='completed'")
             total_completed = c.fetchone()[0]
+
+            # Recent throughput, for the dashboard's time-remaining estimate.
+            # last_updated is stamped when a job completes (local time, as a
+            # Python datetime, so the cut-offs are passed the same way).
+            _now = datetime.now()
+            c.execute("SELECT COUNT(*) FROM jobs WHERE status='completed' AND last_updated > ?",
+                      (_now - timedelta(days=1),))
+            completed_24h = c.fetchone()[0]
+            c.execute("SELECT COUNT(*) FROM jobs WHERE status='completed' AND last_updated > ?",
+                      (_now - timedelta(days=7),))
+            completed_7d = c.fetchone()[0]
         finally:
             conn.close()
     return jsonify({"scoreboard": sb, "active": act, "active_jobs": active_jobs, "history": hist, "queue_depth": queue_depth, "queue_items": queue_items, "total_jobs": total_count, "total_completed": total_completed,
                     "queue_stalled": queue_stalled, "queue_stalled_items": queue_stalled_items,
+                    "throughput": {"completed_24h": completed_24h, "completed_7d": completed_7d},
                     "code": _code_revision()})
 
 @app.route('/api/all_jobs')
