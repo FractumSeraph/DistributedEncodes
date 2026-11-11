@@ -350,11 +350,9 @@ async function processJob(job) {
         //    mov_text is a common hard-failure, and bitmap subs can't convert.
         //  - lp=1 keeps browser memory down (native workers pass no
         //    -svtav1-params; lp only limits threading, not the bitstream).
-        //  - '-c:a opus' + '-strict -2' is FFmpeg's built-in encoder: the
-        //    DEPLOYED wasm was configured without --enable-libopus, so libopus
-        //    isn't available. The wasm-build/ Dockerfile DOES enable it — after
-        //    a rebuild, switch this to '-c:a libopus' (and drop -strict) for
-        //    parity with native workers.
+        //  - '-c:a opus' + '-strict -2' is FFmpeg's built-in Opus encoder.
+        //    The current wasm also contains libopus (what native workers
+        //    use), but the audio encoder is deliberately left as it was.
         const crf = (job.content_profile === 'live_action') ? '57' : '63';
         const args = [
             '-threads', '1',

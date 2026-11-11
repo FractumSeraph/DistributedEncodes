@@ -1,106 +1,115 @@
-# Rebuilding the browser worker's FFmpeg WebAssembly
+# The browser worker's FFmpeg WebAssembly build
 
-The in-browser worker (`/web`) runs a custom FFmpeg compiled to WebAssembly with
-**SVT-AV1** and **libopus**. This directory rebuilds it reproducibly with Docker,
-so you can pick up newer AV1 development without remembering the original steps.
+The in-browser worker (`/web`) runs FFmpeg compiled to WebAssembly with
+**SVT-AV1** and **libopus**. `static/ffmpeg.js` and `static/ffmpeg.wasm` are
+built by `build.sh` in this directory:
 
-## What the original build was
+- FFmpeg n7.1, SVT-AV1 v2.3.0, opus v1.5.2
+- Emscripten **4.0.10**
+- SVT-AV1's x86 SSE2–AVX2 *intrinsics* compiled to WebAssembly SIMD
 
-Recovered from the shipped `static/ffmpeg.wasm`:
-
-- **FFmpeg 6.1** (`Lavc60.31.102`)
-- Emscripten toolchain, `--arch=x86_32` (32-bit), `-pthread`
-- `--enable-gpl --enable-libsvtav1`, libopus statically linked
-- `--disable-network --disable-ffprobe --disable-ffplay --disable-doc`
-- Output: `ffmpeg.js` + `ffmpeg.wasm` + `ffmpeg.worker.js` (classic pthread build,
-  non-modularized — `web_node.js` does `importScripts('ffmpeg.js')` and uses the
-  global `self.Module`).
-
-The `Dockerfile` here reproduces that configuration and bumps the components to
-current releases (FFmpeg 7.1, SVT-AV1 2.3.0, opus 1.5.2 by default — change the
-`ARG` lines to pin whatever you want).
-
-## Why the previous build could not finish an encode
-
-The `ffmpeg.wasm` shipped before this rebuild (FFmpeg 6.1 + **SVT-AV1 v1.8.0**) started
-encoding and then died with `RuntimeError: unreachable` as soon as the first
-frame reached SVT-AV1's picture manager. It never produced output, for any
-input size.
-
-Cause: in SVT-AV1 1.8.0, `rtime_alloc_palette_tokens()` is *declared* in
-`EbPictureManagerProcess.c` as returning `void` but *defined* in
-`EbPictureControlSet.c` as returning `EbErrorType`. Native compilers tolerate
-that. WebAssembly checks call signatures, so the linker replaces the call with
-a stub that traps. (In the shipped binary: function 50, a bare `unreachable`,
-called once from the picture manager kernel.)
-
-Upstream fixed it in **v2.0.0** (the function became `static` with one
-signature), so any build from SVT-AV1 2.x or later avoids it. The Dockerfile
-here pins v2.3.0. When linking, treat any `function signature mismatch`
-warning from `wasm-ld` as a build failure: each one is a guaranteed trap at
-run time.
+Its output is byte-identical to a native build of SVT-AV1 2.3.0 with the same
+settings (checked on two clips at preset 2, CRF 63, one thread).
 
 ## Build it
 
+With Docker:
+
 ```bash
-# from the repo root
 docker build -t fractum-ffwasm ./wasm-build
-
-# copy the three artifacts into static/ (overwrites the old wasm)
 docker run --rm -v "$PWD/static:/out" fractum-ffwasm \
-  sh -c 'cp -a /build/dist/ffmpeg.js /build/dist/ffmpeg.wasm /build/dist/ffmpeg.worker.js /out/'
+  cp /build/dist/ffmpeg.js /build/dist/ffmpeg.wasm /out/
 ```
 
-Then hard-refresh `/web` (the page already cache-busts the worker URL) and run a
-small test file through it.
+Or natively, with emsdk 4.0.10 active (`source emsdk_env.sh`):
 
-## Bumping versions
-
-Edit the `ARG` lines at the top of the `Dockerfile`:
-
-```dockerfile
-ARG FFMPEG_VERSION=n7.1
-ARG SVTAV1_VERSION=v2.3.0
-ARG OPUS_VERSION=v1.5.2
-ARG EMSDK_VERSION=3.1.51
+```bash
+BUILD=/some/scratch/dir bash wasm-build/build.sh
+cp /some/scratch/dir/dist/ffmpeg.js /some/scratch/dir/dist/ffmpeg.wasm static/
 ```
 
-SVT-AV1 has moved a lot since your original build — newer releases encode faster
-at the same quality, so a bump is worthwhile.
+`build.sh` is what produced the committed files (run natively). The Dockerfile
+wraps the same script and has not itself been run.
 
-## What the build needed (all already in the Dockerfile)
+## How SVT-AV1 gets its SIMD (`svt-wasm-simd/`)
 
-The files now in `static/` were produced by running the Dockerfile's steps
-natively with emsdk 3.1.51 (FFmpeg n7.1, SVT-AV1 v2.3.0, opus v1.5.2). The
-recipe as first written failed at four points; each has a workaround in place:
+SVT-AV1 is slow without vector code: built as plain C it encodes at about a
+quarter of the speed below. Its vector code is x86-only, in two forms:
 
-1. **FFmpeg 7.x mistakes `emcc` for clang-cl.** Its configure treats any clang
-   that accepts `-?` as clang-cl and switches to MSVC flags (`-nologo`, `-Fo`).
-   A `sed` drops that probe.
-2. **pkg-config cannot see the libraries just built.** `emconfigure` points
-   pkg-config at Emscripten's sysroot and ignores `PKG_CONFIG_PATH`; it honours
-   `EM_PKG_CONFIG_PATH`.
-3. **Stack protector.** opus and SVT-AV1 both turn on `-fstack-protector-strong`
-   and Emscripten has no libssp. opus takes `--disable-stack-protector`;
-   SVT-AV1 has no switch, so a two-symbol stub library is linked in.
-4. **Final link.** `--enable-gpl` builds `libpostproc`, and `fftools` needs
-   `libavdevice`; both must be on the link line. FFmpeg's own `make` ends by
-   linking a plain `ffmpeg_g`, which fails under Emscripten ("initial memory too
-   small") and is ignored: only the objects and archives are used.
+- **intrinsics** (C files using `_mm_*` / `_mm256_*`), which Emscripten can
+  compile to WebAssembly SIMD with `-msimd128 -mavx2` (256-bit vectors are
+  emulated with two 128-bit ones);
+- **hand-written assembly** (`.asm`), which cannot be built for WebAssembly.
 
-`web_node.js` expects a separate `ffmpeg.worker.js`. Emscripten 3.1.51 emits
-one; newer versions may not, in which case pin the version or update the worker
-bootstrap in `web_node.js`.
+`patch_svt.py` makes the Emscripten build take the x86 path: it defines
+`ARCH_X86_64`, skips NASM, cpuinfo and AVX-512, and reports SSE2–AVX2 as
+available (there is no `cpuid`).
+
+`gen_fallbacks.py` deals with the assembly. After a first compile it reads the
+library's symbol table and writes two headers:
+
+- `wasm_simd_asm_fallbacks.h` (force-included everywhere): functions that
+  exist *only* as assembly are renamed to their C version.
+- `wasm_simd_rtcd_fallbacks.h` (included by the two run-time dispatch files):
+  intrinsics wrappers that call assembly helpers are replaced, in the dispatch
+  tables, by SVT-AV1's own non-assembly implementation. This includes the
+  dav1d inverse transforms.
+
+`overlay/` holds the hand-written parts:
+
+- `wasm_simd_intrinsics.h`: exact WebAssembly-SIMD versions of `MPSADBW` and
+  `PHMINPOSUW`. Emscripten emulates both with scalar loops, and SVT-AV1's
+  motion search is built on them: with the stock emulation one SAD kernel was
+  about 70% of all compute.
+- `wasm_simd_asm_helpers.c`: C versions of seven small filter helpers that
+  only exist as assembly, so the AVX2 convolve can be used.
+
+One AVX2 function, `svt_copy_mi_map_grid_avx2`, gives a different result under
+Emscripten's 256-bit emulation and corrupts the bitstream. It was found by
+switching each of the 542 AVX2 dispatch entries on and off against the C
+build's output, and is redirected to its C version.
+
+### Measured (standalone encoder under Node, 640x480, preset 2, CRF 63, lp=1)
+
+| Build                                   | Speed    |
+|-----------------------------------------|----------|
+| Plain C                                 | 0.24 fps |
+| SIMD, stock Emscripten intrinsics       | 0.30 fps |
+| SIMD + fast MPSADBW / PHMINPOSUW        | 0.87 fps |
+| SIMD + those + AVX2 convolve (shipped)  | 1.02 fps |
+| Native, same version, AVX-512, lp=1     | 3.89 fps |
+
+All four WebAssembly rows produce the same bytes as the native build.
+
+## If you change versions
+
+- **Emscripten.** 3.1.x has no AVX2 intrinsics. **7.0.0 miscompiles SVT-AV1 at
+  `-O2` and above** even as plain C: only the first frame decodes. After any
+  toolchain change, encode a clip with the standalone encoder and compare its
+  md5 against a native build of the same SVT-AV1 version.
+- **SVT-AV1.** The patch anchors and the fallback lists are for v2.3.0. A new
+  version needs `gen_fallbacks.py` re-run and the bisection repeated if the
+  output stops matching. v1.8.0 and earlier cannot work at all: they declare
+  `rtime_alloc_palette_tokens()` with two different return types, which
+  WebAssembly turns into a trap on the first frame (fixed upstream in v2.0.0).
+  Treat any `function signature mismatch` warning from `wasm-ld` as a failure.
+- **FFmpeg 7.x build workarounds** already in `build.sh`: configure mistakes
+  `emcc` for clang-cl (a `sed` drops that probe); `emconfigure` needs
+  `EM_PKG_CONFIG_PATH`; opus and SVT-AV1 enable the stack protector, which
+  Emscripten has no library for (opus is built without it, SVT-AV1 gets a
+  two-symbol stub); `libavdevice` and `libpostproc` must be on the final link
+  line; FFmpeg's own `ffmpeg_g` link fails and is ignored.
 
 ## Known behaviour of this build
 
 - **It never exits.** FFmpeg encodes, finalises and closes the output, prints
   its final report, then hangs in its own shutdown and never calls `exit`.
-  `web_node.js` therefore treats `progress=end` in FFmpeg's `-progress` output
-  as completion, and the page starts a fresh worker before the next job.
-- **It is slow.** No SIMD and one encoder thread (`lp=1`). Measured in headless
-  Chromium: about 0.26 frames per second at 640x480, preset 2 (300 frames in
-  19 minutes), using roughly 570 MB.
+  `web_node.js` treats `progress=end` in FFmpeg's `-progress` output as
+  completion, and the page starts a fresh worker before the next job.
+- **Packets carry no duration.** Without help the MP4 comes out one frame
+  short, so `web_node.js` adds `-bsf:v setts=duration=1` to chunk encodes.
+- **Still slower than native.** One encoder thread (`lp=1`), emulated 256-bit
+  vectors, and no assembly: roughly a quarter of native single-thread speed.
 
 ## Memory reality (why this only takes small files)
 
