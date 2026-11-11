@@ -20,6 +20,26 @@ The `Dockerfile` here reproduces that configuration and bumps the components to
 current releases (FFmpeg 7.1, SVT-AV1 2.3.0, opus 1.5.2 by default — change the
 `ARG` lines to pin whatever you want).
 
+## Why the shipped build cannot finish an encode
+
+The `ffmpeg.wasm` currently in `static/` (FFmpeg 6.1 + **SVT-AV1 v1.8.0**) starts
+encoding and then dies with `RuntimeError: unreachable` as soon as the first
+frame reaches SVT-AV1's picture manager. It never produces output, for any
+input size.
+
+Cause: in SVT-AV1 1.8.0, `rtime_alloc_palette_tokens()` is *declared* in
+`EbPictureManagerProcess.c` as returning `void` but *defined* in
+`EbPictureControlSet.c` as returning `EbErrorType`. Native compilers tolerate
+that. WebAssembly checks call signatures, so the linker replaces the call with
+a stub that traps. (In the shipped binary: function 50, a bare `unreachable`,
+called once from the picture manager kernel.)
+
+Upstream fixed it in **v2.0.0** (the function became `static` with one
+signature), so any build from SVT-AV1 2.x or later avoids it. The Dockerfile
+here pins v2.3.0. When linking, treat any `function signature mismatch`
+warning from `wasm-ld` as a build failure: each one is a guaranteed trap at
+run time.
+
 ## Build it
 
 ```bash
