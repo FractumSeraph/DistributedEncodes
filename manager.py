@@ -591,13 +591,34 @@ def sanitize_txid(val):
     cleaned = re.sub(r'[^a-zA-Z0-9,:_.-]', '', str(val))[:2048]
     return cleaned or None
 
-def _record_earning(conn, wallet, worker_id, job_id, kind, chunk_index, minutes):
+def _record_earning(conn, wallet, worker_id, job_id, kind, chunk_index, minutes, provisional=0):
     """Append one verified upload to the FractumCoin earnings ledger.
-    Caller holds db_lock and commits."""
+    Caller holds db_lock and commits.
+
+    provisional=1 (video chunks): the credit is not payable until the job is
+    assembled from its chunks. If the job is finished as a whole file instead,
+    the whole-file worker is paid and these rows are voided."""
     conn.execute(
-        "INSERT INTO earnings (timestamp, wallet, worker_id, job_id, kind, chunk_index, minutes) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (datetime.now(), wallet, worker_id, job_id, kind, chunk_index, round(float(minutes), 3)))
+        "INSERT INTO earnings (timestamp, wallet, worker_id, job_id, kind, chunk_index, minutes, provisional) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (datetime.now(), wallet, worker_id, job_id, kind, chunk_index, round(float(minutes), 3),
+         1 if provisional else 0))
+
+def _void_provisional_chunk_credit(conn, job_id):
+    """Cancel chunk credit that never became part of a finished file.
+    Returns (rows, minutes) voided. Caller holds db_lock and commits.
+
+    The rows are kept (zeroed and closed) rather than deleted, so the ledger
+    still shows the upload happened. Rows already paid are never touched."""
+    cur = conn.execute("SELECT COUNT(*), COALESCE(SUM(minutes), 0) FROM earnings "
+                       "WHERE job_id=? AND COALESCE(provisional, 0)=1 AND paid=0", (job_id,))
+    n, mins = cur.fetchone()
+    if n:
+        conn.execute("UPDATE earnings SET minutes=0, kind='video_chunk_void', provisional=0, "
+                     "paid=1, paid_txid='VOID', paid_at=? "
+                     "WHERE job_id=? AND COALESCE(provisional, 0)=1 AND paid=0",
+                     (datetime.now(), job_id))
+    return int(n or 0), round(float(mins or 0), 3)
 
 def is_version_sufficient(client_ver, min_ver):
     if not client_ver: return False
@@ -1156,6 +1177,9 @@ def _restore_completed_chunks(c, job_id, ranges, has_track, now):
             and all(abs(a - x) < 0.001 and abs(b - y) < 0.001
                     for (a, b), (x, y) in zip(old_ranges, ranges)))
     if not same:
+        # Those uploads will never be part of a finished file, and the new
+        # plan's chunks earn their own credit.
+        _void_provisional_chunk_credit(c, job_id)
         # Synchronous removal (only of our own files): the async rmtree could
         # race the fresh plan.json written right after this returns.
         try:
@@ -1849,6 +1873,9 @@ def _assemble_job(job_id):
                 # upload), so the work-queue rows can go — keeps the chunks
                 # table holding only active work.
                 conn.execute("DELETE FROM chunks WHERE job_id=?", (job_id,))
+                # The chunks made it into a finished file: their credit is
+                # now final and payable.
+                conn.execute("UPDATE earnings SET provisional=0 WHERE job_id=? AND provisional=1", (job_id,))
                 conn.commit()
             finally:
                 conn.close()
@@ -2393,6 +2420,11 @@ def init_db():
         try: cursor.execute("ALTER TABLE earnings ADD COLUMN paid_txid TEXT")
         except sqlite3.OperationalError: pass
         try: cursor.execute("ALTER TABLE earnings ADD COLUMN paid_at TIMESTAMP")
+        except sqlite3.OperationalError: pass
+        # 1 = chunk credit for a job that has not been assembled yet. Not
+        # payable until it is; voided if the job is finished whole instead.
+        # Existing rows default to 0 and stay payable exactly as before.
+        try: cursor.execute("ALTER TABLE earnings ADD COLUMN provisional INTEGER DEFAULT 0")
         except sqlite3.OperationalError: pass
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_earnings_unpaid ON earnings(paid, wallet)")
 
@@ -3072,7 +3104,7 @@ def upload_chunk():
             # credit if two workers race the same chunk.
             if newly_completed and kind == 'video':
                 _record_earning(conn, wallet, worker_id, job_id, 'video_chunk', chunk_index,
-                                float(crow['duration_sec'] or 0) / 60.0)
+                                float(crow['duration_sec'] or 0) / 60.0, provisional=1)
             if newly_completed:
                 # Real progress: reset the 6h-stall strike counter.
                 c.execute("UPDATE jobs SET chunk_stall_count=0 WHERE id=? AND COALESCE(chunk_stall_count,0) != 0",
@@ -3243,6 +3275,7 @@ def upload_result():
                 # the chunk workers earn per chunk; crediting the straggler too
                 # would be a double payout).
                 _completed_now = (c.rowcount == 1)
+                _voided = (0, 0)
                 if _completed_now and prev is not None and prev[0] != 'completed':
                     # Never credit more than the source is long: the length
                     # check above only rejects files that are too SHORT, so a
@@ -3251,6 +3284,11 @@ def upload_result():
                     if _src_dur and _src_dur > 0:
                         _credit_sec = min(verified_dur, float(_src_dur))
                     _record_earning(conn, wallet, worker_id, job_id, 'full', None, _credit_sec / 60.0)
+                    # The film was finished as one whole file, so that worker
+                    # is the one paid for it. Chunk credit from an abandoned
+                    # split of this job is cancelled, or the same minutes
+                    # would be paid twice.
+                    _voided = _void_provisional_chunk_credit(conn, job_id)
                 conn.commit()
             finally:
                 conn.close()
@@ -3263,6 +3301,9 @@ def upload_result():
         db_handler.sync_to_disk()
 
         log_event("INFO", f"Job completed by {worker_id}", job_id)
+        if _voided[0]:
+            log_event("WARN", f"Cancelled {_voided[0]} unpaid chunk credit(s) ({_voided[1]} min): "
+                              "the job was finished as a whole file, which is what gets paid.", job_id)
         return jsonify({"status": "success"})
     return jsonify({"status": "error"}), 400
 
@@ -3798,7 +3839,7 @@ def api_payouts_pending():
                        ROUND(SUM(minutes), 3) as total_unpaid_minutes,
                        MIN(timestamp) as first_upload
                 FROM earnings
-                WHERE paid=0 AND wallet IS NOT NULL AND wallet != ''
+                WHERE paid=0 AND COALESCE(provisional, 0)=0 AND wallet IS NOT NULL AND wallet != ''
                 GROUP BY wallet ORDER BY first_upload ASC""")
             groups = [dict(r) for r in c.fetchall()]
             wallets = []
@@ -3810,7 +3851,7 @@ def api_payouts_pending():
                 # comes next cycle. Paying the uncapped total against a capped
                 # id set silently overpays the remainder every cycle.
                 c.execute("SELECT id, approved, minutes FROM earnings "
-                          "WHERE paid=0 AND wallet=? ORDER BY id ASC LIMIT ?",
+                          "WHERE paid=0 AND COALESCE(provisional, 0)=0 AND wallet=? ORDER BY id ASC LIMIT ?",
                           (g['wallet'], PAYOUT_IDS_PER_WALLET))
                 rows = c.fetchall()
                 served_minutes = round(sum(r['minutes'] or 0 for r in rows), 3)
@@ -3961,7 +4002,7 @@ def api_payouts_approve():
     with db_lock:
         conn = db_handler.get_connection(); c = conn.cursor()
         try:
-            c.execute("UPDATE earnings SET approved=? WHERE wallet=? AND paid=0",
+            c.execute("UPDATE earnings SET approved=? WHERE wallet=? AND paid=0 AND COALESCE(provisional, 0)=0",
                       (1 if approving else 0, wallet))
             count = c.rowcount
             c.execute("SELECT ROUND(SUM(minutes), 3) FROM earnings WHERE wallet=? AND paid=0 AND approved=1", (wallet,))
