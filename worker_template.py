@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.9.2"
+WORKER_VERSION = "3.9.3"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -139,6 +139,9 @@ _TUI_SIGNAL = None  # Set to 'pause' or 'quit' by signal handler, polled by app 
 WORKER_DETAILS = {}
 SESSION_STATS = {"jobs_done": 0, "bytes_uploaded": 0, "start": 0.0}
 STATS_LOCK = threading.Lock()
+# How much CPU the video encodes of this session actually used (Linux only):
+# total ffmpeg CPU-seconds, total encode wall-seconds, number of encodes.
+ENC_USAGE = {"cpu": 0.0, "wall": 0.0, "n": 0, "slots": 1, "hinted": False}
 
 # Chunked encoding: set to False once the manager responds 404 to /get_chunk
 # (older manager) so we stop asking. Shared across worker threads.
@@ -1403,9 +1406,16 @@ class _StreamWatch:
     STALL_KILL_SEC = 900.0   # frames were flowing, then none for 15 min
     OPEN_KILL_SEC  = 1800.0  # never produced a first frame in 30 min
 
-    def __init__(self, update_status, single_mode=False, heartbeat=None):
+    def __init__(self, update_status, single_mode=False, heartbeat=None, measure=False):
         self._update = update_status
         self._single = single_mode
+        # measure: sample this ffmpeg's CPU time (video encodes only), to
+        # learn how many CPU threads one encode really uses on this machine.
+        self._measure = measure
+        self._cpu_last = None       # (cpu seconds, wall time of that sample)
+        self._cpu_first = None
+        self._ticks = 0
+        self._paused_ever = False
         # The chunk read loop only reports to the manager from inside its
         # out_time branch, so a long source-open sends NOTHING for its whole
         # duration and CHUNK_STALE_SECONDS can hand the chunk to another node
@@ -1448,6 +1458,30 @@ class _StreamWatch:
 
     def stop(self):
         self._stop.set()
+        first, last = self._cpu_first, self._cpu_last
+        if first and last and not self._paused_ever and not self.stall_killed:
+            wall = last[1] - first[1]
+            if wall >= 60:
+                with STATS_LOCK:
+                    ENC_USAGE["cpu"] += last[0] - first[0]
+                    ENC_USAGE["wall"] += wall
+                    ENC_USAGE["n"] += 1
+
+    def _sample_cpu(self):
+        """CPU seconds used so far by the attached ffmpeg (Linux /proc)."""
+        proc = self._proc
+        if proc is None:
+            return
+        try:
+            with open(f"/proc/{proc.pid}/stat", "r") as f:
+                rest = f.read().rsplit(")", 1)[1].split()
+            cpu = (int(rest[11]) + int(rest[12])) / float(os.sysconf("SC_CLK_TCK"))
+        except Exception:
+            self._measure = False       # not Linux, or the process is gone
+            return
+        self._cpu_last = (cpu, time.time())
+        if self._cpu_first is None:
+            self._cpu_first = self._cpu_last
 
     def _run(self):
         while not self._stop.wait(1.0):
@@ -1455,7 +1489,11 @@ class _StreamWatch:
                 continue
             if PAUSE_REQUESTED:
                 self._was_paused = True
+                self._paused_ever = True
                 continue
+            self._ticks += 1
+            if self._measure and self._ticks % 5 == 0:
+                self._sample_cpu()
             if self._was_paused:
                 # Time spent paused is not a stall: restart both clocks.
                 self._was_paused = False
@@ -1509,6 +1547,29 @@ class _StreamWatch:
         if now - self._last_said >= 15.0:
             self._last_said = now
             safe_print(f"    ... {single_line}")
+
+def _jobs_hint():
+    """Once per session: if the video encodes so far left most of this
+    machine's CPU idle, return a one-line suggestion to run more job slots.
+    Based on measured ffmpeg CPU time, not on the core count alone."""
+    cores = os.cpu_count() or 1
+    with STATS_LOCK:
+        if ENC_USAGE["hinted"] or ENC_USAGE["n"] < 3 or ENC_USAGE["wall"] < 1200:
+            return None
+        per_encode = ENC_USAGE["cpu"] / ENC_USAGE["wall"]     # CPU threads one encode keeps busy
+        slots = ENC_USAGE["slots"]
+        if cores < 4 or per_encode < 0.5:
+            return None
+        in_use = per_encode * slots
+        if in_use >= 0.6 * cores:
+            return None
+        better = min(32, cores // 2, int(0.85 * cores / per_encode))
+        if better <= slots:
+            return None
+        ENC_USAGE["hinted"] = True
+    return (f"Tip: each encode has been using about {per_encode:.1f} of this machine's {cores} CPU "
+            f"threads, so {slots} job slot{'s' if slots != 1 else ''} leaves most of it idle. If it has "
+            f"memory to spare, restarting with --jobs {better} would get more done.")
 
 def _set_speed(worker_id, line):
     """Stash ffmpeg's own 'speed=' figure for the display.
@@ -2445,7 +2506,8 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
             # Ticks the display while ffmpeg opens and seeks the source, which
             # this loop cannot do: readline() below is blocked the whole time.
             watch = _StreamWatch(update_status, single_mode,
-                                 heartbeat=lambda: report_chunk("processing", last_pct)).start().attach(proc)
+                                 heartbeat=lambda: report_chunk("processing", last_pct),
+                                 measure=(kind == 'video')).start().attach(proc)
             # try/finally: an exception mid-loop (e.g. disk-full on the log
             # write) must still deregister and kill ffmpeg — a leaked encoder
             # blocks forever on a full stdout pipe once nobody reads it.
@@ -2597,6 +2659,8 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
 
         if upload_ok:
             log(worker_id, f"Chunk complete ({chunk_tag}).")
+            _hint = _jobs_hint()
+            if _hint: log(worker_id, _hint)
             d = WORKER_DETAILS.get(worker_id)
             if d is not None:
                 d.update({"phase": "Done", "pct": 100})
@@ -3389,7 +3453,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                     log_buffer = []
                     # See the chunk path: readline() blocks while ffmpeg opens
                     # the source, so the ticking has to come from elsewhere.
-                    watch = _StreamWatch(update_status, single_mode).start()
+                    watch = _StreamWatch(update_status, single_mode, measure=True).start()
 
                     popen_kwargs = {}
                     if platform.system() == 'Windows':
@@ -3569,6 +3633,8 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                     if upload_success:
                         if single_mode: print_progress(worker_id, 100, 100, prefix='Up', suffix='OK')
                         log(worker_id, "Job complete.")
+                        _hint = _jobs_hint()
+                        if _hint: log(worker_id, _hint)
                         d = WORKER_DETAILS.get(worker_id)
                         if d is not None:
                             d.update({"phase": "Done", "pct": 100})
@@ -3771,6 +3837,7 @@ def run_worker(args):
 
     num_jobs = args.jobs if args.jobs > 0 else 1
     if num_jobs > 32: num_jobs = 32
+    ENC_USAGE["slots"] = num_jobs
     
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
