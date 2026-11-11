@@ -112,7 +112,7 @@ self.onmessage = async function(e) {
         try {
             await processJob(msg.job);
         } catch (err) {
-            postMessage({type: 'error', msg: err.toString()});
+            postMessage({type: 'error', msg: err.toString(), restart: runtimeStuck});
         }
         return; // Don't pass job messages to Emscripten
     }
@@ -122,7 +122,7 @@ self.onmessage = async function(e) {
         try {
             await processChunk(msg.chunk);
         } catch (err) {
-            postMessage({type: 'chunk_error', msg: err.toString()});
+            postMessage({type: 'chunk_error', msg: err.toString(), restart: runtimeStuck});
         }
         return;
     }
@@ -137,6 +137,55 @@ self.onmessage = async function(e) {
 // keyframe-aligned segment (with an accurate lead offset in the response
 // headers); we seek into it and encode exactly [start, start+dur], matching
 // what a native chunk worker produces so assembly tiles perfectly.
+// FFmpeg runs on its own thread (PROXY_TO_PTHREAD), so this worker stays free
+// while it encodes. FFmpeg appends key=value progress blocks to a file in the
+// in-memory filesystem; read the latest encoded position from it and pass it
+// to the page, which shows it and sends it to the manager as real progress.
+// (-progress and -stats_period only control reporting, not the encode.)
+//
+// It is also how completion is detected. This build writes the whole output
+// and prints its final report, then hangs in its own shutdown and never calls
+// exit. FFmpeg writes "progress=end" with that final report, after the output
+// file has been finalised and closed, so that marker is taken as "done". The
+// runtime is then left stuck in shutdown: `runtimeStuck` tells the page to
+// replace this worker before the next job.
+let runtimeStuck = false;
+
+function finishWithoutExit() {
+    if (!self.resolveJob) return;      // exit arrived normally after all
+    runtimeStuck = true;
+    postMessage({type: 'log', level: 'sys', msg: "FFmpeg finished (no exit signal); continuing."});
+    const done = self.resolveJob;
+    self.resolveJob = null;
+    self.rejectJob = null;
+    done();
+}
+
+function startProgressPoll(FS, progPath, totalSec) {
+    let lastSec = -1;
+    let ended = false;
+    const id = setInterval(() => {
+        try {
+            const txt = FS.readFile(progPath, { encoding: 'utf8' });
+            if (!ended && txt.indexOf('progress=end') >= 0) {
+                ended = true;
+                // A moment for a normal exit to arrive first, if it is going to.
+                setTimeout(finishWithoutExit, 3000);
+            }
+            const at = txt.lastIndexOf('out_time_us=');
+            if (at < 0) return;
+            const us = parseInt(txt.slice(at + 12, at + 40), 10);
+            if (!Number.isFinite(us) || us < 0) return;
+            const sec = us / 1e6;
+            if (sec <= lastSec) return;
+            lastSec = sec;
+            const pct = (totalSec > 0) ? Math.max(0, Math.min(99, Math.floor(sec / totalSec * 100))) : null;
+            postMessage({ type: 'progress', sec: sec, pct: pct });
+        } catch (e) { /* file not created yet */ }
+    }, 5000);
+    return () => clearInterval(id);
+}
+
 async function processChunk(chunk) {
     const FS = self.Module.FS || self.FS;
     const callMain = self.Module.callMain || self.callMain;
@@ -144,6 +193,8 @@ async function processChunk(chunk) {
 
     const segPath = "/tmp/seg_" + Date.now() + ".mkv";
     const outPath = "/tmp/cout_" + Date.now() + ".mp4";
+    const progPath = "/tmp/cprog_" + Date.now() + ".txt";
+    let stopProgress = () => {};
     const crf = (chunk.content_profile === 'live_action') ? '57' : '63';
 
     postMessage({type: 'log', level: 'sys', msg: `Chunk ${chunk.chunk_index} of ${chunk.filename}: downloading segment...`});
@@ -166,14 +217,20 @@ async function processChunk(chunk) {
         // change the bitstream — no tune override, so browser chunks match
         // native chunks (SVT default tune) when tiled into one video.
         // -enc_time_base pins the encoder time base to the source frame rate
-        // (manager sends the exact fraction): FFmpeg 7.x (this wasm) doesn't
+        // (manager sends the exact fraction): FFmpeg 7.x (this wasm) does not
         // propagate a frame rate through setpts, and libsvtav1 would see
         // 1/time_base = 1000 fps and refuse to start (240 fps cap).
         let etbArgs = [];
         const frMatch = String(chunk.fps || '').match(/^([1-9]\d*)\/([1-9]\d*)$/);
         if (frMatch) {
             const fn = parseInt(frMatch[1], 10), fd = parseInt(frMatch[2], 10);
-            if (fn / fd <= 240) etbArgs = ['-enc_time_base', `${fd}/${fn}`];
+            // setts: this FFmpeg build hands the muxer packets with no
+            // duration, so the MP4's length came out one frame short and
+            // every chunk after a browser chunk landed a frame early when
+            // the film was assembled. With the encoder time base pinned to
+            // one frame, each packet lasts exactly 1 tick. Timestamps only;
+            // the encoded video is untouched.
+            if (fn / fd <= 240) etbArgs = ['-enc_time_base', `${fd}/${fn}`, '-bsf:v', 'setts=duration=1'];
         }
         const args = [
             '-threads', '1', '-v', 'verbose',
@@ -185,12 +242,15 @@ async function processChunk(chunk) {
             ...etbArgs,
             '-vf', 'setpts=PTS-STARTPTS,scale=-2:480',
             '-movflags', '+faststart',
+            '-progress', progPath, '-stats_period', '5',
             outPath
         ];
         currentOutputPath = outPath;
         const ffmpegPromise = new Promise((resolve, reject) => { self.resolveJob = resolve; self.rejectJob = reject; });
         callMain(args);
+        stopProgress = startProgressPoll(FS, progPath, dur);
         await ffmpegPromise;
+        stopProgress();
 
         let exists = false;
         try { FS.stat(outPath); exists = true; } catch(e) {}
@@ -210,13 +270,15 @@ async function processChunk(chunk) {
             method: 'POST', body: fd,
             headers: chunk.token ? { 'X-Worker-Token': chunk.token } : {}
         });
-        if (up.status === 409) { postMessage({type: 'chunk_stale'}); return; }
+        if (up.status === 409) { postMessage({type: 'chunk_stale', restart: runtimeStuck}); return; }
         if (!up.ok) throw new Error("Chunk upload failed: " + up.status);
-        postMessage({type: 'chunk_done'});
+        postMessage({type: 'chunk_done', restart: runtimeStuck});
     } finally {
+        stopProgress();
         currentOutputPath = null;
         try { FS.unlink(segPath); } catch(e) {}
         try { FS.unlink(outPath); } catch(e) {}
+        try { FS.unlink(progPath); } catch(e) {}
     }
 }
 
@@ -233,6 +295,8 @@ async function processJob(job) {
     const outputFilename = "output_" + Date.now() + ".mp4";
     const inputPath = "/tmp/" + inputFilename;
     const outputPath = "/tmp/" + outputFilename;
+    const progPath = "/tmp/prog_" + Date.now() + ".txt";
+    let stopProgress = () => {};
 
     postMessage({type: 'log', level: 'sys', msg: `Worker processing: ${job.filename}`});
 
@@ -286,11 +350,9 @@ async function processJob(job) {
         //    mov_text is a common hard-failure, and bitmap subs can't convert.
         //  - lp=1 keeps browser memory down (native workers pass no
         //    -svtav1-params; lp only limits threading, not the bitstream).
-        //  - '-c:a opus' + '-strict -2' is FFmpeg's built-in encoder: the
-        //    DEPLOYED wasm was configured without --enable-libopus, so libopus
-        //    isn't available. The wasm-build/ Dockerfile DOES enable it — after
-        //    a rebuild, switch this to '-c:a libopus' (and drop -strict) for
-        //    parity with native workers.
+        //  - '-c:a opus' + '-strict -2' is FFmpeg's built-in Opus encoder.
+        //    The current wasm also contains libopus (what native workers
+        //    use), but the audio encoder is deliberately left as it was.
         const crf = (job.content_profile === 'live_action') ? '57' : '63';
         const args = [
             '-threads', '1',
@@ -309,6 +371,7 @@ async function processJob(job) {
             '-b:a', '24k',
             '-ac', '1',
             '-strict', '-2',
+            '-progress', progPath, '-stats_period', '5',
             outputPath
         ];
 
@@ -324,8 +387,11 @@ async function processJob(job) {
         // callMain might return immediately if proxied, or block. 
         // We await our custom promise which is triggered by Module.quit
         callMain(args);
-        
+        const totalSec = parseFloat((job.stream_meta && job.stream_meta.duration) || 0) || 0;
+        stopProgress = startProgressPoll(FS, progPath, totalSec);
+
         await ffmpegPromise;
+        stopProgress();
 
         // 4. Read Output
         postMessage({type: 'log', level: 'sys', msg: "Reading output..."});
@@ -365,20 +431,22 @@ async function processJob(job) {
         if (up.status === 400 || up.status === 409) {
             let why = "HTTP " + up.status;
             try { const j = await up.json(); if (j && j.message) why += " " + j.message; } catch (e) {}
-            postMessage({type: 'upload_rejected', msg: why});
+            postMessage({type: 'upload_rejected', msg: why, restart: runtimeStuck});
             return;
         }
         if (!up.ok) throw new Error("Upload failed: " + up.status + " " + up.statusText);
         
-        postMessage({type: 'done'});
+        postMessage({type: 'done', restart: runtimeStuck});
 
     } catch (e) {
         throw e;
     } finally {
+        stopProgress();
         currentOutputPath = null;
         // Cleanup
         try {
             if (FS) {
+                try { FS.unlink(progPath); } catch(e) {}
                 try { FS.unlink(inputPath); } catch(e) {}
                 try { FS.unlink(outputPath); } catch(e) {}
             }

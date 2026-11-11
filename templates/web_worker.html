@@ -248,7 +248,7 @@
     let currentChunk = null;   // {job_id, chunk_index} of an in-flight chunk, for release + heartbeat
 
     // Must be >= manager MIN_CLIENT_VERSION or /get_job returns "Update Required".
-    const WEB_WORKER_VERSION = "3.4.2";
+    const WEB_WORKER_VERSION = "3.5.0";
 
     // Worker token: injected by the manager (/web) so the page authenticates
     // out of the box; ?token= in the URL overrides. Empty only if the manager
@@ -267,6 +267,27 @@
     let loopGen = 0;
     // Stops the heartbeat and settles the promise of the work in flight.
     let cancelActive = null;
+    // Latest progress reported by the encoder, sent with each heartbeat. The
+    // manager takes back work whose progress never changes, so a heartbeat
+    // stuck at 0 got slow-but-healthy browser encodes reassigned.
+    let activeProgress = 0;
+    let lastProgressLog = 0;
+    // Set when the encoder finished its work but its runtime did not shut
+    // down cleanly; the loop replaces the worker before taking more work.
+    let workerNeedsRestart = false;
+
+    function noteProgress(msg) {
+        // No known duration (some whole-file jobs): report encoded minutes,
+        // which still moves as the encode advances.
+        activeProgress = (msg.pct !== null && msg.pct !== undefined)
+            ? msg.pct : Math.min(99, 1 + Math.floor((msg.sec || 0) / 60));
+        const now = Date.now();
+        if (now - lastProgressLog > 60000) {
+            lastProgressLog = now;
+            const at = Math.floor(msg.sec || 0);
+            log(`Encoding... ${msg.pct !== null && msg.pct !== undefined ? msg.pct + '% ' : ''}(${at}s of video done)`, 'sys');
+        }
+    }
 
     const _tokenQS = WORKER_TOKEN ? ('?token=' + encodeURIComponent(WORKER_TOKEN)) : '';
 
@@ -345,7 +366,7 @@
                 method: 'POST', headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({ job_id: jobId, chunk_index: chunkIndex, kind: 'video',
                                        worker_id: currentWorkerId, status: 'processing',
-                                       progress: 0, version: WEB_WORKER_VERSION })
+                                       progress: activeProgress, version: WEB_WORKER_VERSION })
             }).catch(() => {});
         }, 15000);
         return () => clearInterval(id);
@@ -359,7 +380,7 @@
             fetch('/report_status' + (WORKER_TOKEN ? ('?token=' + encodeURIComponent(WORKER_TOKEN)) : ''), {
                 method: 'POST', headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({ job_id: jobId, worker_id: currentWorkerId,
-                                       status: 'processing', progress: 0,
+                                       status: 'processing', progress: activeProgress,
                                        version: WEB_WORKER_VERSION })
             }).catch(() => {});
         }, 30000);
@@ -369,14 +390,20 @@
     function runChunkInWorker(chunk) {
         return new Promise((resolve, reject) => {
             if (!worker) { reject(new Error("Worker not initialized")); return; }
+            activeProgress = 0; lastProgressLog = 0;
             const hb = startChunkHeartbeat(chunk.job_id, chunk.chunk_index);
             const stopHb = () => { hb(); cancelActive = null; };
             cancelActive = (err) => { stopHb(); if (err) reject(err); };
             worker.onmessage = (e) => {
                 const msg = e.data;
                 if (msg.type === 'log') log(msg.msg, msg.level);
-                else if (msg.type === 'chunk_done' || msg.type === 'chunk_stale') { stopHb(); resolve(); }
-                else if (msg.type === 'chunk_error') { stopHb(); reject(new Error(msg.msg)); }
+                else if (msg.type === 'progress') noteProgress(msg);
+                else if (msg.type === 'chunk_done' || msg.type === 'chunk_stale') {
+                    stopHb();
+                    if (msg.restart) workerNeedsRestart = true;
+                    resolve();
+                }
+                else if (msg.type === 'chunk_error') { stopHb(); if (msg.restart) workerNeedsRestart = true; reject(new Error(msg.msg)); }
             };
             worker.onerror = (e) => {
                 stopHb();
@@ -452,6 +479,11 @@
 
         while (alive()) {
             try {
+                if (workerNeedsRestart) {
+                    workerNeedsRestart = false;
+                    await initWorker();   // fresh encoder (and a fresh heap) for the next job
+                    if (!alive()) break;
+                }
                 // A. CHUNK FIRST — take a slice of a large video via a pre-cut
                 // segment (video_only: browsers can't do the whole-file audio
                 // chunk). This is how browser nodes help on multi-GB sources.
@@ -572,6 +604,7 @@
                 return;
             }
 
+            activeProgress = 0; lastProgressLog = 0;
             const hb = startJobHeartbeat(job.id);
             const stopHb = () => { hb(); cancelActive = null; };
             cancelActive = (err) => { stopHb(); if (err) reject(err); };
@@ -580,18 +613,23 @@
                 const msg = e.data;
                 if (msg.type === 'log') {
                     log(msg.msg, msg.level);
+                } else if (msg.type === 'progress') {
+                    noteProgress(msg);
                 } else if (msg.type === 'done') {
                     stopHb();
+                    if (msg.restart) workerNeedsRestart = true;
                     resolve();
                 } else if (msg.type === 'upload_rejected') {
                     // The manager refused the upload and has already recorded
                     // the outcome; a failure report on top would count twice.
                     stopHb();
+                    if (msg.restart) workerNeedsRestart = true;
                     log("Upload not accepted by manager: " + msg.msg, 'err');
                     currentJobId = null;
                     resolve();
                 } else if (msg.type === 'error') {
                     stopHb();
+                    if (msg.restart) workerNeedsRestart = true;
                     reject(new Error(msg.msg));
                 }
             };
