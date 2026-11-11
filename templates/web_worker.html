@@ -223,10 +223,16 @@
                     <input type="text" id="maxChunkSec" value="120" style="width: 80px;">
                 </div>
             </div>
+            <div style="border: 1px dashed var(--neon-purple, #b026ff); padding: 10px 12px; margin-bottom: 15px; font-size: 0.85em;">
+                <b>Faster option:</b> the installed worker app does the same job several times
+                faster than a browser tab. If you can install it, please use that instead:
+                <a href="/#run-worker" style="color: var(--neon-green);">how to run the worker app</a>.
+            </div>
             <div style="color: var(--text-dim); font-size: 0.8em; margin-bottom: 15px;">
-                In-browser AV1 encoding runs a full FFmpeg (SVT-AV1) in WebAssembly. It only
-                takes small source files (the manager filters by MAX SOURCE MB) and is slower
-                than a native worker. Keep this tab focused for best performance.
+                This page runs a full FFmpeg (SVT-AV1) in WebAssembly, with the same encoding
+                settings as the app. It takes short slices of large videos and small whole
+                files (see MAX SOURCE MB), at roughly a quarter of the app's speed. Keep this
+                tab open and focused while it works.
             </div>
             <div>
                 <button id="btnStart" class="btn-control" onclick="startLoop()">[ EXECUTE ]</button>
