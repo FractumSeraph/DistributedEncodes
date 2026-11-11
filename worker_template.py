@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.9.3"
+WORKER_VERSION = "3.9.4"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -326,10 +326,15 @@ if HAS_TEXTUAL:
             with Vertical(id="pause-dialog"):
                 yield Label("\u23f8  WORKER PAUSED", id="pause-title")
                 yield Label(subtitle, id="pause-subtitle")
+                # Text(), not str: "[C]" in a plain string is parsed as markup
+                # and vanished, so the buttons gave no hint of their keys.
+                yield Label(Text("C  Continue   carry on encoding"), classes="pause-help")
+                yield Label(Text("F  Finish     complete the current work, then exit"), classes="pause-help")
+                yield Label(Text("S  Stop       stop now and hand the work back"), classes="pause-help")
                 with Horizontal(id="pause-buttons"):
-                    yield Button("[C] Continue", id="btn-continue", variant="success")
-                    yield Button("[F] Finish", id="btn-finish", variant="warning")
-                    yield Button("[S] Stop", id="btn-stop", variant="error")
+                    yield Button(Text("[C] Continue"), id="btn-continue", variant="success")
+                    yield Button(Text("[F] Finish"), id="btn-finish", variant="warning")
+                    yield Button(Text("[S] Stop"), id="btn-stop", variant="error")
 
         def action_choose_continue(self) -> None: self.dismiss("continue")
         def action_choose_finish(self) -> None: self.dismiss("finish")
@@ -379,33 +384,41 @@ if HAS_TEXTUAL:
         }
         PauseModal {
             align: center middle;
+            background: $background 75%;
         }
         #pause-dialog {
             background: $surface;
             border: thick $warning;
-            padding: 1 4;
-            width: 56;
+            padding: 1 3;
+            width: 66;
+            max-width: 100%;
             height: auto;
         }
         #pause-title {
+            width: 100%;
             text-align: center;
             color: $warning;
             text-style: bold;
             padding-bottom: 1;
         }
         #pause-subtitle {
+            width: 100%;
             text-align: center;
-            color: $text-disabled;
+            color: $text-muted;
             padding-bottom: 1;
+        }
+        .pause-help {
+            width: 100%;
+            color: $text;
         }
         #pause-buttons {
             height: auto;
-            align: center middle;
+            width: 100%;
             padding-top: 1;
         }
-        #btn-continue { margin: 0 1; }
-        #btn-finish   { margin: 0 1; }
-        #btn-stop     { margin: 0 1; }
+        /* Equal shares of the row: with fixed-width buttons the third one
+           was pushed past the edge of the dialog and cut off. */
+        #pause-buttons Button { width: 1fr; min-width: 10; margin: 0 1; }
         """
 
         BINDINGS = [  # type: ignore[assignment]
@@ -830,10 +843,10 @@ def safe_print(message):
     if not CONSOLE_LOCK.acquire(timeout=2):
         return
     try:
-        width = get_term_width()
-        # Truncate long messages to avoid wrapping onto a second line
-        if len(message) > width - 1:
-            message = message[:width-1]
+        # Long messages are no longer cut to the terminal width: that took
+        # the chunk tag off the end of every "Chunk job" line, and under a
+        # service (no terminal, width assumed 80) it cut every line in the
+        # journal. A long line simply wraps.
         # \033[K (Erase to End of Line) clears any leftover chars from a
         # previously longer line drawn at the same position — avoids the
         # padding-width-mismatch flicker that occurred on terminal resize.
@@ -1053,7 +1066,7 @@ def print_progress(worker_id, current, total, prefix='', suffix=''):
     
     try:
         bar = block_char * filled_length + fill_char * (bar_length - filled_length)
-        line = f'[{datetime.now().strftime("%H:%M:%S")}] [{worker_id}] {prefix} |{bar}| {percent:.1f}% {suffix}'
+        line = f'[{datetime.now().strftime("%H:%M:%S")}] [{worker_id}] {prefix} |{bar}| {percent}% {suffix}'
         if len(line) > width - 1:
             line = line[:width - 1]
         with CONSOLE_LOCK:
@@ -1065,7 +1078,7 @@ def print_progress(worker_id, current, total, prefix='', suffix=''):
         fill_char = '-'
         try:
             bar = block_char * filled_length + fill_char * (bar_length - filled_length)
-            line = f'[{datetime.now().strftime("%H:%M:%S")}] [{worker_id}] {prefix} |{bar}| {percent:.1f}% {suffix}'
+            line = f'[{datetime.now().strftime("%H:%M:%S")}] [{worker_id}] {prefix} |{bar}| {percent}% {suffix}'
             if len(line) > width - 1: line = line[:width - 1]
             with CONSOLE_LOCK:
                 sys.stdout.write(f'\r{line}\033[K')
@@ -2294,6 +2307,9 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                       "phase": "Probe" if kind == 'audio' else "Encoding",
                       "pct": 0, "job_start": time.time()})
         log(worker_id, f"Chunk job: {filename} [{chunk_tag}/{total}] ({dur_sec/60:.1f}m slice)")
+        # Without the TUI the slot kept reading "Idle" until ffmpeg's first
+        # progress line, several seconds after the chunk was taken.
+        update_status("Enc 0%")
 
         # Quota: estimate the share of the source this chunk will stream.
         # The audio pass reads the whole (interleaved) file.
@@ -3955,7 +3971,9 @@ def run_worker(args):
             _tui_reason = "--no-tui flag passed"
         else:
             _tui_reason = _TEXTUAL_UNAVAIL_REASON or "textual not installed (pip install textual)"
-        print(f"Fractum Worker v{WORKER_VERSION} — TUI disabled ({_tui_reason})")
+        # safe_print clears the status line first; a bare print() landed on
+        # the end of it ("[1: Idle] [2: Idle]Fractum Worker v...").
+        safe_print(f"Fractum Worker v{WORKER_VERSION} — TUI disabled ({_tui_reason})")
         while True:
             if not PAUSE_REQUESTED:
                 all_dead = True
