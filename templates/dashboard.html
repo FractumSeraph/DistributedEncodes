@@ -97,7 +97,7 @@
         .kpi-row { display: flex; gap: 20px; margin-bottom: 30px; flex-wrap: wrap; }
         .kpi { 
             flex: 1; 
-            min-width: 150px; 
+            min-width: 130px; 
             background: rgba(0,0,0,0.5); 
             border: 1px solid var(--neon-purple); 
             padding: 15px; 
@@ -150,9 +150,20 @@
         }
         
         .job-item { margin-bottom: 15px; border: 1px solid rgba(204,0,255,0.3); padding: 10px; background: rgba(0,0,0,0.4); }
-        .job-header { display: flex; justify-content: space-between; margin-bottom: 5px; }
-        .job-user { color: var(--neon-pink); font-size: 0.9em; font-weight: bold; }
-        .job-percent { color: var(--neon-purple); font-size: 0.9em; font-weight: bold; }
+        .job-header { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 5px; }
+        .job-user { color: var(--neon-pink); font-size: 0.9em; font-weight: bold; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .job-percent { color: var(--neon-purple); font-size: 0.9em; font-weight: bold; white-space: nowrap; flex-shrink: 0; }
+        .job-chunk { color: var(--neon-purple); }
+
+        /* Leaderboard: the name column takes what is left and truncates;
+           it used to run underneath the hours on long names. */
+        .lb-name { font-weight: bold; color: var(--text-light); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .lb-time { width: 82px; text-align: right; color: var(--neon-purple); white-space: nowrap; }
+        .lb-files { width: 84px; text-align: right; color: var(--text-dim); font-size: 0.85em; white-space: nowrap; }
+        @media (max-width: 480px) {
+            .lb-files { width: 62px; font-size: 0.75em; }
+            .lb-time { width: 70px; }
+        }
         .job-file { color: var(--text-dim); font-size: 0.85em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-bottom: 5px; }
         
         .progress-bg { background: #1a1a1a; height: 6px; width: 100%; border-radius: 0; border: 1px solid #333; }
@@ -294,8 +305,8 @@
                 <div class="os-section" style="margin-top: 30px;">
                     <span class="os-title">:: NO INSTALL (BROWSER) &mdash; SLOWER</span>
                     Can't install anything? You can encode in a browser tab instead.
-                    It does the same work at the same quality, but runs at roughly a
-                    quarter of the app's speed and only while the tab stays open.
+                    It does the same work at the same quality, but is at least four
+                    times slower than the app and only runs while the tab stays open.
                     <b>If you can run one of the options above, use that.</b>
                     <div style="text-align: center; margin-top: 12px;">
                         <a href="/web" class="modal-btn" style="opacity: 0.8;">ENCODE IN BROWSER</a>
@@ -383,10 +394,10 @@
                 const completed = (rawData.total_completed !== undefined)
                     ? rawData.total_completed
                     : rawData.scoreboard.reduce((acc, u) => acc + u.files_count, 0);
-                // active is worker-centric (one row per busy worker); the
-                // "processing" stat tile still counts JOBS in flight.
-                const activeCount = (rawData.active_jobs !== undefined)
-                    ? rawData.active_jobs : rawData.active.length;
+                // The tile is labelled "Active Workers", so it counts the busy
+                // workers listed below it (one row each), not jobs in flight:
+                // several workers share one chunked job.
+                const activeCount = rawData.active.length;
 
                 const data = {
                     queue: {
@@ -424,15 +435,21 @@
                 lb.innerHTML = data.users.length ? data.users.map((u,i) => 
                     `<tr>
                         <td style="width: 40px; color:var(--text-dim)">#${i+1}</td>
-                        <td style="font-weight:bold; color:var(--text-light)">${escapeHTML(u.name)}</td>
-                        <td style="text-align:right; color:var(--neon-purple)">${fmtTime(u.time)}</td>
-                        <td style="text-align:right; color:var(--text-dim); font-size:0.85em;">${u.count} file${u.count !== 1 ? 's' : ''}</td>
+                        <td class="lb-name" title="${escapeHTML(u.name)}">${escapeHTML(u.name)}</td>
+                        <td class="lb-time">${fmtTime(u.time)}</td>
+                        <td class="lb-files">${u.count} file${u.count !== 1 ? 's' : ''}</td>
                     </tr>`
                 ).join('') : '<tr><td colspan="4" style="text-align:center; color:var(--text-dim); padding:20px;">// NO DATA //</td></tr>';
                 
                 const act = document.getElementById('active-list');
                 act.innerHTML = data.active.length ? data.active.map(j => {
-                    const cleanName = j.file.split('/').pop();
+                    // A chunk row's name ends in " [chunk 12/31]". Take that tag
+                    // off before cutting the folder away: splitting on "/"
+                    // first left only the "31]" after the tag's own slash.
+                    const tagMatch = String(j.file).match(/^(.*?)(\s*\[[^\]]*\])$/);
+                    const baseName = (tagMatch ? tagMatch[1] : String(j.file)).split('/').pop();
+                    const chunkTag = tagMatch ? tagMatch[2].trim() : '';
+                    const cleanName = chunkTag ? `${baseName} ${chunkTag}` : baseName;
                     const pct = j.progress || 0;
                     const who = j.workername
                         ? `${escapeHTML(j.username)} <span style="color:var(--text-dim); font-weight:normal;">· ${escapeHTML(j.workername)}</span>`
@@ -446,7 +463,7 @@
                             <div class="job-user">${who}</div>
                             <div class="job-percent">${detail}${pct}%</div>
                         </div>
-                        <div class="job-file" title="${escapeHTML(cleanName)}">${escapeHTML(cleanName)}</div>
+                        <div class="job-file" title="${escapeHTML(cleanName)}">${chunkTag ? `<span class="job-chunk">${escapeHTML(chunkTag)}</span> ` : ''}${escapeHTML(baseName)}</div>
                         <div class="progress-bg"><div class="progress-fill" style="width: ${pct}%"></div></div>
                     </div>`;
                 }).join('') : '<div style="color:var(--text-dim); padding:10px;">// SYSTEM IDLE</div>';

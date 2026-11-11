@@ -18,6 +18,10 @@
             --font: 'Roboto Mono', monospace;
         }
         *, *::before, *::after { box-sizing: border-box; }
+        /* The page title is one long unbroken word; on a phone it ran off the
+           side and made the whole page scroll sideways. */
+        h1 { overflow-wrap: anywhere; }
+        @media (max-width: 520px) { h1 { font-size: 1.3em; } input[type="text"] { max-width: 100%; } }
         
         body {
             background-color: var(--bg-dark);
@@ -224,14 +228,14 @@
                 </div>
             </div>
             <div style="border: 1px dashed var(--neon-purple, #b026ff); padding: 10px 12px; margin-bottom: 15px; font-size: 0.85em;">
-                <b>Faster option:</b> the installed worker app does the same job several times
-                faster than a browser tab. If you can install it, please use that instead:
+                <b>Faster option:</b> the installed worker app does the same job at least four
+                times faster than a browser tab. If you can install it, please use that instead:
                 <a href="/#run-worker" style="color: var(--neon-green);">how to run the worker app</a>.
             </div>
             <div style="color: var(--text-dim); font-size: 0.8em; margin-bottom: 15px;">
                 This page runs a full FFmpeg (SVT-AV1) in WebAssembly, with the same encoding
                 settings as the app. It takes short slices of large videos and small whole
-                files (see MAX SOURCE MB), at roughly a quarter of the app's speed. Keep this
+                files (see MAX SOURCE MB), and is at least four times slower than the app. Keep this
                 tab open and focused while it works.
             </div>
             <div>

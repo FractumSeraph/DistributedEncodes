@@ -546,10 +546,14 @@ def _auto_update_loop():
 
 def log_event(level, message, related_id=None):
     try:
-        clean_msg = str(message).replace('<', '&lt;').replace('>', '&gt;')
+        # Stored as plain text; the admin page escapes on display. Escaping
+        # here as well showed "-&gt;" in the log, and stripping the job id down
+        # to [A-Za-z0-9_.-] removed its "/" so "Folder/File.mkv" read as
+        # "FolderFile.mkv" and no longer matched any job.
+        clean_msg = re.sub(r'[\x00-\x08\x0b-\x1f]', ' ', str(message))[:4000]
         clean_id = str(related_id) if related_id else None
         if clean_id:
-            clean_id = re.sub(r'[^a-zA-Z0-9_.-]', '', clean_id)
+            clean_id = re.sub(r'[\x00-\x1f]', ' ', clean_id)[:512]
         
         # NOTE: never call log_event while another connection in the same
         # thread has an uncommitted write transaction — SQLite allows one
