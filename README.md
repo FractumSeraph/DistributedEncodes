@@ -84,7 +84,7 @@ services:
 
 ### Option 2: Linux / WSL (One-liner)
 
-Installs FFmpeg and Python automatically, then starts the worker:
+Installs FFmpeg and Python (the only step that uses `sudo`), then starts the worker as your own user in `~/FractumWorker`. Re-running the same line later picks up that folder again, including the saved worker name and any partial encode. Set `FRACTUM_DIR` to use a different folder.
 
 ```bash
 curl -s "https://encode.fractumseraph.net/install?username=YourName&workername=LinuxNode&jobs=1" | bash
@@ -137,8 +137,9 @@ The script asks for a username and a worker name (press Enter to use the compute
 
 Use `fractum-worker.service` to run the worker as a persistent background service that restarts on crash and on reboot.
 
-1. Edit `fractum-worker.service` — set `User`, `WorkingDirectory`, and the flags in `ExecStart`.
-2. Copy and enable:
+1. Run the Linux one-liner from the dashboard once. It creates `~/FractumWorker` with `worker.py` in it. Stop it (Ctrl+C, then `s`).
+2. Edit `fractum-worker.service` — set `User`, `WorkingDirectory` (that folder), and the flags in `ExecStart`.
+3. Copy and enable:
    ```bash
    sudo cp fractum-worker.service /etc/systemd/system/
    sudo systemctl daemon-reload

@@ -2527,8 +2527,32 @@ def admin_panel(): return render_template('admin.html')
 @app.route('/api/ping')
 def api_ping(): return jsonify({"status": "pong"})
 
+_WORKER_SCRIPT_CACHE = {"key": None, "body": None}
+
+def _worker_script_bytes():
+    """The worker script as served to volunteers. The worker token is filled in
+    as the script's default, exactly as /install and /web already hand it out,
+    so a manually downloaded worker.py (dashboard 'MANUAL' steps, the Windows
+    launcher, the systemd unit) can sign in without WORKER_SECRET being set
+    by hand. With the stock token the file is served unchanged."""
+    st = os.stat(WORKER_TEMPLATE_FILE)
+    key = (st.st_mtime_ns, st.st_size, WORKER_SECRET)
+    if _WORKER_SCRIPT_CACHE["key"] != key:
+        with open(WORKER_TEMPLATE_FILE, 'rb') as f:
+            body = f.read()
+        stock = b'WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")'
+        if WORKER_SECRET and WORKER_SECRET != "DefaultInsecureSecret" and body.count(stock) == 1:
+            body = body.replace(stock, ('WORKER_SECRET = os.environ.get("WORKER_SECRET", %s)'
+                                        % json.dumps(str(WORKER_SECRET))).encode('utf-8'))
+        _WORKER_SCRIPT_CACHE["key"], _WORKER_SCRIPT_CACHE["body"] = key, body
+    return _WORKER_SCRIPT_CACHE["body"]
+
 @app.route('/dl/worker')
-def download_worker_script(): return send_file(WORKER_TEMPLATE_FILE, as_attachment=True, download_name='worker.py')
+def download_worker_script():
+    resp = Response(_worker_script_bytes(), mimetype='text/x-python')
+    resp.headers['Content-Disposition'] = 'attachment; filename=worker.py'
+    resp.headers['Content-Type'] = 'text/x-python; charset=utf-8'
+    return resp
 
 # [ADDED] Route to serve the watermark font to workers
 @app.route('/dl/font')
@@ -2553,12 +2577,37 @@ def install_script():
     if not j.isdigit(): j = '1'
     wallet = sanitize_wallet(request.args.get('wallet'))
     wallet_arg = f' --wallet "{wallet}"' if wallet else ''
+    series_arg = f' --series-id "{s_id}"' if s_id else ''
     script = f"""#!/bin/bash
-if [ -x "$(command -v apt-get)" ]; then sudo apt-get update -qq && sudo apt-get install -y ffmpeg python3 python3-requests; fi
-if [ -x "$(command -v dnf)" ]; then sudo dnf install -y ffmpeg python3 python3-requests; fi
-curl -s "{SERVER_URL_DISPLAY.rstrip('/')}/dl/worker" -o worker.py
-export WORKER_SECRET="{WORKER_SECRET}"
-python3 worker.py --username "{u}" --workername "{w}" --jobs {j} --manager "{SERVER_URL_DISPLAY}" --series-id "{s_id}"{wallet_arg}
+# Fractum worker bootstrap (served by the manager).
+# Root is only used to install packages. The worker itself runs as the user
+# who typed the command, in ~/FractumWorker, so re-running this line later
+# finds the same folder (saved name, partial encodes) and nothing it writes
+# is owned by root. Set FRACTUM_DIR to use a different folder.
+SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
+if [ -x "$(command -v apt-get)" ]; then $SUDO apt-get update -qq && $SUDO apt-get install -y ffmpeg python3 python3-requests curl; fi
+if [ -x "$(command -v dnf)" ]; then $SUDO dnf install -y ffmpeg python3 python3-requests curl; fi
+
+RUN_USER="${{SUDO_USER:-$(id -un)}}"
+RUN_HOME="$(getent passwd "$RUN_USER" 2>/dev/null | cut -d: -f6)"
+[ -n "$RUN_HOME" ] || RUN_HOME="$HOME"
+WORKDIR="${{FRACTUM_DIR:-$RUN_HOME/FractumWorker}}"
+as_user() {{ if [ "$(id -un)" != "$RUN_USER" ]; then sudo -H -u "$RUN_USER" "$@"; else "$@"; fi; }}
+
+as_user mkdir -p "$WORKDIR" || {{ echo "[!] Could not create $WORKDIR"; exit 1; }}
+cd "$WORKDIR" || exit 1
+# -f: an error page must not be saved as worker.py. Download to a temporary
+# name so a failed download leaves an existing worker.py usable.
+if as_user curl -fsS "{SERVER_URL_DISPLAY.rstrip('/')}/dl/worker" -o worker.py.new; then
+    as_user mv -f worker.py.new worker.py
+elif [ -f worker.py ]; then
+    echo "[!] Could not download the latest worker; starting the copy already here."
+else
+    echo "[!] Could not download the worker from {SERVER_URL_DISPLAY.rstrip('/')}. Check the connection and try again."
+    exit 1
+fi
+echo "[*] Worker folder: $WORKDIR (running as $RUN_USER)"
+as_user env WORKER_SECRET="{WORKER_SECRET}" python3 worker.py --username "{u}" --workername "{w}" --jobs {j} --manager "{SERVER_URL_DISPLAY}"{series_arg}{wallet_arg}
 """
     return Response(script, mimetype='text/x-shellscript')
 

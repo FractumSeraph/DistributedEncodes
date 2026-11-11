@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.9.4"
+WORKER_VERSION = "3.9.5"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -132,6 +132,17 @@ ACTIVE_PROCS = {}
 PROC_LOCK = threading.Lock()
 TUI_APP = None  # Set to WorkerApp instance when running in TUI mode
 _TUI_WAS_RUNNING = False  # Set True before app.run(), never cleared; guards safe_print post-TUI
+
+def _plain_log():
+    """True when output is not a terminal (a file, a pipe, the systemd
+    journal). There, lines redrawn in place with '\\r' never end, so the
+    journal received one enormous line; progress is written as ordinary,
+    occasional lines instead."""
+    try:
+        return not sys.stdout.isatty()
+    except Exception:
+        return True
+_PLAIN_LAST = {}   # (worker_id, prefix) -> last percentage logged / last status line
 _TUI_SIGNAL = None  # Set to 'pause' or 'quit' by signal handler, polled by app timer
 
 # Per-worker rich state, polled by the TUI every 0.5s
@@ -843,6 +854,10 @@ def safe_print(message):
     if not CONSOLE_LOCK.acquire(timeout=2):
         return
     try:
+        if _plain_log():
+            sys.stdout.write(message + '\n')
+            sys.stdout.flush()
+            return
         # Long messages are no longer cut to the terminal width: that took
         # the chunk tag off the end of every "Chunk job" line, and under a
         # service (no terminal, width assumed 80) it cut every line in the
@@ -895,6 +910,19 @@ def signal_handler(sig, frame):
                 # timer picks this up on the event loop thread (call_from_thread
                 # cannot be used from a signal handler — same thread as the loop).
                 _TUI_SIGNAL = 'pause'
+        elif sig == signal.SIGTERM:
+            # "systemctl stop" / "kill": nobody is there to answer a pause
+            # menu. Stop the encoders and exit; the threads hand their work
+            # back and a whole-file encode keeps its partial file to resume.
+            # (This used to open the pause menu, fail to read an answer, and
+            # only then abort.)
+            SHUTDOWN_EVENT.set()
+            try: kill_processes()
+            except: pass
+            try:
+                sys.stdout.write('\n[!] Stop requested (SIGTERM). Shutting down...\n')
+                sys.stdout.flush()
+            except: pass
         elif not PAUSE_REQUESTED:
             PAUSE_REQUESTED = True
             try:
@@ -1055,6 +1083,18 @@ def print_progress(worker_id, current, total, prefix='', suffix=''):
         return
     if sys.is_finalizing():
         return
+    if _plain_log():
+        # One ordinary line each time another 10% is reached.
+        step = percent // 10
+        key = (worker_id, prefix)
+        if _PLAIN_LAST.get(key) != step:
+            _PLAIN_LAST[key] = step
+            if step > 0 or current >= total:
+                names = {'Enc': 'Encoding', 'Up': 'Uploading', 'DL': 'Downloading'}
+                log(worker_id, f"{names.get(prefix, prefix)} {percent}%")
+        if current >= total:
+            _PLAIN_LAST.pop(key, None)
+        return
     width = get_term_width()
     overhead = 12 + len(worker_id) + len(prefix) + 10 + len(suffix)
     bar_length = width - overhead - 5
@@ -1106,6 +1146,16 @@ def monitor_status_loop(worker_ids):
                 except: short_id = wid
                 state = WORKER_PROGRESS.get(wid, "Idle")
                 parts.append(f"[{short_id}: {state}]")
+        if parts and _plain_log():
+            # No in-place status line without a terminal: one ordinary line
+            # a minute, and only when something changed.
+            line = " ".join(parts)
+            now = time.time()
+            if line != _PLAIN_LAST.get('status') and now - _PLAIN_LAST.get('status_at', 0) >= 60:
+                _PLAIN_LAST['status'] = line; _PLAIN_LAST['status_at'] = now
+                safe_print(f"[{datetime.now().strftime('%H:%M:%S')}] Status: {line}")
+            time.sleep(0.5)
+            continue
         if parts:
             line = " ".join(parts)
             width = get_term_width()
@@ -3721,7 +3771,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                 if os.path.exists(raw_log_path): os.remove(raw_log_path)
                 if os.path.exists(gz_log_path): os.remove(gz_log_path)
             else:
-                if single_mode:
+                if single_mode and not _plain_log():
                     with CONSOLE_LOCK:
                         sys.stdout.write(f"\033[2K\r[{datetime.now().strftime('%H:%M:%S')}] [{worker_id}] Idle. Waiting...")
                         sys.stdout.flush()
@@ -3863,6 +3913,16 @@ def run_worker(args):
     _force_tui = getattr(args, 'force_tui', False)
 
     use_tui = HAS_TEXTUAL and (not getattr(args, 'no_tui', False) or _force_tui)
+    # A full-screen UI needs a terminal to draw on. With output going to a
+    # file, a pipe or the systemd journal it only filled the log with cursor
+    # control codes, so fall back to plain lines there (--force-tui overrides).
+    _no_terminal = False
+    try:
+        _no_terminal = not sys.stdout.isatty()
+    except Exception:
+        _no_terminal = True
+    if use_tui and _no_terminal and not _force_tui:
+        use_tui = False
     single_mode = (num_jobs == 1) and not use_tui
 
     # Initialize per-worker detail state and session stats
@@ -3969,6 +4029,8 @@ def run_worker(args):
     else:
         if HAS_TEXTUAL and getattr(args, 'no_tui', False):
             _tui_reason = "--no-tui flag passed"
+        elif HAS_TEXTUAL and _no_terminal:
+            _tui_reason = "output is not a terminal"
         else:
             _tui_reason = _TEXTUAL_UNAVAIL_REASON or "textual not installed (pip install textual)"
         # safe_print clears the status line first; a bare print() landed on
