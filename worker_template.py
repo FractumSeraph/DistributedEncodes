@@ -61,7 +61,18 @@ def _bootstrap_textual():
         import venv as _venv
         if not os.path.isdir(_VENV_DIR):
             print(f"[*] Creating venv at {_VENV_DIR} ...")
-            _venv.create(_VENV_DIR, with_pip=True)
+            try:
+                _venv.create(_VENV_DIR, with_pip=True)
+            except BaseException as _ce:
+                # Debian/Ubuntu without python3-venv: their venv module prints
+                # an explanation and calls sys.exit(1), which is not an
+                # Exception. Without this the whole worker exited here. Remove
+                # the half-made folder so a later run can try again.
+                import shutil as _sh
+                _sh.rmtree(_VENV_DIR, ignore_errors=True)
+                if isinstance(_ce, KeyboardInterrupt):
+                    raise
+                raise RuntimeError(f"could not create a virtual environment ({_ce or 'python3-venv missing?'})")
         venv_python = (
             os.path.join(_VENV_DIR, 'Scripts', 'python.exe')  # Windows
             if sys.platform == 'win32' else
@@ -81,7 +92,21 @@ def _bootstrap_textual():
 
     print("[!] Could not install textual automatically — continuing without TUI.")
 
-_bootstrap_textual()
+def _tui_wanted():
+    """The full-screen UI is only used on a terminal and without --no-tui, so
+    there is nothing to install for a service, a log file or a cloud startup
+    script. (Same rule as the later choice of display mode.)"""
+    if '--no-tui' in sys.argv:
+        return False
+    if '--force-tui' in sys.argv:
+        return True
+    try:
+        return sys.stdout.isatty()
+    except Exception:
+        return False
+
+if _tui_wanted():
+    _bootstrap_textual()
 
 try:
     import textual as _textual_mod
@@ -113,7 +138,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.9.6"
+WORKER_VERSION = "3.9.7"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()

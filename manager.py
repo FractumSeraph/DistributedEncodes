@@ -2585,7 +2585,7 @@ def install_script():
 # finds the same folder (saved name, partial encodes) and nothing it writes
 # is owned by root. Set FRACTUM_DIR to use a different folder.
 SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
-if [ -x "$(command -v apt-get)" ]; then $SUDO apt-get update -qq && $SUDO apt-get install -y ffmpeg python3 python3-requests curl; fi
+if [ -x "$(command -v apt-get)" ]; then $SUDO apt-get update -qq && $SUDO apt-get install -y ffmpeg python3 python3-requests python3-venv curl; fi
 if [ -x "$(command -v dnf)" ]; then $SUDO dnf install -y ffmpeg python3 python3-requests curl; fi
 
 RUN_USER="${{SUDO_USER:-$(id -un)}}"
