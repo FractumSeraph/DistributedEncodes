@@ -1,26 +1,36 @@
-# Replace all instances of the work pi with your username.
+# Fractum worker as a systemd service: starts on boot, restarts if it exits.
+#
+# Before installing, change the three things marked CHANGE below. The easiest
+# way to get the folder ready is to run the dashboard's Linux one-liner once
+# (it creates ~/FractumWorker with worker.py in it), stop it, then enable this.
 [Unit]
 Description=Fractum Distributed Worker
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-# CHANGE THIS to your username (e.g., pi, ubuntu, or your specific user)
+# CHANGE: the user to run as (not root).
 User=pi
 Group=pi
 
-# CHANGE THIS to the folder where worker.py is located
-WorkingDirectory=/home/pi/DistributedEncodes
+# CHANGE: the folder that holds worker.py. Partial encodes and the saved
+# worker name live here too, so keep it the same between runs.
+WorkingDirectory=/home/pi/FractumWorker
 
-# COMMAND TO RUN
-# Adjust the flags (--manager, --username, etc.) as needed.
-# Note: We use -u to force unbuffered output so logs appear instantly.
-ExecStart=/usr/bin/python3 -u worker_template.py --username "pi" --workername "pi" --jobs 1
+# CHANGE: --manager, --username, --workername and --jobs.
+# -u keeps output unbuffered so it reaches the journal immediately.
+# --no-tui: there is no terminal under systemd.
+ExecStart=/usr/bin/python3 -u worker.py --no-tui --manager "https://encode.fractumseraph.net/" --username "pi" --workername "pi" --jobs 1
 
-# RESTART POLICY
-# Vital for this worker: If it updates itself or crashes, systemd will restart it.
+# Only needed when worker.py did not come from the manager's /dl/worker
+# (that copy already carries the token), e.g. when running from a git clone:
+#Environment=WORKER_SECRET=your-manager-token
+
+# The worker updates itself by re-executing, and exits cleanly on SIGTERM
+# after handing its work back. Give it a little time to do that.
 Restart=always
 RestartSec=10
+TimeoutStopSec=30
 
 [Install]
 WantedBy=multi-user.target
