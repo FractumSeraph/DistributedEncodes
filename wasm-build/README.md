@@ -20,11 +20,11 @@ The `Dockerfile` here reproduces that configuration and bumps the components to
 current releases (FFmpeg 7.1, SVT-AV1 2.3.0, opus 1.5.2 by default — change the
 `ARG` lines to pin whatever you want).
 
-## Why the shipped build cannot finish an encode
+## Why the previous build could not finish an encode
 
-The `ffmpeg.wasm` currently in `static/` (FFmpeg 6.1 + **SVT-AV1 v1.8.0**) starts
-encoding and then dies with `RuntimeError: unreachable` as soon as the first
-frame reaches SVT-AV1's picture manager. It never produces output, for any
+The `ffmpeg.wasm` shipped before this rebuild (FFmpeg 6.1 + **SVT-AV1 v1.8.0**) started
+encoding and then died with `RuntimeError: unreachable` as soon as the first
+frame reached SVT-AV1's picture manager. It never produced output, for any
 input size.
 
 Cause: in SVT-AV1 1.8.0, `rtime_alloc_palette_tokens()` is *declared* in
@@ -68,28 +68,39 @@ ARG EMSDK_VERSION=3.1.51
 SVT-AV1 has moved a lot since your original build — newer releases encode faster
 at the same quality, so a bump is worthwhile.
 
-## Two spots most likely to need a tweak (be ready to iterate)
+## What the build needed (all already in the Dockerfile)
 
-This recipe reconstructs your exact FFmpeg configure line (that part is known-good
-from your binary), but two steps depend on toolchain/library specifics that shift
-between versions. If a `docker build` fails, it's almost certainly one of these:
+The files now in `static/` were produced by running the Dockerfile's steps
+natively with emsdk 3.1.51 (FFmpeg n7.1, SVT-AV1 v2.3.0, opus v1.5.2). The
+recipe as first written failed at four points; each has a workaround in place:
 
-1. **SVT-AV1's wasm CMake (step 2).** SVT-AV1 is heavily x86-optimized; on the
-   Emscripten toolchain its CMake should fall back to the portable C path
-   automatically (no asm). If it tries to use x86 intrinsics or fails detecting
-   the target, pass `-DCMAKE_SYSTEM_PROCESSOR=generic` and/or the release's
-   documented "C-only" switch. SVT-AV1 also leans on threads heavily — keep the
-   Emscripten `PTHREAD_POOL_SIZE` (step 4) at least as large as the encoder's
-   thread count (the browser worker already caps SVT threads via
-   `-svtav1-params lp=1`, so a small pool is fine).
+1. **FFmpeg 7.x mistakes `emcc` for clang-cl.** Its configure treats any clang
+   that accepts `-?` as clang-cl and switches to MSVC flags (`-nologo`, `-Fo`).
+   A `sed` drops that probe.
+2. **pkg-config cannot see the libraries just built.** `emconfigure` points
+   pkg-config at Emscripten's sysroot and ignores `PKG_CONFIG_PATH`; it honours
+   `EM_PKG_CONFIG_PATH`.
+3. **Stack protector.** opus and SVT-AV1 both turn on `-fstack-protector-strong`
+   and Emscripten has no libssp. opus takes `--disable-stack-protector`;
+   SVT-AV1 has no switch, so a two-symbol stub library is linked in.
+4. **Final link.** `--enable-gpl` builds `libpostproc`, and `fftools` needs
+   `libavdevice`; both must be on the link line. FFmpeg's own `make` ends by
+   linking a plain `ffmpeg_g`, which fails under Emscripten ("initial memory too
+   small") and is ignored: only the objects and archives are used.
 
-2. **Emscripten pthread output naming (steps 1/4).** `web_node.js` expects a
-   separate `ffmpeg.worker.js`. Emscripten versions around **3.1.51** emit that
-   file for `-pthread`; some **newer** versions changed how the pthread worker is
-   delivered and may not emit a standalone `.worker.js`. If yours doesn't:
-   either pin `EMSDK_VERSION` back to a version that does, **or** update
-   `web_node.js` (the `mainScriptUrlOrBlob` / worker bootstrap) to the new model.
-   Nothing else in the app cares which you choose.
+`web_node.js` expects a separate `ffmpeg.worker.js`. Emscripten 3.1.51 emits
+one; newer versions may not, in which case pin the version or update the worker
+bootstrap in `web_node.js`.
+
+## Known behaviour of this build
+
+- **It never exits.** FFmpeg encodes, finalises and closes the output, prints
+  its final report, then hangs in its own shutdown and never calls `exit`.
+  `web_node.js` therefore treats `progress=end` in FFmpeg's `-progress` output
+  as completion, and the page starts a fresh worker before the next job.
+- **It is slow.** No SIMD and one encoder thread (`lp=1`). Measured in headless
+  Chromium: about 0.26 frames per second at 640x480, preset 2 (300 frames in
+  19 minutes), using roughly 570 MB.
 
 ## Memory reality (why this only takes small files)
 

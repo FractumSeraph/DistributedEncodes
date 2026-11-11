@@ -134,8 +134,10 @@ RUN mkdir -p ${BUILD}/dist && cd ${BUILD}/ffmpeg && \
       -sPTHREAD_POOL_SIZE=8 \
       -sPROXY_TO_PTHREAD=1 \
       -sALLOW_MEMORY_GROWTH=1 \
-      -sMAXIMUM_MEMORY=2gb \
-      -sINITIAL_MEMORY=64mb \
+      -sMAXIMUM_MEMORY=4gb \
+      -sINITIAL_MEMORY=1gb \
+      -sSTACK_SIZE=5mb \
+      -sDEFAULT_PTHREAD_STACK_SIZE=2mb \
       -sEXPORTED_RUNTIME_METHODS=callMain,FS \
       -sINVOKE_RUN=0 \
       -sEXIT_RUNTIME=0 \

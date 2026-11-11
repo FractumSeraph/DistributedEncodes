@@ -272,6 +272,9 @@
     // stuck at 0 got slow-but-healthy browser encodes reassigned.
     let activeProgress = 0;
     let lastProgressLog = 0;
+    // Set when the encoder finished its work but its runtime did not shut
+    // down cleanly; the loop replaces the worker before taking more work.
+    let workerNeedsRestart = false;
 
     function noteProgress(msg) {
         // No known duration (some whole-file jobs): report encoded minutes,
@@ -395,8 +398,12 @@
                 const msg = e.data;
                 if (msg.type === 'log') log(msg.msg, msg.level);
                 else if (msg.type === 'progress') noteProgress(msg);
-                else if (msg.type === 'chunk_done' || msg.type === 'chunk_stale') { stopHb(); resolve(); }
-                else if (msg.type === 'chunk_error') { stopHb(); reject(new Error(msg.msg)); }
+                else if (msg.type === 'chunk_done' || msg.type === 'chunk_stale') {
+                    stopHb();
+                    if (msg.restart) workerNeedsRestart = true;
+                    resolve();
+                }
+                else if (msg.type === 'chunk_error') { stopHb(); if (msg.restart) workerNeedsRestart = true; reject(new Error(msg.msg)); }
             };
             worker.onerror = (e) => {
                 stopHb();
@@ -472,6 +479,11 @@
 
         while (alive()) {
             try {
+                if (workerNeedsRestart) {
+                    workerNeedsRestart = false;
+                    await initWorker();   // fresh encoder (and a fresh heap) for the next job
+                    if (!alive()) break;
+                }
                 // A. CHUNK FIRST — take a slice of a large video via a pre-cut
                 // segment (video_only: browsers can't do the whole-file audio
                 // chunk). This is how browser nodes help on multi-GB sources.
@@ -605,16 +617,19 @@
                     noteProgress(msg);
                 } else if (msg.type === 'done') {
                     stopHb();
+                    if (msg.restart) workerNeedsRestart = true;
                     resolve();
                 } else if (msg.type === 'upload_rejected') {
                     // The manager refused the upload and has already recorded
                     // the outcome; a failure report on top would count twice.
                     stopHb();
+                    if (msg.restart) workerNeedsRestart = true;
                     log("Upload not accepted by manager: " + msg.msg, 'err');
                     currentJobId = null;
                     resolve();
                 } else if (msg.type === 'error') {
                     stopHb();
+                    if (msg.restart) workerNeedsRestart = true;
                     reject(new Error(msg.msg));
                 }
             };

@@ -112,7 +112,7 @@ self.onmessage = async function(e) {
         try {
             await processJob(msg.job);
         } catch (err) {
-            postMessage({type: 'error', msg: err.toString()});
+            postMessage({type: 'error', msg: err.toString(), restart: runtimeStuck});
         }
         return; // Don't pass job messages to Emscripten
     }
@@ -122,7 +122,7 @@ self.onmessage = async function(e) {
         try {
             await processChunk(msg.chunk);
         } catch (err) {
-            postMessage({type: 'chunk_error', msg: err.toString()});
+            postMessage({type: 'chunk_error', msg: err.toString(), restart: runtimeStuck});
         }
         return;
     }
@@ -142,11 +142,36 @@ self.onmessage = async function(e) {
 // in-memory filesystem; read the latest encoded position from it and pass it
 // to the page, which shows it and sends it to the manager as real progress.
 // (-progress and -stats_period only control reporting, not the encode.)
+//
+// It is also how completion is detected. This build writes the whole output
+// and prints its final report, then hangs in its own shutdown and never calls
+// exit. FFmpeg writes "progress=end" with that final report, after the output
+// file has been finalised and closed, so that marker is taken as "done". The
+// runtime is then left stuck in shutdown: `runtimeStuck` tells the page to
+// replace this worker before the next job.
+let runtimeStuck = false;
+
+function finishWithoutExit() {
+    if (!self.resolveJob) return;      // exit arrived normally after all
+    runtimeStuck = true;
+    postMessage({type: 'log', level: 'sys', msg: "FFmpeg finished (no exit signal); continuing."});
+    const done = self.resolveJob;
+    self.resolveJob = null;
+    self.rejectJob = null;
+    done();
+}
+
 function startProgressPoll(FS, progPath, totalSec) {
     let lastSec = -1;
+    let ended = false;
     const id = setInterval(() => {
         try {
             const txt = FS.readFile(progPath, { encoding: 'utf8' });
+            if (!ended && txt.indexOf('progress=end') >= 0) {
+                ended = true;
+                // A moment for a normal exit to arrive first, if it is going to.
+                setTimeout(finishWithoutExit, 3000);
+            }
             const at = txt.lastIndexOf('out_time_us=');
             if (at < 0) return;
             const us = parseInt(txt.slice(at + 12, at + 40), 10);
@@ -192,7 +217,7 @@ async function processChunk(chunk) {
         // change the bitstream — no tune override, so browser chunks match
         // native chunks (SVT default tune) when tiled into one video.
         // -enc_time_base pins the encoder time base to the source frame rate
-        // (manager sends the exact fraction): FFmpeg 7.x (this wasm) doesn't
+        // (manager sends the exact fraction): FFmpeg 7.x (this wasm) does not
         // propagate a frame rate through setpts, and libsvtav1 would see
         // 1/time_base = 1000 fps and refuse to start (240 fps cap).
         let etbArgs = [];
@@ -239,9 +264,9 @@ async function processChunk(chunk) {
             method: 'POST', body: fd,
             headers: chunk.token ? { 'X-Worker-Token': chunk.token } : {}
         });
-        if (up.status === 409) { postMessage({type: 'chunk_stale'}); return; }
+        if (up.status === 409) { postMessage({type: 'chunk_stale', restart: runtimeStuck}); return; }
         if (!up.ok) throw new Error("Chunk upload failed: " + up.status);
-        postMessage({type: 'chunk_done'});
+        postMessage({type: 'chunk_done', restart: runtimeStuck});
     } finally {
         stopProgress();
         currentOutputPath = null;
@@ -402,12 +427,12 @@ async function processJob(job) {
         if (up.status === 400 || up.status === 409) {
             let why = "HTTP " + up.status;
             try { const j = await up.json(); if (j && j.message) why += " " + j.message; } catch (e) {}
-            postMessage({type: 'upload_rejected', msg: why});
+            postMessage({type: 'upload_rejected', msg: why, restart: runtimeStuck});
             return;
         }
         if (!up.ok) throw new Error("Upload failed: " + up.status + " " + up.statusText);
         
-        postMessage({type: 'done'});
+        postMessage({type: 'done', restart: runtimeStuck});
 
     } catch (e) {
         throw e;
