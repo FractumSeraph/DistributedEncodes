@@ -224,7 +224,13 @@ async function processChunk(chunk) {
         const frMatch = String(chunk.fps || '').match(/^([1-9]\d*)\/([1-9]\d*)$/);
         if (frMatch) {
             const fn = parseInt(frMatch[1], 10), fd = parseInt(frMatch[2], 10);
-            if (fn / fd <= 240) etbArgs = ['-enc_time_base', `${fd}/${fn}`];
+            // setts: this FFmpeg build hands the muxer packets with no
+            // duration, so the MP4's length came out one frame short and
+            // every chunk after a browser chunk landed a frame early when
+            // the film was assembled. With the encoder time base pinned to
+            // one frame, each packet lasts exactly 1 tick. Timestamps only;
+            // the encoded video is untouched.
+            if (fn / fd <= 240) etbArgs = ['-enc_time_base', `${fd}/${fn}`, '-bsf:v', 'setts=duration=1'];
         }
         const args = [
             '-threads', '1', '-v', 'verbose',
