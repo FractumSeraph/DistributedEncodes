@@ -406,12 +406,12 @@ Volunteers can encode small files directly in their browser — no Python, no FF
 - The page authenticates automatically (the worker token is injected server-side).
 - **Big files, too:** browser nodes take chunks of large videos via *server-side segmentation* — the manager stream-copies just the piece for one chunk into a small standalone file and sends that, so the browser never downloads a multi-GB source. See "Server-side segmentation" below.
 - Whole-file browser jobs still accept only small sources — set **MAX SOURCE MB** on the page (default 150). Browser encoding is memory-bound (32-bit WebAssembly), so large *whole* files can crash the tab; the manager filters jobs by that size.
-- **Rebuilding the WASM:** the FFmpeg→WebAssembly bundle (SVT-AV1 + Opus) is rebuilt reproducibly with the Docker recipe in [`wasm-build/`](wasm-build/README.md) — use it to compile a newer AV1.
+- **Rebuilding the WASM:** the FFmpeg→WebAssembly bundle (SVT-AV1 with WebAssembly SIMD + Opus) is built by [`wasm-build/build.sh`](wasm-build/README.md); read that README before changing component or compiler versions.
 - Threads require cross-origin isolation; the manager already sends the needed `Cross-Origin-Opener-Policy` / `Cross-Origin-Embedder-Policy` headers, and the `.wasm` is served with the correct `application/wasm` type.
 - Subtitles are dropped in the browser (no `ffprobe` in the wasm build to filter subtitle types safely); output is video + Opus audio.
 - A `WALLET` field on the page credits FractumCoin earnings just like the native `--wallet` flag.
 
-> The browser worker is best for casual, low-power contributors on small files. Native workers remain far faster and handle the large files.
+> The dashboard's "Run worker app" dialog links to `/web` last, labelled as the slower option, and the `/web` page points back to the app instructions (`/#run-worker`). Native workers are preferred: the browser build runs at roughly a quarter of native single-thread speed, uses one encoder thread, and only works while the tab is open.
 
 ## Utility Scripts
 

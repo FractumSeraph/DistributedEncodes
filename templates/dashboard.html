@@ -288,16 +288,19 @@
                 <div style="text-align: center; margin-top: 30px;">
                     <a href="/dl/worker" target="_blank" class="modal-btn">DOWNLOAD WORKER.PY</a>
                 </div>
-                <!-- Browser worker (/web) link hidden for now — the in-browser
-                     encoder isn't reliable yet. The /web route still exists for
-                     testing; re-add this link when it's ready. -->
-                <!--
-                    <a href="/web" class="modal-btn">ENCODE IN BROWSER</a>
-                    <p style="font-size:0.8em; color:#888; text-align:center; margin-top:8px;">
-                        No install needed — encode small files right in your browser (AV1 via WebAssembly).
-                    </p>
-                -->
-
+                <!-- Browser worker: offered last and described as the slower
+                     option on purpose. The installed app is several times
+                     faster, so it is what volunteers should use if they can. -->
+                <div class="os-section" style="margin-top: 30px;">
+                    <span class="os-title">:: NO INSTALL (BROWSER) &mdash; SLOWER</span>
+                    Can't install anything? You can encode in a browser tab instead.
+                    It does the same work at the same quality, but runs at roughly a
+                    quarter of the app's speed and only while the tab stays open.
+                    <b>If you can run one of the options above, use that.</b>
+                    <div style="text-align: center; margin-top: 12px;">
+                        <a href="/web" class="modal-btn" style="opacity: 0.8;">ENCODE IN BROWSER</a>
+                    </div>
+                </div>
 
                 <div style="margin-top: 30px; border-top: 1px dashed var(--neon-purple); padding-top: 20px;">
                     <span class="os-title" style="color: var(--text-light);">:: SERIES ID REFERENCE</span>
@@ -311,6 +314,10 @@
     </div>
 
     <script>
+        // Lets other pages link straight to the worker instructions: /#run-worker
+        window.addEventListener('DOMContentLoaded', () => {
+            if (location.hash === '#run-worker') openModal();
+        });
         function openModal() { 
             const url = window.location.origin;
             document.getElementById('linux-cmd').innerText = `curl -s "${url}/install?username=User&workername=Box1" | sudo bash`;
