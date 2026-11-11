@@ -138,7 +138,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.9.7"
+WORKER_VERSION = "3.9.8"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -167,6 +167,25 @@ def _plain_log():
         return not sys.stdout.isatty()
     except Exception:
         return True
+def _download_progress(pct):
+    """Progress of the one-off FFmpeg download. On a terminal the line is
+    redrawn in place. Anywhere else it is an ordinary line every 25%: one
+    update per 8 KB block with no line ending added up to a single line of
+    several hundred kilobytes, and Google Cloud's startup-script runner
+    stops a script whose output line is longer than 64 KB."""
+    try:
+        if not _plain_log():
+            sys.stdout.write(f"\r    Downloading... {pct}%")
+            sys.stdout.flush()
+            return
+        step = pct // 25
+        if _PLAIN_LAST.get('ffmpeg-download') != step:
+            _PLAIN_LAST['ffmpeg-download'] = step
+            if step:
+                sys.stdout.write(f"    Downloading... {step * 25}%\n")
+                sys.stdout.flush()
+    except Exception:
+        pass
 _PLAIN_LAST = {}   # (worker_id, prefix) -> last percentage logged / last status line
 _TUI_SIGNAL = None  # Set to 'pause' or 'quit' by signal handler, polled by app timer
 
@@ -1981,11 +2000,7 @@ def download_ffmpeg_windows():
                         downloaded += len(chunk)
                         if total_size > 0:
                             pct = int((downloaded / total_size) * 100)
-                            try:
-                                msg = f"    Downloading... {pct}%"
-                                sys.stdout.write(f"\r{msg}")
-                                sys.stdout.flush()
-                            except: pass
+                            _download_progress(pct)
             print("\n[*] Extracting FFmpeg...")
             
             with zipfile.ZipFile(temp_zip) as z:
@@ -2041,10 +2056,7 @@ def _download_ffmpeg_linux_from(url):
                  downloaded += len(chunk)
                  if total_size > 0:
                      pct = int((downloaded / total_size) * 100)
-                     try:
-                         sys.stdout.write(f"\r    Downloading... {pct}%")
-                         sys.stdout.flush()
-                     except: pass
+                     _download_progress(pct)
         
         print("\n[*] Extracting FFmpeg...")
         ext_dir = f"temp_ffmpeg_ext_{int(time.time())}"
