@@ -4048,7 +4048,31 @@ def get_logs():
         conn = db_handler.get_connection(); conn.row_factory = sqlite3.Row
         try:
             c = conn.cursor()
-            c.execute("SELECT * FROM system_logs ORDER BY timestamp DESC LIMIT ?", (limit,))
+            # Optional filters, so one job's or one worker's history can be
+            # pulled without paging through everything else:
+            #   level=WARN,ERROR   q=text in the message   job=text in the job id
+            #   since=2026-11-10 22:00   before_id=N (page backwards)
+            where, params = [], []
+            levels = [l.strip().upper() for l in (request.args.get('level') or '').split(',') if l.strip()]
+            if levels:
+                where.append("level IN (%s)" % ",".join("?" * len(levels))); params += levels
+            for arg, col in (('q', 'message'), ('job', 'related_id')):
+                val = (request.args.get(arg) or '').strip()
+                if val:
+                    where.append(f"instr(lower(COALESCE({col}, '')), ?) > 0"); params.append(val.lower()[:200])
+            since = (request.args.get('since') or '').strip()
+            if since:
+                where.append("timestamp >= ?"); params.append(since[:32])
+            try:
+                before_id = int(request.args.get('before_id') or 0)
+            except (ValueError, TypeError):
+                before_id = 0
+            if before_id > 0:
+                where.append("id < ?"); params.append(before_id)
+            sql = "SELECT * FROM system_logs"
+            if where:
+                sql += " WHERE " + " AND ".join(where)
+            c.execute(sql + " ORDER BY timestamp DESC LIMIT ?", (*params, limit))
             logs = [dict(r) for r in c.fetchall()]
         finally:
             conn.close()

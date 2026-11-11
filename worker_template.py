@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.9.0"
+WORKER_VERSION = "3.9.1"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -909,6 +909,30 @@ def kill_processes():
                 if proc.poll() is None: proc.kill()
             except: pass
 
+# The update that check_version() found and vetted, held for apply_update().
+_PENDING_UPDATE = {"body": None, "version": None}
+# Set (and inherited across the re-exec) when installing a version failed, so
+# the worker does not stop its work every ten minutes to fail the same way.
+_UPDATE_FAILED_ENV = "FRACTUM_UPDATE_FAILED"
+
+def _vet_update(body):
+    """Return the version string of a downloaded worker script, or None when
+    the download is not a complete, valid worker (an error page served with a
+    200, a truncated transfer). Installing such a file would leave a worker
+    that cannot start, and nothing would ever repair it."""
+    try:
+        text = body.decode('utf-8')
+    except (UnicodeDecodeError, AttributeError):
+        return None
+    match = re.search(r'^WORKER_VERSION\s*=\s*"([^"]+)"', text, re.M)
+    if not match or 'def run_worker(' not in text or '__main__' not in text:
+        return None
+    try:
+        compile(text, 'worker.py', 'exec')
+    except (SyntaxError, ValueError):
+        return None
+    return match.group(1)
+
 def check_version(manager_url):
     global LAST_UPDATE_CHECK
     with CHECK_LOCK:
@@ -916,35 +940,59 @@ def check_version(manager_url):
         LAST_UPDATE_CHECK = time.time()
     try:
         url = f"{manager_url}/dl/worker"
-        r = requests.get(url, headers=get_auth_headers(), timeout=10)
+        r = requests.get(url, headers=get_auth_headers(), timeout=30)
         if r.status_code == 200:
-            match = re.search(r'WORKER_VERSION\s*=\s*"([^"]+)"', r.text)
-            if match and match.group(1) != WORKER_VERSION:
-                safe_print(f"[!] Update found: {WORKER_VERSION} -> {match.group(1)}")
-                return True
+            # Bytes, not r.text: the script is written back exactly as served,
+            # whatever charset the response claims.
+            body = r.content
+            match = re.search(rb'^WORKER_VERSION\s*=\s*"([^"]+)"', body, re.M)
+            if not match: return False
+            new_version = match.group(1).decode('ascii', 'replace')
+            if new_version == WORKER_VERSION: return False
+            if os.environ.get(_UPDATE_FAILED_ENV) == new_version: return False
+            if _vet_update(body) != new_version:
+                safe_print(f"[!] Update {new_version} offered by the manager is incomplete or invalid. Ignoring it.")
+                return False
+            _PENDING_UPDATE["body"] = body; _PENDING_UPDATE["version"] = new_version
+            safe_print(f"[!] Update found: {WORKER_VERSION} -> {new_version}")
+            return True
     except: pass
     return False
 
 def apply_update(manager_url):
     safe_print("[*] Downloading and applying update...")
     tmp_path = None
+    target_path = os.path.abspath(sys.argv[0])
+    version = _PENDING_UPDATE.get("version") or "?"
     try:
-        url = f"{manager_url}/dl/worker"
-        r = requests.get(url, headers=get_auth_headers(), timeout=30)
-        if r.status_code == 200:
-            target_path = os.path.abspath(sys.argv[0])
-            tmp_path = target_path + '.tmp'
-            with open(tmp_path, 'w', encoding='utf-8') as f:
-                f.write(r.text)
-            os.replace(tmp_path, target_path)
-            safe_print("[*] Restarting worker...")
-            os.execv(sys.executable, [sys.executable] + sys.argv)
+        body = _PENDING_UPDATE.get("body")
+        if body is None:
+            r = requests.get(f"{manager_url}/dl/worker", headers=get_auth_headers(), timeout=30)
+            if r.status_code != 200:
+                raise RuntimeError(f"HTTP {r.status_code}")
+            body = r.content
+            version = _vet_update(body)
+            if version is None:
+                raise RuntimeError("downloaded script is incomplete or invalid")
+        tmp_path = target_path + '.tmp'
+        with open(tmp_path, 'wb') as f:
+            f.write(body)
+        os.replace(tmp_path, target_path)
     except Exception as e:
         safe_print(f"[!] Failed to apply update: {e}")
         if tmp_path:
             try:
                 if os.path.exists(tmp_path): os.remove(tmp_path)
             except: pass
+        # Carry on with the current version rather than exit: a worker that
+        # quits here stays down until someone notices.
+        os.environ[_UPDATE_FAILED_ENV] = str(version)
+        safe_print("[*] Continuing on the current version.")
+    safe_print("[*] Restarting worker...")
+    try:
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    except Exception as e:
+        safe_print(f"[!] Could not restart the worker: {e}")
 
 def print_progress(worker_id, current, total, prefix='', suffix=''):
     if total <= 0: return
