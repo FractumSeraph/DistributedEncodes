@@ -113,7 +113,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.9.5"
+WORKER_VERSION = "3.9.6"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -1613,7 +1613,7 @@ class _StreamWatch:
 
 def _jobs_hint():
     """Once per session: if the video encodes so far left most of this
-    machine's CPU idle, return a one-line suggestion to run more job slots.
+    machine's CPU idle, return a one-line note that more job slots are possible.
     Based on measured ffmpeg CPU time, not on the core count alone."""
     cores = os.cpu_count() or 1
     with STATS_LOCK:
@@ -1630,9 +1630,12 @@ def _jobs_hint():
         if better <= slots:
             return None
         ENC_USAGE["hinted"] = True
-    return (f"Tip: each encode has been using about {per_encode:.1f} of this machine's {cores} CPU "
-            f"threads, so {slots} job slot{'s' if slots != 1 else ''} leaves most of it idle. If it has "
-            f"memory to spare, restarting with --jobs {better} would get more done.")
+    # Running below full load is a perfectly good choice (heat, noise, the
+    # power bill), so this only states what was measured and what the option is.
+    return (f"Note: each encode has been using about {per_encode:.1f} of this machine's {cores} CPU "
+            f"threads, with {slots} job slot{'s' if slots != 1 else ''} running. That is fine if you "
+            f"want to keep heat and power use down. If you would rather use more of the machine, "
+            f"--jobs {better} is the setting (it also needs more memory).")
 
 def _set_speed(worker_id, line):
     """Stash ffmpeg's own 'speed=' figure for the display.
