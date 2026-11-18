@@ -138,7 +138,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.9.8"
+WORKER_VERSION = "3.10.0"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -2420,6 +2420,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
         out_path = os.path.join(temp_dir, f"chunk_out_{_co_safe}{ENCODING_CONFIG['OUTPUT_EXT']}")
         raw_log_path = os.path.join(temp_dir, "chunk_encode.log")
         gz_log_path = os.path.join(temp_dir, "chunk_encode.log.gz")
+        slice_args = None; slice_path = None; slice_max_bytes = 0   # see "Audio slice" below
 
         base_crf = int(ENCODING_CONFIG["VIDEO_CRF"])
         target_crf = (base_crf - 6) if profile == 'live_action' else base_crf
@@ -2473,6 +2474,33 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                     '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
                     '-progress', 'pipe:1', out_path])
             prog_total = dur_sec
+            # Audio slice (manager asks for it with 'audio_slice'): a second
+            # output of the SAME ffmpeg run that stream-copies the source's
+            # audio and text-subtitle packets for this chunk's time range.
+            # Those bytes are being downloaded anyway - the audio is
+            # interleaved with the video - so the manager can rebuild the
+            # whole audio track from the slices and nobody has to download
+            # the entire source a second time just for audio.
+            #   -ss 0             drop packets before the chunk start (none on
+            #                     the first chunk, which must keep them all)
+            #   -t dur+1          run a second past the chunk end; the overlap
+            #                     is how the manager proves each join
+            #   -output_ts_offset put the source's own timestamps back, so
+            #                     slices line up without guesswork
+            _as = chunk.get('audio_slice') if isinstance(chunk, dict) else None
+            try:
+                if isinstance(_as, dict) and _as.get('audio_index') is not None:
+                    slice_path = os.path.join(temp_dir, f"chunk_out_{_co_safe}.aslice.mka")
+                    slice_max_bytes = int(_as.get('max_bytes') or 0)
+                    slice_args = ((['-ss', '0'] if start_sec > 0 else []) +
+                                  ([] if is_last else ['-t', f"{dur_sec + 1.0:.5f}"]) +
+                                  ['-output_ts_offset', f"{start_sec:.5f}",
+                                   '-map', f"0:{int(_as['audio_index'])}"])
+                    for _sidx in (_as.get('subtitle_indices') or []):
+                        slice_args += ['-map', f"0:{int(_sidx)}"]
+                    slice_args += ['-c', 'copy', '-f', 'matroska', slice_path]
+            except (TypeError, ValueError):
+                slice_args = None; slice_path = None
         else:
             # Audio + subtitles for the whole file, encoded once.
             audio_index = None; subtitle_indices = []; audio_channels = 2
@@ -2591,18 +2619,28 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                     log(worker_id, f"Chunk encode failed (rc="
                                    f"{_ffmpeg_rc_text(proc.returncode) if proc else '?'}). "
                                    f"Retrying in {_delay}s...", "WARN")
+                    if slice_args and not _trunc_note:
+                        # The encode itself failed. The audio slice is an
+                        # extra the chunk does not depend on: retry without
+                        # it, so it can never be what keeps a chunk failing.
+                        log(worker_id, f"Retrying without the audio slice ({chunk_tag}).", "WARN")
+                        slice_args = None
                 update_status("Retrying")
                 for _ in range(_delay):
                     if SHUTDOWN_EVENT.is_set(): break
                     time.sleep(1)
                 if SHUTDOWN_EVENT.is_set(): break
 
+            if slice_path:
+                try:
+                    if os.path.exists(slice_path): os.remove(slice_path)
+                except OSError: pass
             popen_kwargs = {}
             if platform.system() == 'Windows':
                 popen_kwargs['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP
             else:
                 popen_kwargs['start_new_session'] = True
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            proc = subprocess.Popen(cmd + (slice_args or []), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     stdin=subprocess.DEVNULL, encoding='utf-8', errors='replace', **popen_kwargs)
             assert proc.stdout is not None
             with PROC_LOCK: ACTIVE_PROCS[worker_id] = proc
@@ -2716,9 +2754,9 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                 log(worker_id, f"Failed to upload chunk log: {_le}", "WARN")
 
         def cleanup():
-            for _fp in [out_path, raw_log_path, gz_log_path]:
+            for _fp in [out_path, raw_log_path, gz_log_path, slice_path]:
                 try:
-                    if os.path.exists(_fp): os.remove(_fp)
+                    if _fp and os.path.exists(_fp): os.remove(_fp)
                 except: pass
 
         if SHUTDOWN_EVENT.is_set() and (proc is None or proc.returncode != 0):
@@ -2749,6 +2787,34 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
 
         # ---- Upload ----
         chunk_bytes = os.path.getsize(out_path)
+        # The audio slice goes first, so it is in place when the manager
+        # records the chunk. Only a slice from a run that ended cleanly is
+        # sent: a stalled-and-salvaged encode may have stopped copying early.
+        # Failing to deliver it costs nothing but the saving - the manager
+        # then has a worker encode the audio from the source as before.
+        if slice_args and slice_path and proc is not None and proc.returncode == 0 and not _stall_salvaged:
+            try:
+                _sl_bytes = os.path.getsize(slice_path) if os.path.exists(slice_path) else 0
+            except OSError:
+                _sl_bytes = 0
+            if _sl_bytes <= 0:
+                log(worker_id, f"No audio slice was written ({chunk_tag}); the manager will use the separate audio pass.", "WARN")
+            elif slice_max_bytes and _sl_bytes > slice_max_bytes:
+                log(worker_id, f"Audio slice is {_sl_bytes/1024/1024:.0f} MB, over the manager's limit; not sending it ({chunk_tag}).", "WARN")
+            else:
+                log(worker_id, f"Sending audio slice ({_sl_bytes/1024/1024:.2f} MB)...")
+                update_status("Up 0%")
+                _sl_outcome, _sl_detail = _upload_with_retry(
+                    f"{manager_url}/upload_audio_slice", lambda: open(slice_path, 'rb'),
+                    f"aslice_{idx}.mka",
+                    {'job_id': job_id, 'chunk_index': idx, 'worker_id': worker_id},
+                    worker_id, f"Audio slice ({chunk_tag})",
+                    keepalive=lambda: report_chunk("processing", 100))
+                if _sl_outcome != 'ok':
+                    log(worker_id, f"Audio slice not delivered ({chunk_tag}): {_sl_detail}", "WARN")
+                else:
+                    with STATS_LOCK:
+                        SESSION_STATS["bytes_uploaded"] += _sl_bytes
         log(worker_id, f"Chunk done ({chunk_bytes/1024/1024:.2f} MB). Uploading...")
         update_status("Up 0%")
         _up_outcome, _up_detail = _upload_with_retry(

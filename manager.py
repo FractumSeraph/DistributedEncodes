@@ -159,12 +159,55 @@ except ImportError:
 # The admin panel can change REMOTE_SOURCE_URL at runtime. That used to live
 # only in memory, so every restart (now automatic) silently reverted it.
 _RUNTIME_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'runtime_config.json')
+# AUDIO_FROM_CHUNKS: where a chunked job's audio/subtitle track comes from.
+#   'off'    one worker downloads the whole source a second time just for the
+#            audio (the original behaviour).
+#   'on'     every video-chunk worker also saves the untouched source audio for
+#            its slice (it is already downloading those bytes); the manager
+#            rejoins the slices and encodes the track itself. Halves the source
+#            traffic per film. Any doubt about the slices falls back to 'off'
+#            behaviour for that job.
+#   'verify' both: the separate audio pass still runs and is what goes into the
+#            final file; the slices are rejoined as well and the two results
+#            compared, with the outcome logged. For checking 'on' on real
+#            sources without relying on it.
+try:
+    from config import AUDIO_FROM_CHUNKS
+except Exception:
+    AUDIO_FROM_CHUNKS = 'off'
+
+# Optional: a folder holding the ffmpeg/ffprobe to use for building that track
+# (e.g. the same static build the workers download). FFmpeg versions differ
+# slightly in how they time audio that carries an encoder delay - older ones
+# place it a few milliseconds later - so using the workers' version here makes
+# the built track identical to a worker's, not merely equivalent.
+try:
+    from config import AUDIO_FROM_CHUNKS_FFMPEG_DIR
+except Exception:
+    AUDIO_FROM_CHUNKS_FFMPEG_DIR = None
+
+def _audio_tool(name):
+    """ffmpeg/ffprobe for the audio-from-chunks build."""
+    if AUDIO_FROM_CHUNKS_FFMPEG_DIR:
+        cand = os.path.join(str(AUDIO_FROM_CHUNKS_FFMPEG_DIR), name)
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return name
+
+def _norm_audio_mode(v):
+    v = str(v or '').strip().lower()
+    return v if v in ('on', 'verify') else 'off'
+AUDIO_FROM_CHUNKS = _norm_audio_mode(AUDIO_FROM_CHUNKS)
+
 try:
     with open(_RUNTIME_CONFIG_FILE) as _f:
         _rc = json.load(_f)
     if isinstance(_rc, dict) and 'REMOTE_SOURCE_URL' in _rc:
         REMOTE_SOURCE_URL = _rc['REMOTE_SOURCE_URL'] or None
         print(f"[*] REMOTE_SOURCE_URL overridden by runtime_config.json: {REMOTE_SOURCE_URL}")
+    if isinstance(_rc, dict) and 'AUDIO_FROM_CHUNKS' in _rc:
+        AUDIO_FROM_CHUNKS = _norm_audio_mode(_rc['AUDIO_FROM_CHUNKS'])
+        print(f"[*] AUDIO_FROM_CHUNKS set by runtime_config.json: {AUDIO_FROM_CHUNKS}")
 except FileNotFoundError:
     pass
 except Exception as _e:
@@ -1007,6 +1050,7 @@ def _probe_media(src, timeout=60):
         # so the worker can be handed this layout and skip its own (slow, over
         # HTTP) probe. This MUST mirror the worker's selection logic verbatim.
         audio_index = None; audio_channels = 2; subtitle_indices = []
+        audio_codec = None; subtitle_codecs = []
         audio_streams = [s for s in streams if s.get('codec_type') == 'audio']
         if audio_streams:
             audio_index = audio_streams[0].get('index')
@@ -1017,11 +1061,13 @@ def _probe_media(src, timeout=60):
                 if s.get('index') == audio_index:
                     try: audio_channels = int(s.get('channels', 2))
                     except (TypeError, ValueError): audio_channels = 2
+                    audio_codec = str(s.get('codec_name') or '').lower() or None
                     break
         for s in streams:
             if (s.get('codec_type') == 'subtitle'
                     and s.get('codec_name', '').lower() in sub_codecs):
                 subtitle_indices.append(s.get('index'))
+                subtitle_codecs.append(s.get('codec_name', '').lower())
         audio_start = None
         first_audio = next((s for s in streams if s.get('codec_type') == 'audio'), None)
         if first_audio is not None:
@@ -1052,6 +1098,7 @@ def _probe_media(src, timeout=60):
             "format_start": format_start, "audio_start": audio_start,
             "audio_index": audio_index, "audio_channels": audio_channels,
             "subtitle_indices": subtitle_indices,
+            "audio_codec": audio_codec, "subtitle_codecs": subtitle_codecs,
         }
     except Exception:
         return None
@@ -1074,6 +1121,12 @@ def _stream_meta_json(probe):
             # falls back to 1/time_base (1000 fps on MKV) and refuses to start
             # ("The maximum allowed frame rate is 240 fps").
             "fps": probe.get("fps_rational"),
+            # For building the audio track from chunk slices (see
+            # AUDIO_FROM_CHUNKS): the container start time anchors the
+            # track's timestamps exactly where a worker's own pass puts them.
+            "format_start": probe.get("format_start") or 0,
+            "audio_codec": probe.get("audio_codec"),
+            "subtitle_codecs": probe.get("subtitle_codecs") or [],
         })
     except (TypeError, ValueError):
         return None
@@ -1119,7 +1172,9 @@ def _pending_chunks_exist(folder_filter):
         conn = db_handler.get_connection()
         try:
             q = ("SELECT 1 FROM chunks c JOIN jobs j ON j.id = c.job_id "
-                 "WHERE c.status='pending' AND j.status='processing' AND COALESCE(j.chunked,0)=1")
+                 "WHERE c.status='pending' AND j.status='processing' AND COALESCE(j.chunked,0)=1 "
+                 # not a chunk anyone can take: the manager builds that track itself
+                 "AND NOT (c.kind='audio' AND COALESCE(j.audio_mode,'')='slices')")
             params = []
             if folder_filter:
                 q += " AND j.id LIKE ?"
@@ -1188,7 +1243,7 @@ def _restore_completed_chunks(c, job_id, ranges, has_track, now):
         # race the fresh plan.json written right after this returns.
         try:
             for name in os.listdir(cdir):
-                if re.fullmatch(r'(video_\d+|audio_track)\.mp4|plan\.json', name):
+                if re.fullmatch(r'(video_\d+|audio_track)\.mp4|plan\.json|aslice_\d+\.mka|aslice_list\.txt', name):
                     try: os.remove(os.path.join(cdir, name))
                     except OSError: pass
         except OSError:
@@ -1536,14 +1591,20 @@ def _split_claimed_job(job):
             duration, has_audio, has_subs = probe['duration'], probe['has_audio'], probe['has_subs']
             now = datetime.now()
             total = len(ranges) + (1 if (has_audio or has_subs) else 0)
+            # Where the audio track will come from (see AUDIO_FROM_CHUNKS).
+            audio_mode = None
+            if AUDIO_FROM_CHUNKS != 'off':
+                _am_ok, _am_why = _audio_slices_eligible(probe)
+                if _am_ok:
+                    audio_mode = 'slices' if AUDIO_FROM_CHUNKS == 'on' else 'verify'
             # Re-assert our claim before creating chunks: an admin reset (or a
             # whole-file worker via /get_job after such a reset) may have taken
             # the job while the probe ran. If the claim is gone, walk away.
             c.execute("UPDATE jobs SET chunked=1, chunkable=1, source_duration_sec=?, total_chunks=?, "
-                      "stream_meta=COALESCE(?, stream_meta), "
+                      "stream_meta=COALESCE(?, stream_meta), audio_mode=?, "
                       "progress=0, worker_id='(chunked)', last_updated=? "
                       "WHERE id=? AND status='processing' AND worker_id='(chunking)'",
-                      (duration, total, _stream_meta_json(probe), now, job_id))
+                      (duration, total, _stream_meta_json(probe), audio_mode, now, job_id))
             if c.rowcount != 1:
                 conn.commit()
                 log_event("WARN", "Split abandoned: job was taken by someone else during the probe.", job_id)
@@ -1562,6 +1623,16 @@ def _split_claimed_job(job):
             # Bank recovery: chunks uploaded during a previous round of this
             # job (before a requeue) are restored instead of re-encoded.
             restored = _restore_completed_chunks(c, job_id, ranges, has_track, now)
+            _restored_without_slices = False
+            if audio_mode and restored:
+                # Chunks kept from an earlier round only help if their audio
+                # slices were kept too.
+                c.execute("SELECT chunk_index FROM chunks WHERE job_id=? AND kind='video' AND status='completed'",
+                          (job_id,))
+                if any(not os.path.isfile(_slice_path(job_id, r[0])) for r in c.fetchall()):
+                    audio_mode = None
+                    _restored_without_slices = True
+                    c.execute("UPDATE jobs SET audio_mode=NULL WHERE id=?", (job_id,))
             all_done = False
             if restored:
                 _update_job_chunk_progress(conn, job_id)
@@ -1571,6 +1642,9 @@ def _split_claimed_job(job):
             log_event("INFO", f"Split into {total} chunk(s) ({duration/60:.1f} min source).", job_id)
             if restored:
                 log_event("INFO", f"Restored {restored} previously-completed chunk(s) — only the rest re-encode.", job_id)
+                if _restored_without_slices:
+                    log_event("INFO", "Audio from chunk slices not used for this job (restored chunks have no audio "
+                                      "slices); a worker will encode the audio track from the source instead.", job_id)
         finally:
             conn.close()
     _save_chunk_plan(job_id, ranges, has_track)
@@ -1579,7 +1653,8 @@ def _split_claimed_job(job):
         _maybe_start_assembly(job_id)
     return True
 
-def _assign_pending_chunk(worker_id, folder_filter, max_size_mb, video_only=False, max_chunk_sec=None):
+def _assign_pending_chunk(worker_id, folder_filter, max_size_mb, video_only=False, max_chunk_sec=None,
+                          worker_version=None):
     """Hand the oldest pending chunk to a worker. Prioritizes the earliest-started
     job so the swarm finishes one video before spilling into the next.
     video_only=True (browser workers) skips the whole-file audio chunk, which
@@ -1593,7 +1668,10 @@ def _assign_pending_chunk(worker_id, folder_filter, max_size_mb, video_only=Fals
         conn.row_factory = sqlite3.Row
         try:
             params = []
-            query_parts = ["c.status='pending'", "j.status='processing'", "COALESCE(j.chunked,0)=1"]
+            query_parts = ["c.status='pending'", "j.status='processing'", "COALESCE(j.chunked,0)=1",
+                           # A 'slices' job's audio track is built by the manager
+                           # from the video chunks' audio slices, not handed out.
+                           "NOT (c.kind='audio' AND COALESCE(j.audio_mode,'')='slices')"]
             if video_only:
                 query_parts.append("c.kind='video'")
             if max_chunk_sec:
@@ -1615,11 +1693,19 @@ def _assign_pending_chunk(worker_id, folder_filter, max_size_mb, video_only=Fals
                 params.append(int(max_size_mb) * 1024 * 1024)
             sql = ("SELECT c.rowid AS chunk_rowid, c.job_id, c.kind, c.chunk_index, c.start_sec, c.duration_sec, "
                    "j.filename, j.file_size, j.source_type, j.source_url, j.content_profile, "
-                   "j.source_duration_sec, j.total_chunks, j.stream_meta "
+                   "j.source_duration_sec, j.total_chunks, j.stream_meta, j.audio_mode "
                    "FROM chunks c JOIN jobs j ON j.id = c.job_id "
                    f"WHERE {' AND '.join(query_parts)} "
-                   "ORDER BY j.started_at ASC, CASE WHEN c.kind='audio' THEN 0 ELSE 1 END, c.chunk_index ASC "
+                   # A worker that cannot save audio slices (older version,
+                   # browser) is steered to jobs that do not need them, and
+                   # only takes a chunk of one that does when nothing else is
+                   # pending - one such chunk sends that whole job back to
+                   # the separate audio pass.
+                   "ORDER BY CASE WHEN ? = 0 AND j.audio_mode IS NOT NULL THEN 1 ELSE 0 END, "
+                   "j.started_at ASC, CASE WHEN c.kind='audio' THEN 0 ELSE 1 END, c.chunk_index ASC "
                    "LIMIT 1")
+            _can_slice = (not video_only) and is_version_sufficient(worker_version, AUDIO_SLICE_MIN_WORKER)
+            params.append(1 if _can_slice else 0)
             c = conn.cursor()
             c.execute(sql, tuple(params))
             row = c.fetchone()
@@ -1631,6 +1717,8 @@ def _assign_pending_chunk(worker_id, folder_filter, max_size_mb, video_only=Fals
             # the frame rate (they pin the encoder time base with it) — drop
             # the rest to keep the payload small.
             _sm = chunk.pop('stream_meta', None)
+            _audio_mode = chunk.pop('audio_mode', None)
+            _sm_parsed = None
             if _sm:
                 try:
                     _sm_parsed = json.loads(_sm)
@@ -1639,6 +1727,24 @@ def _assign_pending_chunk(worker_id, folder_filter, max_size_mb, video_only=Fals
                     elif _sm_parsed.get('fps'):
                         chunk['fps'] = _sm_parsed['fps']
                 except (TypeError, ValueError): pass
+            _drop_audio_mode = None
+            if _audio_mode and chunk['kind'] == 'video':
+                # Ask this worker to save the source audio for its slice
+                # alongside the chunk. A worker that cannot (older version,
+                # browser) means the job's audio has to come from the separate
+                # pass after all - decided now, so that pass can start at once.
+                if (_can_slice and isinstance(_sm_parsed, dict)
+                        and _sm_parsed.get('audio_index') is not None):
+                    chunk['audio_slice'] = {
+                        "audio_index": _sm_parsed.get('audio_index'),
+                        "subtitle_indices": _sm_parsed.get('subtitle_indices') or [],
+                        "max_bytes": AUDIO_SLICE_MAX_BYTES,
+                    }
+                else:
+                    _drop_audio_mode = (f"{worker_id} "
+                                        + ("is a browser worker" if video_only else
+                                           f"runs worker {worker_version or '?'}, needs {AUDIO_SLICE_MIN_WORKER}"))
+                    c.execute("UPDATE jobs SET audio_mode=NULL WHERE id=?", (chunk['job_id'],))
             # The final video chunk encodes to EOF instead of using -t.
             # Computed as a separate single-row query so the assignment scan
             # doesn't pay a correlated subquery per candidate row.
@@ -1652,6 +1758,10 @@ def _assign_pending_chunk(worker_id, folder_filter, max_size_mb, video_only=Fals
                       "WHERE rowid=?", (worker_id, now, chunk.pop('chunk_rowid')))
             c.execute("UPDATE jobs SET last_updated=? WHERE id=?", (now, chunk['job_id']))
             conn.commit()
+            if _drop_audio_mode:
+                threading.Thread(target=log_event, daemon=True, args=(
+                    "INFO", f"Audio from chunk slices not used for this job ({_drop_audio_mode}); "
+                            "a worker will encode the audio track from the source instead.", chunk['job_id'])).start()
             chunk['download_url'] = build_download_url(chunk['job_id'], chunk['source_type'], chunk.pop('source_url'))
             # Browser workers can't range-stream a multi-GB source, so they fetch
             # a small pre-cut segment for this chunk instead (see /download_segment).
@@ -1751,6 +1861,540 @@ def _verify_chunk(filepath, kind, expected_dur, is_last):
     except Exception as e:
         return False, str(e)
 
+# ==============================================================================
+# AUDIO TRACK FROM CHUNK SLICES  (AUDIO_FROM_CHUNKS)
+# ==============================================================================
+# A chunked job used to read its source twice: the video chunks cover the file
+# once between them, and a separate audio pass downloads all of it again,
+# because audio is interleaved through the whole file. When the source host's
+# upload is what limits the farm, half of that traffic bought nothing.
+#
+# Instead, each video-chunk worker also writes the source's audio and text
+# subtitle packets for its time range to a small side file - a stream COPY,
+# untouched, of bytes it is already downloading - and sends it along with its
+# chunk. Slices overlap by a second. Here they are rejoined into the complete
+# original packet stream and encoded once, with the same settings a worker
+# uses, so the result is what the separate pass would have produced.
+#
+# Nothing is taken on trust. At every join the overlap is compared packet by
+# packet (content hash and timestamp), the joined stream is read back and
+# compared with what the slices say it must contain, and the finished track
+# goes through the same verifier as a worker's upload. Any doubt, at any step,
+# and the job simply reverts to the separate audio pass.
+AUDIO_SLICE_MIN_WORKER = "3.10.0"
+AUDIO_SLICE_MAX_BYTES = 96 * 1024 * 1024
+# Audio codecs this has been tested with end to end. Anything else keeps the
+# separate audio pass; add a codec here only after running it through
+# 'verify' mode.
+_SLICE_AUDIO_CODECS = {'ac3', 'eac3', 'aac', 'dts', 'opus'}
+_SLICE_SUB_CODECS = {'subrip', 'ass', 'ssa'}
+# MUST mirror the worker's ENCODING_CONFIG and its choice of audio filter.
+_AUDIO_TRACK_ENC = {"codec": "libopus", "bitrate": "24k", "channels": "1", "subtitle_codec": "mov_text"}
+AUDIO_BUILD_JOBS = set()
+
+def _audio_filter_for_channels(channels):
+    """The worker's downmix filter, verbatim."""
+    if channels > 2:
+        return "pan=mono|c0=0.5*FC+0.25*FL+0.25*FR+0.1*BL+0.1*BR,aresample=async=1"
+    if channels == 2:
+        return "pan=mono|c0=0.5*c0+0.5*c1,aresample=async=1"
+    return "aresample=async=1"
+
+def _audio_slices_eligible(probe):
+    """(ok, reason): can this source's audio track be built from slices?"""
+    if not probe or probe.get('audio_index') is None:
+        return False, "no audio stream"
+    if (probe.get('audio_codec') or '') not in _SLICE_AUDIO_CODECS:
+        return False, f"audio codec {probe.get('audio_codec') or 'unknown'}"
+    for sc in probe.get('subtitle_codecs') or []:
+        if sc not in _SLICE_SUB_CODECS:
+            return False, f"subtitle codec {sc}"
+    return True, ""
+
+def _slice_path(job_id, chunk_index):
+    return os.path.join(_chunk_dir(job_id), f"aslice_{int(chunk_index)}.mka")
+
+def _read_packets(path, concat=False, timeout=600):
+    """Packets of a media file (or, concat=True, of a concat list) as
+    {stream_index: [(pts_us, dur_us, md5), ...]} in file order, plus the
+    streams' codec types. Raises on any ffprobe problem."""
+    cmd = [_audio_tool('ffprobe'), '-v', 'error']
+    if concat:
+        cmd += ['-f', 'concat', '-safe', '0']
+    cmd += ['-show_packets', '-show_data_hash', 'md5', '-show_streams',
+            '-show_entries', 'packet=stream_index,pts_time,duration_time,data_hash:stream=index,codec_type,codec_name',
+            '-of', 'json', path]
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if res.returncode != 0:
+        raise RuntimeError(f"ffprobe failed: {(res.stderr or '')[-200:].strip()}")
+    data = json.loads(res.stdout)
+    types = {int(st['index']): st.get('codec_type') for st in data.get('streams', [])}
+    out = {i: [] for i in types}
+    for pk in data.get('packets', []):
+        if 'pts_time' not in pk or 'data_hash' not in pk:
+            raise RuntimeError("packet without a timestamp or hash")
+        out.setdefault(int(pk['stream_index']), []).append(
+            (int(round(float(pk['pts_time']) * 1e6)),
+             int(round(float(pk.get('duration_time') or 0) * 1e6)),
+             pk['data_hash']))
+    return types, out
+
+class _SliceProblem(Exception):
+    """The slices cannot be trusted; the job falls back to the separate pass."""
+
+_SLICE_TS_TOL_US = 1500     # Matroska stores milliseconds
+
+def _plan_slice_join(slice_files, ranges):
+    """Work out where each slice hands over to the next, proving at every
+    boundary that nothing is missing or doubled. Returns (cuts_us, expected)
+    where expected is {stream: [(pts_us, md5), ...]} for the joined result."""
+    n = len(slice_files)
+    parsed = []
+    for i, path in enumerate(slice_files):
+        if not path or not os.path.isfile(path):
+            raise _SliceProblem(f"slice {i} is missing")
+        try:
+            types, pk = _read_packets(path)
+        except Exception as e:
+            raise _SliceProblem(f"slice {i} unreadable ({e})")
+        if types.get(0) != 'audio' or any(t != 'subtitle' for k, t in types.items() if k != 0):
+            raise _SliceProblem(f"slice {i} has an unexpected stream layout")
+        if i and sorted(types) != sorted(parsed[0][0]):
+            raise _SliceProblem(f"slice {i} has a different number of streams")
+        if not pk.get(0):
+            raise _SliceProblem(f"slice {i} has no audio packets")
+        parsed.append((types, pk))
+    aud = [pk[0] for _, pk in parsed]
+    for i in range(n):
+        # Each slice must begin where its chunk does. A slice sent for the
+        # wrong chunk, or cut with different timing, fails here.
+        start_us = int(round(ranges[i][0] * 1e6))
+        first = aud[i][0][0]
+        lo = -500000 if i == 0 else start_us - 100000
+        if not (lo <= first <= start_us + 500000):
+            raise _SliceProblem(f"slice {i} starts at {first/1e6:.3f}s, chunk at {start_us/1e6:.3f}s")
+        if any(b[0] <= a[0] for a, b in zip(aud[i], aud[i][1:])):
+            raise _SliceProblem(f"slice {i} has out-of-order audio timestamps")
+    cuts = []; keep = []
+    for i in range(n - 1):
+        a, b = aud[i], aud[i + 1]
+        f_pts = b[0][0]
+        k = None
+        for j in range(len(a) - 1, -1, -1):
+            if a[j][0] < f_pts - _SLICE_TS_TOL_US:
+                break
+            if abs(a[j][0] - f_pts) <= _SLICE_TS_TOL_US:
+                k = j; break
+        if k is None or k == 0:
+            raise _SliceProblem(f"slice {i} does not reach the start of slice {i + 1}")
+        tail = a[k:]
+        if len(tail) < 3 or len(b) < len(tail):
+            raise _SliceProblem(f"overlap between slices {i} and {i + 1} is too short to check")
+        for x, y in zip(tail, b):
+            if x[2] != y[2] or abs(x[0] - y[0]) > _SLICE_TS_TOL_US:
+                raise _SliceProblem(f"slices {i} and {i + 1} disagree where they overlap")
+        keep.append(k)
+        cuts.append((a[k - 1][0] + f_pts) // 2)
+    keep.append(len(aud[-1]))
+    expected = {0: []}
+    for i in range(n):
+        expected[0].extend((p[0], p[2]) for p in aud[i][:keep[i]])
+    for st in sorted(parsed[0][0]):
+        if st == 0:
+            continue
+        expected[st] = []
+        for i in range(n):
+            lo = cuts[i - 1] if i > 0 else None
+            hi = cuts[i] if i < n - 1 else None
+            for p in parsed[i][1].get(st, []):
+                if (lo is None or p[0] >= lo) and (hi is None or p[0] < hi):
+                    expected[st].append((p[0], p[2]))
+    return cuts, expected
+
+def _build_audio_from_slices(job_id, ranges, stream_meta, src_duration, out_path):
+    """Rejoin a job's audio slices and encode the audio/subtitle track.
+    Returns (True, summary) or (False, reason). reason 'interrupted' means the
+    encoder was killed (manager stopping), not that the slices are bad."""
+    cdir = _chunk_dir(job_id)
+    files = [_slice_path(job_id, i) for i in range(len(ranges))]
+    list_path = os.path.join(cdir, "aslice_list.txt")
+    try:
+        cuts, expected = _plan_slice_join(files, ranges)
+        fmt_start = float(stream_meta.get('format_start') or 0)
+        if src_duration and expected[0]:
+            # The last slice has no following slice to prove it complete.
+            end_s = expected[0][-1][0] / 1e6
+            if end_s < fmt_start + float(src_duration) - 3.0:
+                raise _SliceProblem(f"audio ends at {end_s:.1f}s of {float(src_duration):.1f}s")
+        with open(list_path, 'w', encoding='utf-8') as f:
+            for i, path in enumerate(files):
+                # Paths are manager-generated (safe charset), no escaping needed
+                f.write(f"file '{os.path.abspath(path).replace(os.sep, '/')}'\n")
+                if i > 0:
+                    f.write(f"inpoint {cuts[i - 1] / 1e6:.6f}\n")
+                if i < len(files) - 1:
+                    f.write(f"outpoint {cuts[i] / 1e6:.6f}\n")
+        # Read the join back: it must be exactly the packets worked out above,
+        # in order, all shifted by one constant (ffmpeg versions differ in
+        # where they anchor a concat list's clock; a constant is corrected for
+        # below, anything else is a broken join).
+        try:
+            _, joined = _read_packets(list_path, concat=True, timeout=1800)
+        except Exception as e:
+            raise _SliceProblem(f"joined stream unreadable ({e})")
+        shift = None
+        for st, exp in expected.items():
+            got = joined.get(st, [])
+            if len(got) != len(exp):
+                raise _SliceProblem(f"join has {len(got)} packets in stream {st}, expected {len(exp)}")
+            for g, e in zip(got, exp):
+                if g[2] != e[1]:
+                    raise _SliceProblem(f"join differs from the slices in stream {st}")
+                if shift is None:
+                    shift = g[0] - e[0]
+                elif abs((g[0] - e[0]) - shift) > 1000:
+                    raise _SliceProblem(f"join has inconsistent timing in stream {st}")
+        shift = shift or 0
+    except _SliceProblem as e:
+        return False, str(e)
+
+    # Encode exactly as a worker's audio pass does. -copyts with an explicit
+    # offset puts every timestamp where that pass would: source time minus
+    # the container's start time.
+    channels = int(stream_meta.get('audio_channels') or 2)
+    n_subs = len(expected) - 1
+    cmd = [_audio_tool('ffmpeg'), '-y', '-copyts', '-itsoffset', f"{-(shift / 1e6) - fmt_start:.6f}",
+           '-f', 'concat', '-safe', '0', '-i', list_path, '-vn',
+           '-map', '0:0', '-c:a', _AUDIO_TRACK_ENC["codec"], '-b:a', _AUDIO_TRACK_ENC["bitrate"],
+           '-ac', _AUDIO_TRACK_ENC["channels"], '-af', _audio_filter_for_channels(channels)]
+    for st in sorted(k for k in expected if k != 0):
+        cmd += ['-map', f'0:{st}']
+    if n_subs:
+        cmd += ['-c:s', _AUDIO_TRACK_ENC["subtitle_codec"]]
+    cmd += ['-movflags', 'frag_keyframe+empty_moov+default_base_moof', out_path]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+    except subprocess.TimeoutExpired:
+        return False, "audio encode timed out"
+    if res.returncode != 0 or not os.path.exists(out_path):
+        err_tail = (res.stderr or '')[-300:].strip()
+        if res.returncode == 255 or res.returncode < 0 or 'received signal' in err_tail:
+            return False, "interrupted"
+        return False, f"audio encode failed (rc={res.returncode}): {err_tail}"
+    ok, reason = _verify_chunk(out_path, 'audio', float(src_duration or 0), False)
+    if not ok:
+        return False, f"built track failed verification: {reason}"
+    return True, f"{len(files)} slices, {len(expected[0])} audio packets, {sum(len(v) for k, v in expected.items() if k)} subtitle events"
+
+# Two encodes of the same audio by different libopus builds differ by codec
+# noise: measured between -11 and -34 dB relative to the signal at 24 kb/s.
+# Tracks that are misaligned by even one packet differ by about +1 dB (they
+# are effectively unrelated signals). -6 dB separates the two cleanly.
+_AUDIO_MATCH_DB = -6.0
+
+def _decode_mono(path, rate, start=None, seconds=None):
+    """The audio track as mono 16-bit samples at `rate` Hz. With start/seconds
+    only that stretch is returned - cut AFTER decoding from the beginning, so
+    it is sample-exact (seeking inside a fragmented MP4 is not)."""
+    import array
+    cmd = ['ffmpeg', '-v', 'error', '-i', path, '-map', '0:a:0', '-ac', '1', '-ar', str(rate)]
+    if start is not None:
+        cmd += ['-af', f"atrim=start_sample={int(round(start * rate))}:end_sample={int(round((start + seconds) * rate))}"]
+    cmd += ['-f', 's16le', '-']
+    res = subprocess.run(cmd, capture_output=True, timeout=1800)
+    buf = array.array('h')
+    buf.frombytes(res.stdout[:len(res.stdout) // 2 * 2])
+    return buf
+
+def _best_lag(ref, test, centre, span):
+    """Lag (in samples) within centre +/- span at which `test`, read from
+    offset lag, best matches `ref`. Returns (lag, correlation); lag > 0 means
+    test is later. `test` must extend far enough either side."""
+    w = len(ref)
+    e_ref = sum(map(int.__mul__, ref, ref)) or 1
+    best = (centre, -2.0)
+    for lag in range(centre - span, centre + span + 1):
+        if lag < 0 or lag + w > len(test):
+            continue
+        seg = test[lag: lag + w]
+        c = sum(map(int.__mul__, ref, seg)) / (e_ref * (sum(map(int.__mul__, seg, seg)) or 1)) ** 0.5
+        if c > best[1]:
+            best = (lag, c)
+    return best
+
+def _estimate_audio_lag(ref_path, test_path):
+    """By how much does test_path's audio trail ref_path's? Seconds, or None
+    when the tracks could not be matched up at all. A coarse search at 4 kHz
+    over +/-50 ms on the loudest two seconds, then refined to the sample at
+    48 kHz."""
+    try:
+        R = 4000
+        ref = _decode_mono(ref_path, R); test = _decode_mono(test_path, R)
+        n = min(len(ref), len(test))
+        if n < R * 12:
+            return None
+        W = 2 * R; PAD = R // 4
+        loud = None
+        for start in range(R * 4, n - W - PAD - 1, R * 20):
+            e = sum(map(int.__mul__, ref[start:start + W], ref[start:start + W]))
+            if loud is None or e > loud[1]:
+                loud = (start, e)
+        if loud is None or loud[1] == 0:
+            return None
+        start = loud[0]
+        coarse = _best_lag(ref[start:start + W], test[start - PAD: start + W + PAD], PAD, 200)
+        if coarse[1] < 0.5:
+            return None
+        coarse_lag = coarse[0] - PAD                    # in 4 kHz samples
+        t0 = start / R + 0.5
+        ref48 = _decode_mono(ref_path, 48000, t0, 0.25)
+        pad48 = 4800
+        test48 = _decode_mono(test_path, 48000, t0 - pad48 / 48000.0, 0.25 + 2 * pad48 / 48000.0)
+        if len(ref48) < 6000 or len(test48) < len(ref48) + pad48:
+            return None
+        fine = _best_lag(ref48, test48, pad48 + coarse_lag * 12, 16)
+        return (fine[0] - pad48) / 48000.0
+    except Exception:
+        return None
+
+def _compare_audio_tracks(ref_path, test_path):
+    """How close are two encodes of the same audio? Returns (match, detail).
+    Different libopus builds give different bytes for the same input, so this
+    measures the decoded difference: aligned tracks differ only by codec
+    noise, tracks even one packet apart differ by about as much as the signal
+    itself. A small CONSTANT offset between the two (FFmpeg versions differ by
+    a few milliseconds in how they time audio that carries an encoder delay)
+    is measured, allowed for, and reported as such - but a track that loses
+    its alignment part-way through is a mismatch."""
+    details = []
+    try:
+        d_ref = _probe_duration_robust(ref_path); d_test = _probe_duration_robust(test_path)
+        if d_ref is None or d_test is None:
+            return False, "could not read the track lengths"
+        if abs(d_test - d_ref) > 0.25:
+            return False, f"length {d_test:.3f}s vs {d_ref:.3f}s"
+        lag = _estimate_audio_lag(ref_path, test_path)
+        if lag is None:
+            return False, "the two tracks could not be matched up"
+        if abs(lag) < 1.5 / 48000:
+            lag = 0.0
+        fmt = "aresample=48000,aformat=sample_fmts=flt:channel_layouts=mono"
+
+        def _difference(trim_ref, trim_test, head_sec=None):
+            # start_sample, not start: a decoded Opus track's first timestamp
+            # is not zero, so a time-based trim of a few ms removes nothing.
+            pre_r = f"atrim=start_sample={int(round(trim_ref * 48000))},asetpts=PTS-STARTPTS," if trim_ref > 0 else ""
+            pre_t = f"atrim=start_sample={int(round(trim_test * 48000))},asetpts=PTS-STARTPTS," if trim_test > 0 else ""
+            if head_sec:
+                pre_r += f"atrim=end_sample={int(head_sec * 48000)},"
+                pre_t += f"atrim=end_sample={int(head_sec * 48000)},"
+            graph = (f"[0:a:0]{fmt},{pre_r}asplit[r][r2];[1:a:0]{fmt},{pre_t}volume=-1[n];"
+                     "[r][n]amix=inputs=2:normalize=0:duration=shortest,"
+                     "astats=measure_perchannel=none:measure_overall=RMS_level[d];"
+                     "[r2]astats=measure_perchannel=none:measure_overall=RMS_level[s]")
+            res = subprocess.run(['ffmpeg', '-hide_banner', '-nostats', '-i', ref_path, '-i', test_path,
+                                  '-filter_complex', graph, '-map', '[d]', '-f', 'null', '-',
+                                  '-map', '[s]', '-f', 'null', '-'],
+                                 capture_output=True, text=True, timeout=1800)
+            levels = {}
+            for m in re.finditer(r'Parsed_astats_(\d+).*RMS level dB:\s*(-?inf|-?[0-9.]+)', res.stderr or ''):
+                levels[int(m.group(1))] = float('-inf') if 'inf' in m.group(2) else float(m.group(2))
+            if res.returncode != 0 or len(levels) != 2:
+                return None
+            diff_db, sig_db = (levels[k] for k in sorted(levels))
+            return float('-inf') if diff_db == float('-inf') else diff_db - sig_db
+
+        # The whole track, and its opening minute on its own: a track that
+        # lost a packet part-way through lines up on one side of the loss
+        # only, so it cannot pass both.
+        rel = _difference(max(0.0, -lag), max(0.0, lag))
+        head = _difference(max(0.0, -lag), max(0.0, lag), head_sec=60)
+        if rel is None or head is None:
+            return False, "could not measure the difference"
+        offset_ms = lag * 1000.0
+        ok = rel <= _AUDIO_MATCH_DB and head <= _AUDIO_MATCH_DB and abs(lag) <= 0.050
+        rel = max(rel, head)
+        details.append("audio " + ("identical" if rel == float('-inf') else f"differs by {rel:.1f} dB relative to the signal"))
+        if offset_ms:
+            details.append(f"with a constant {offset_ms:+.1f} ms offset "
+                           "(expected, at about 5 to 45 ms, when this server's FFmpeg is older than "
+                           "the worker's: they time audio encoder delay differently; see "
+                           "AUDIO_FROM_CHUNKS_FFMPEG_DIR)")
+
+        # Subtitles: same lines, in the same order, with the same timing
+        # (give or take that same constant offset).
+        def _subs(path):
+            tracks = []
+            for idx in range(8):
+                r = subprocess.run(['ffmpeg', '-v', 'error', '-i', path, '-map', f'0:s:{idx}', '-f', 'srt', '-'],
+                                   capture_output=True, text=True, timeout=300)
+                if r.returncode != 0:
+                    break
+                cues = []
+                for blk in re.split(r'\n\s*\n', r.stdout.strip()):
+                    m = re.search(r'(\d+):(\d+):(\d+)[,.](\d+)\s*-->\s*(\d+):(\d+):(\d+)[,.](\d+)\s*\n?(.*)', blk, re.S)
+                    if m:
+                        g = [int(x) for x in m.groups()[:8]]
+                        cues.append((g[0] * 3600 + g[1] * 60 + g[2] + g[3] / 1000.0,
+                                     g[4] * 3600 + g[5] * 60 + g[6] + g[7] / 1000.0, m.group(9).strip()))
+                tracks.append(cues)
+            return tracks
+        s_ref, s_test = _subs(ref_path), _subs(test_path)
+        tol = abs(offset_ms) / 1000.0 + 0.002
+        subs_ok = len(s_ref) == len(s_test) and all(
+            len(a) == len(b) and all(x[2] == y[2] and abs(x[0] - y[0]) <= tol and abs(x[1] - y[1]) <= tol
+                                     for x, y in zip(a, b))
+            for a, b in zip(s_ref, s_test))
+        if subs_ok:
+            details.append(f"subtitles the same ({len(s_ref)} track(s), {sum(len(t) for t in s_ref)} lines)")
+        else:
+            ok = False
+            details.append("subtitles DIFFER")
+    except Exception as e:
+        return False, f"comparison error: {e}"
+    return ok, "; ".join(details)
+
+def _set_job_audio_classic(job_id, why, level="INFO"):
+    """Give the job's audio track back to the separate whole-source pass."""
+    changed = False
+    with db_lock:
+        conn = db_handler.get_connection()
+        try:
+            c = conn.cursor()
+            c.execute("UPDATE jobs SET audio_mode=NULL WHERE id=? AND audio_mode IS NOT NULL", (job_id,))
+            changed = (c.rowcount == 1)
+            conn.commit()
+        finally:
+            conn.close()
+    if changed:
+        log_event(level, f"Audio from chunk slices not used for this job ({why}); "
+                         "a worker will encode the audio track from the source instead.", job_id)
+
+def _maybe_start_audio_build(job_id):
+    """Spawn the audio-track build once every video chunk (and so every
+    slice) of a 'slices' job is in."""
+    with ASSEMBLY_LOCK:
+        if job_id in AUDIO_BUILD_JOBS:
+            return
+        AUDIO_BUILD_JOBS.add(job_id)
+    threading.Thread(target=_audio_build_job, args=(job_id,), daemon=True).start()
+
+def _audio_build_job(job_id):
+    try:
+        with db_lock:
+            conn = db_handler.get_connection()
+            conn.row_factory = sqlite3.Row
+            try:
+                c = conn.cursor()
+                c.execute("SELECT status, source_duration_sec, stream_meta, audio_mode FROM jobs "
+                          "WHERE id=? AND COALESCE(chunked,0)=1", (job_id,))
+                jrow = c.fetchone()
+                c.execute("SELECT kind, chunk_index, start_sec, duration_sec, status FROM chunks "
+                          "WHERE job_id=? ORDER BY chunk_index ASC", (job_id,))
+                rows = [dict(r) for r in c.fetchall()]
+            finally:
+                conn.close()
+        if jrow is None or jrow['status'] != 'processing' or jrow['audio_mode'] != 'slices':
+            return
+        video = [r for r in rows if r['kind'] == 'video']
+        audio = next((r for r in rows if r['kind'] == 'audio'), None)
+        if audio is None or audio['status'] != 'pending' or not video \
+                or any(r['status'] != 'completed' for r in video):
+            return
+        try:
+            meta = json.loads(jrow['stream_meta'] or '{}')
+        except (TypeError, ValueError):
+            meta = {}
+        ranges = [(float(r['start_sec'] or 0), float(r['duration_sec'] or 0)) for r in video]
+        cdir = _chunk_dir(job_id)
+        out_tmp = os.path.join(cdir, "audio_track.building.mp4")
+        ok, detail = _build_audio_from_slices(job_id, ranges, meta, jrow['source_duration_sec'], out_tmp)
+        if not ok:
+            try:
+                if os.path.exists(out_tmp): os.remove(out_tmp)
+            except OSError: pass
+            if detail == 'interrupted':
+                return      # the maintenance loop tries again
+            _set_job_audio_classic(job_id, detail, level="WARN")
+            return
+        final_path = os.path.join(cdir, "audio_track.mp4")
+        os.replace(out_tmp, final_path)
+        all_done = False
+        with db_lock:
+            conn = db_handler.get_connection()
+            try:
+                c = conn.cursor()
+                c.execute("UPDATE chunks SET status='completed', progress=100, worker_id='(from chunks)', "
+                          "uploaded_path=?, last_updated=? WHERE job_id=? AND kind='audio' AND status='pending'",
+                          (final_path, datetime.now(), job_id))
+                _update_job_chunk_progress(conn, job_id)
+                c.execute("SELECT COUNT(*) FROM chunks WHERE job_id=? AND status != 'completed'", (job_id,))
+                all_done = (c.fetchone()[0] == 0)
+                conn.commit()
+            finally:
+                conn.close()
+        log_event("INFO", f"Audio track built from chunk slices ({detail}); every join verified.", job_id)
+        if all_done:
+            _maybe_start_assembly(job_id)
+    except Exception as e:
+        _set_job_audio_classic(job_id, f"build error: {e}", level="WARN")
+    finally:
+        with ASSEMBLY_LOCK:
+            AUDIO_BUILD_JOBS.discard(job_id)
+
+def _audio_verify_mode_check(job_id, ranges, stream_meta, src_duration, worker_audio_path):
+    """'verify' mode: build the track from slices too and report how it
+    compares with the one a worker encoded from the source. Never affects the
+    job."""
+    cdir = _chunk_dir(job_id)
+    out_tmp = os.path.join(cdir, "audio_track.check.mp4")
+    try:
+        ok, detail = _build_audio_from_slices(job_id, ranges, stream_meta, src_duration, out_tmp)
+        if not ok:
+            if detail != 'interrupted':
+                log_event("WARN", f"Audio-from-chunks check: could not build the track ({detail}).", job_id)
+            return
+        match, cmp_detail = _compare_audio_tracks(worker_audio_path, out_tmp)
+        log_event("INFO" if match else "WARN",
+                  f"Audio-from-chunks check: {'MATCH' if match else 'MISMATCH'} ({cmp_detail}; {detail}).", job_id)
+    except Exception as e:
+        log_event("WARN", f"Audio-from-chunks check failed to run: {e}", job_id)
+    finally:
+        try:
+            if os.path.exists(out_tmp): os.remove(out_tmp)
+        except OSError: pass
+
+def _subtitle_durations_ok(path):
+    """True/False: do the text-subtitle lines in this file have a length?
+    None when the file has no subtitle lines (or cannot be read)."""
+    try:
+        res = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 's',
+                              '-show_entries', 'packet=duration_time,size', '-of', 'csv=p=0', path],
+                             capture_output=True, text=True, timeout=300)
+        if res.returncode != 0:
+            return None
+        lines = 0; timed = 0
+        for row in (res.stdout or '').splitlines():
+            parts = row.strip().split(',')
+            if len(parts) < 2:
+                continue
+            try:
+                size = int(parts[1])
+            except ValueError:
+                continue
+            if size <= 2:
+                continue        # mov_text end-of-line marker, not a line
+            lines += 1
+            try:
+                if float(parts[0]) > 0: timed += 1
+            except ValueError:
+                pass            # "N/A"
+        if lines == 0:
+            return None
+        return timed * 2 >= lines
+    except Exception:
+        return None
+
 def _maybe_start_assembly(job_id):
     """Spawn an assembly thread if all chunks of the job are completed."""
     with ASSEMBLY_LOCK:
@@ -1780,11 +2424,11 @@ def _assemble_job(job_id):
             conn.row_factory = sqlite3.Row
             try:
                 c = conn.cursor()
-                c.execute("SELECT status, source_duration_sec, total_chunks, stream_meta FROM jobs WHERE id=? AND COALESCE(chunked,0)=1", (job_id,))
+                c.execute("SELECT status, source_duration_sec, total_chunks, stream_meta, audio_mode FROM jobs WHERE id=? AND COALESCE(chunked,0)=1", (job_id,))
                 jrow = c.fetchone()
                 if jrow is None or jrow['status'] != 'processing':
                     return
-                c.execute("SELECT kind, chunk_index, duration_sec, uploaded_path, worker_id FROM chunks "
+                c.execute("SELECT kind, chunk_index, start_sec, duration_sec, uploaded_path, worker_id FROM chunks "
                           "WHERE job_id=? ORDER BY chunk_index ASC", (job_id,))
                 rows = [dict(r) for r in c.fetchall()]
                 c.execute("SELECT COUNT(*) FROM chunks WHERE job_id=? AND status != 'completed'", (job_id,))
@@ -1803,6 +2447,15 @@ def _assemble_job(job_id):
         if audio_chunk and (not audio_chunk['uploaded_path'] or not os.path.exists(audio_chunk['uploaded_path'])):
             raise RuntimeError("chunk file missing: audio")
 
+        if jrow['audio_mode'] == 'verify' and audio_chunk and audio_chunk['worker_id'] != '(from chunks)':
+            try:
+                _vm_meta = json.loads(jrow['stream_meta'] or '{}')
+            except (TypeError, ValueError):
+                _vm_meta = {}
+            _audio_verify_mode_check(
+                job_id, [(float(r['start_sec'] or 0), float(r['duration_sec'] or 0)) for r in video_chunks],
+                _vm_meta, jrow['source_duration_sec'], audio_chunk['uploaded_path'])
+
         cdir = _chunk_dir(job_id)
         list_path = os.path.join(cdir, "concat_list.txt")
         out_tmp = os.path.join(cdir, "assembled.mp4")
@@ -1817,15 +2470,32 @@ def _assemble_job(job_id):
             cmd += ['-i', audio_chunk['uploaded_path'], '-map', '0:v:0', '-map', '1:a?', '-map', '1:s?']
         else:
             cmd += ['-map', '0:v:0']
-        cmd += ['-c', 'copy', '-movflags', '+faststart', out_tmp]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-        if res.returncode != 0 or not os.path.exists(out_tmp):
-            err_tail = res.stderr[-500:] if res.stderr else ''
-            # rc 255 / negative rc / "received signal" = ffmpeg was killed,
-            # not a real mux error. Don't tear the job down for that.
-            if res.returncode == 255 or res.returncode < 0 or 'received signal' in err_tail:
-                raise _AssemblyInterrupted(f"concat killed (rc={res.returncode})")
-            raise RuntimeError(f"concat failed (rc={res.returncode}): {err_tail}")
+        def _run_concat(extra):
+            full = cmd + ['-c', 'copy'] + extra + ['-movflags', '+faststart', out_tmp]
+            res = subprocess.run(full, capture_output=True, text=True, timeout=3600)
+            if res.returncode != 0 or not os.path.exists(out_tmp):
+                err_tail = res.stderr[-500:] if res.stderr else ''
+                # rc 255 / negative rc / "received signal" = ffmpeg was killed,
+                # not a real mux error. Don't tear the job down for that.
+                if res.returncode == 255 or res.returncode < 0 or 'received signal' in err_tail:
+                    raise _AssemblyInterrupted(f"concat killed (rc={res.returncode})")
+                raise RuntimeError(f"concat failed (rc={res.returncode}): {err_tail}")
+        _run_concat([])
+        # FFmpeg 6.x reads the subtitle packets of the (fragmented) track
+        # file without their durations, and its MP4 writer then ends every
+        # line the instant it starts: the finished film has subtitles nobody
+        # can see. Newer versions copy them correctly. Check the result, and
+        # when the durations are gone, redo the join stating each packet's
+        # duration explicitly (the gap to the next packet, which is exactly
+        # what the track file encodes).
+        if audio_chunk and _subtitle_durations_ok(out_tmp) is False:
+            _run_concat(['-bsf:s', 'setts=duration=if(eq(NEXT_PTS\\,NOPTS)\\,0\\,NEXT_PTS-PTS)'])
+            if _subtitle_durations_ok(out_tmp) is False:
+                log_event("WARN", "Subtitle timing could not be preserved during assembly "
+                                  "(this server's FFmpeg drops subtitle durations when copying).", job_id)
+            else:
+                log_event("INFO", "Subtitle durations restored during assembly "
+                                  "(this server's FFmpeg drops them when copying).", job_id)
 
         _src_audio = None
         if jrow['stream_meta']:
@@ -1851,7 +2521,7 @@ def _assemble_job(job_id):
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         shutil.move(out_tmp, save_path)
 
-        workers = sorted({r['worker_id'] for r in rows if r['worker_id']})
+        workers = sorted({r['worker_id'] for r in rows if r['worker_id'] and r['worker_id'] != '(from chunks)'})
         with db_lock:
             conn = db_handler.get_connection()
             try:
@@ -2342,6 +3012,12 @@ def init_db():
         # chunks re-pended) rather than wiped; only after repeated stalls does
         # it fall back to the whole-file queue. Resets when a chunk completes.
         try: cursor.execute("ALTER TABLE jobs ADD COLUMN chunk_stall_count INTEGER DEFAULT 0")
+        except sqlite3.OperationalError: pass
+        # [ADDED] audio_mode: NULL = the audio chunk is encoded by a worker
+        # from the whole source (original behaviour); 'slices' = built by the
+        # manager from audio slices sent with the video chunks; 'verify' =
+        # both, compared. Set per job when it is split.
+        try: cursor.execute("ALTER TABLE jobs ADD COLUMN audio_mode TEXT")
         except sqlite3.OperationalError: pass
 
         # Chunk work-items for split jobs.  kind = 'video' (a time range) or
@@ -2934,7 +3610,8 @@ def get_chunk():
     try:
         folder_filter = _resolve_folder_filter(series_id)
 
-        chunk = _assign_pending_chunk(worker_id, folder_filter, max_size_mb, video_only=video_only, max_chunk_sec=max_chunk_sec)
+        chunk = _assign_pending_chunk(worker_id, folder_filter, max_size_mb, video_only=video_only,
+                                      max_chunk_sec=max_chunk_sec, worker_version=worker_version)
         if chunk is None and max_chunk_sec and _pending_chunks_exist(folder_filter):
             # Chunks ARE pending — this capped worker just can't take any of
             # them. Splitting another queued job here would convert one more
@@ -2960,7 +3637,8 @@ def get_chunk():
                 try:
                     job = _claim_job_for_split(folder_filter, max_size_mb)
                     if job is not None and _split_claimed_job(job):
-                        chunk = _assign_pending_chunk(worker_id, folder_filter, max_size_mb, video_only=video_only, max_chunk_sec=max_chunk_sec)
+                        chunk = _assign_pending_chunk(worker_id, folder_filter, max_size_mb, video_only=video_only,
+                                                      max_chunk_sec=max_chunk_sec, worker_version=worker_version)
                 finally:
                     SPLIT_LOCK.release()
             else:
@@ -3085,6 +3763,55 @@ def download_segment():
     resp.headers['X-Segment-Duration'] = f"{dur:.3f}"
     return resp
 
+@app.route('/upload_audio_slice', methods=['POST'])
+@requires_worker_auth
+def upload_audio_slice():
+    """Receive the source audio/subtitle packets a worker saved alongside one
+    video chunk (see AUDIO FROM CHUNK SLICES). Sent BEFORE the chunk itself,
+    so the slice is in place by the time the chunk is recorded. A slice is
+    only checked for basic shape here; the real verification happens when the
+    slices are joined."""
+    job_id = request.form.get('job_id')
+    worker_id = sanitize_input(request.form.get('worker_id'))
+    try:
+        chunk_index = int(request.form.get('chunk_index'))
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "chunk_index required"}), 400
+    if 'file' not in request.files or not job_id or chunk_index < 0:
+        return jsonify({"status": "error"}), 400
+    with db_lock:
+        conn = db_handler.get_connection()
+        try:
+            c = conn.cursor()
+            c.execute("SELECT c.status, j.status, j.audio_mode FROM chunks c JOIN jobs j ON j.id=c.job_id "
+                      "WHERE c.job_id=? AND c.kind='video' AND c.chunk_index=?", (job_id, chunk_index))
+            row = c.fetchone()
+        finally:
+            conn.close()
+    if row is None or row[1] != 'processing' or row[0] == 'completed' or not row[2]:
+        return jsonify({"status": "stale", "message": "Slice not wanted"}), 409
+    quarantine_dir = os.path.join("temp_uploads", "quarantine")
+    os.makedirs(quarantine_dir, exist_ok=True)
+    temp_path = os.path.join(quarantine_dir, f"{uuid.uuid4().hex}.mka")
+    request.files['file'].save(temp_path)
+    try:
+        size = os.path.getsize(temp_path)
+        res = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'stream=codec_type',
+                              '-of', 'csv=p=0', temp_path], capture_output=True, text=True, timeout=120)
+        kinds = [x.strip() for x in (res.stdout or '').split() if x.strip()]
+        good = (res.returncode == 0 and kinds[:1] == ['audio']
+                and all(k == 'subtitle' for k in kinds[1:]) and 0 < size <= AUDIO_SLICE_MAX_BYTES)
+    except Exception:
+        good = False
+    if not good:
+        try: os.remove(temp_path)
+        except OSError: pass
+        return jsonify({"status": "error", "message": "not a usable audio slice"}), 400
+    cdir = _chunk_dir(job_id)
+    os.makedirs(cdir, exist_ok=True)
+    shutil.move(temp_path, _slice_path(job_id, chunk_index))
+    return jsonify({"status": "success"})
+
 @app.route('/upload_chunk', methods=['POST'])
 @requires_worker_auth
 def upload_chunk():
@@ -3110,7 +3837,7 @@ def upload_chunk():
             c.execute("SELECT status, duration_sec FROM chunks WHERE job_id=? AND kind=? AND chunk_index=?",
                       (job_id, kind, chunk_index))
             crow = c.fetchone()
-            c.execute("SELECT status FROM jobs WHERE id=?", (job_id,))
+            c.execute("SELECT status, audio_mode FROM jobs WHERE id=?", (job_id,))
             jrow = c.fetchone()
             c.execute("SELECT COALESCE(MAX(chunk_index), -1) FROM chunks WHERE job_id=? AND kind='video'", (job_id,))
             max_video_index = c.fetchone()[0]
@@ -3141,7 +3868,14 @@ def upload_chunk():
     final_path = os.path.join(cdir, f"{kind}_{chunk_index if chunk_index >= 0 else 'track'}.mp4")
     shutil.move(temp_path, final_path)
 
+    # A video chunk of a job whose audio comes from slices must have brought
+    # its slice (uploaded just before). If not, the job goes back to the
+    # separate audio pass now rather than discovering the hole at the end.
+    if kind == 'video' and jrow['audio_mode'] and not os.path.isfile(_slice_path(job_id, chunk_index)):
+        _set_job_audio_classic(job_id, f"{worker_id} sent chunk {chunk_index} without an audio slice")
+
     all_done = False
+    build_audio = False
     with db_lock:
         conn = db_handler.get_connection()
         try:
@@ -3165,6 +3899,13 @@ def upload_chunk():
             _update_job_chunk_progress(conn, job_id)
             c.execute("SELECT COUNT(*) FROM chunks WHERE job_id=? AND status != 'completed'", (job_id,))
             all_done = (c.fetchone()[0] == 0)
+            if not all_done:
+                c.execute("SELECT COUNT(*) FROM chunks c JOIN jobs j ON j.id=c.job_id "
+                          "WHERE c.job_id=? AND c.kind='video' AND c.status != 'completed'", (job_id,))
+                _video_left = c.fetchone()[0]
+                c.execute("SELECT audio_mode FROM jobs WHERE id=?", (job_id,))
+                _am = c.fetchone()
+                build_audio = (_video_left == 0 and _am is not None and _am[0] == 'slices')
             conn.commit()
         finally:
             conn.close()
@@ -3174,6 +3915,8 @@ def upload_chunk():
     log_event("INFO", f"Chunk {kind}#{chunk_index} received from {worker_id}", job_id)
     if all_done:
         _maybe_start_assembly(job_id)
+    elif build_audio:
+        _maybe_start_audio_build(job_id)
     return jsonify({"status": "success"})
 
 @app.route('/report_chunk', methods=['POST'])
@@ -4305,28 +5048,39 @@ def api_wedge_dumps():
 @app.route('/api/get_config')
 @requires_auth
 def get_config():
-    return jsonify({"REMOTE_SOURCE_URL": REMOTE_SOURCE_URL})
+    return jsonify({"REMOTE_SOURCE_URL": REMOTE_SOURCE_URL, "AUDIO_FROM_CHUNKS": AUDIO_FROM_CHUNKS})
 
 @app.route('/api/update_config', methods=['POST'])
 @requires_auth
 def update_config():
-    global REMOTE_SOURCE_URL
+    global REMOTE_SOURCE_URL, AUDIO_FROM_CHUNKS
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return jsonify({"status": "error", "message": "JSON body required"}), 400
+    changed = []
     if 'REMOTE_SOURCE_URL' in data:
         new_url = str(data['REMOTE_SOURCE_URL'] or '').strip()
         if not new_url: new_url = None
         REMOTE_SOURCE_URL = new_url
+        changed.append(f"Remote Source URL to: {REMOTE_SOURCE_URL}")
+    if 'AUDIO_FROM_CHUNKS' in data:
+        if str(data['AUDIO_FROM_CHUNKS'] or '').strip().lower() not in ('off', 'verify', 'on'):
+            return jsonify({"status": "error", "message": "AUDIO_FROM_CHUNKS must be off, verify or on"}), 400
+        AUDIO_FROM_CHUNKS = _norm_audio_mode(data['AUDIO_FROM_CHUNKS'])
+        # Applies to jobs split from now on; jobs already split keep the
+        # mode they were given.
+        changed.append(f"Audio from chunk slices to: {AUDIO_FROM_CHUNKS}")
+    if changed:
         try:
             _tmp = _RUNTIME_CONFIG_FILE + '.tmp'
             with open(_tmp, 'w') as f:
-                json.dump({"REMOTE_SOURCE_URL": REMOTE_SOURCE_URL}, f)
+                json.dump({"REMOTE_SOURCE_URL": REMOTE_SOURCE_URL, "AUDIO_FROM_CHUNKS": AUDIO_FROM_CHUNKS}, f)
             os.replace(_tmp, _RUNTIME_CONFIG_FILE)
         except OSError as e:
-            log_event("WARN", f"Could not persist Remote Source URL: {e}")
-        log_event("WARN", f"Admin updated Remote Source URL to: {REMOTE_SOURCE_URL}")
-    return jsonify({"status": "ok", "new_value": REMOTE_SOURCE_URL})
+            log_event("WARN", f"Could not persist the runtime settings: {e}")
+        for ch in changed:
+            log_event("WARN", f"Admin updated {ch}")
+    return jsonify({"status": "ok", "new_value": REMOTE_SOURCE_URL, "AUDIO_FROM_CHUNKS": AUDIO_FROM_CHUNKS})
 
 @app.route('/api/rescan_db')
 @requires_auth
@@ -4419,6 +5173,7 @@ def maintenance_loop():
         try:
             logs_to_write = []
             assembly_candidates = []
+            audio_build_candidates = []
             with db_lock:
                 conn = db_handler.get_connection(); cursor = conn.cursor()
                 try:
@@ -4459,6 +5214,14 @@ def maintenance_loop():
                                         AND EXISTS (SELECT 1 FROM chunks c WHERE c.job_id = j.id)
                                         AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.job_id = j.id AND c.status != 'completed')""")
                     assembly_candidates = [r[0] for r in cursor.fetchall()]
+                    # 'slices' jobs whose video chunks are all in but whose
+                    # audio track has not been built yet (manager restarted
+                    # mid-build, or the last chunk was a restored one).
+                    cursor.execute("""SELECT j.id FROM jobs j
+                                      WHERE COALESCE(j.chunked, 0)=1 AND j.status='processing' AND j.audio_mode='slices'
+                                        AND EXISTS (SELECT 1 FROM chunks c WHERE c.job_id = j.id AND c.kind='audio' AND c.status='pending')
+                                        AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.job_id = j.id AND c.kind='video' AND c.status != 'completed')""")
+                    audio_build_candidates = [r[0] for r in cursor.fetchall()]
 
                     # Backstop: a chunked job with zero chunk activity for 6h.
                     # If it already has completed chunks, that's banked work —
@@ -4527,6 +5290,8 @@ def maintenance_loop():
             for level, msg, jid in logs_to_write: log_event(level, msg, jid)
             for jid in assembly_candidates:
                 _maybe_start_assembly(jid)
+            for jid in audio_build_candidates:
+                _maybe_start_audio_build(jid)
 
             # Prune quarantine (files older than 1 hour)
             sweep_quarantine()
