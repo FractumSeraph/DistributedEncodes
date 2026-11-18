@@ -138,7 +138,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.10.0"
+WORKER_VERSION = "3.11.0"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -213,7 +213,7 @@ _script_dir = os.path.dirname(os.path.abspath(__file__))
 ENCODING_CONFIG = {
     "VIDEO_CODEC": "libsvtav1",
     "VIDEO_PRESET": "2",
-    "VIDEO_CRF": "63",           
+    "VIDEO_CRF": "57",           # one value for every video (no per-profile adjustment)
     "VIDEO_PIX_FMT": "yuv420p",
     "VIDEO_SCALE": "scale=-2:480",
     "AUDIO_CODEC": "libopus",
@@ -2368,7 +2368,6 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
         total      = int(chunk.get('total_chunks', 0) or 0)
         src_dur    = float(chunk.get('source_duration_sec', 0) or 0)
         dl_url     = chunk['download_url']
-        profile    = chunk.get('content_profile', 'standard')
         filename   = chunk.get('filename', job_id)
         chunk_tag  = "audio" if kind == 'audio' else f"chunk {idx+1}"
 
@@ -2422,10 +2421,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
         gz_log_path = os.path.join(temp_dir, "chunk_encode.log.gz")
         slice_args = None; slice_path = None; slice_max_bytes = 0   # see "Audio slice" below
 
-        base_crf = int(ENCODING_CONFIG["VIDEO_CRF"])
-        target_crf = (base_crf - 6) if profile == 'live_action' else base_crf
-        if profile == 'live_action':
-            log(worker_id, f"Live Action profile detected! Allocating 2x bitrate (CRF: {target_crf})")
+        target_crf = int(ENCODING_CONFIG["VIDEO_CRF"])
         if watermark and kind == 'video':
             log(worker_id, "Watermark is skipped on chunked jobs to keep the final video consistent.", "WARN")
 
@@ -3509,15 +3505,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                     # Mono -> Mono: Passthrough
                     audio_filter = "aresample=async=1"
 
-                # [ADDED] Dynamic CRF Adjustment for Live Action Profile
-                base_crf = int(ENCODING_CONFIG["VIDEO_CRF"])
-                profile = job.get('content_profile', 'standard')
-                
-                if profile == 'live_action':
-                    target_crf = base_crf - 6
-                    log(worker_id, f"Live Action profile detected! Allocating 2x bitrate (CRF: {target_crf})")
-                else:
-                    target_crf = base_crf
+                target_crf = int(ENCODING_CONFIG["VIDEO_CRF"])
 
                 # Map the audio track ONLY when the source actually has one.
                 # audio_index defaults to 0, so an audio-less source (or a

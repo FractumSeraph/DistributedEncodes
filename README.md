@@ -322,12 +322,12 @@ All encoding is done by the worker. Settings are baked into `worker_template.py`
 |---|---|
 | Video codec | `libsvtav1` (SVT-AV1) |
 | Preset | `2` (high quality, slow) |
-| CRF | `63` standard / `57` live-action |
+| CRF | `57` (every video) |
 | Resolution | 480p (scale to width, keep aspect) |
 | Audio codec | Opus, mono, 24kbps |
 | Container | `.mp4` |
 
-The manager detects a `live_action` content profile and tells the worker to reduce CRF by 6 (allocating ~2x bitrate).
+Every video uses the same CRF. (Older workers chose 63 or 57 from a per-job content profile; the manager now marks every job so they use 57 too.)
 
 ---
 
@@ -421,7 +421,7 @@ Config: `PAYOUT_TOKEN` (shared secret for the daemon; `None` disables the token 
 
 ## Browser Worker (no install)
 
-Volunteers can encode small files directly in their browser — no Python, no FFmpeg install. The manager serves an in-browser node at **`/web`** (linked from the dashboard) that runs a purpose-built FFmpeg WebAssembly bundle with **SVT-AV1 + Opus** compiled in, using the same targets as the native worker (preset 2, CRF 63, 480p, mono Opus).
+Volunteers can encode small files directly in their browser — no Python, no FFmpeg install. The manager serves an in-browser node at **`/web`** (linked from the dashboard) that runs a purpose-built FFmpeg WebAssembly bundle with **SVT-AV1 + Opus** compiled in, using the same targets as the native worker (preset 2, CRF 57, 480p, mono Opus).
 
 - The page authenticates automatically (the worker token is injected server-side).
 - **Big files, too:** browser nodes take chunks of large videos via *server-side segmentation* — the manager stream-copies just the piece for one chunk into a small standalone file and sends that, so the browser never downloads a multi-GB source. See "Server-side segmentation" below.

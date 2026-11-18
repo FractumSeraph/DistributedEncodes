@@ -960,6 +960,11 @@ def verify_upload(filepath, source_has_audio=None):
 # CHUNKED ENCODING (split one video across many workers)
 # ==============================================================================
 
+# Every video is encoded at CRF 57. Newer workers (3.11.0+) always use 57; older
+# ones still pick it from the job's content profile (57 for 'live_action', 63
+# otherwise), so the manager hands every job and chunk out as 'live_action'.
+ENCODE_PROFILE = 'live_action'
+
 def build_download_url(job_id, source_type, source_url):
     """Build the URL a worker should stream the source from."""
     if source_type == 'remote':
@@ -1762,6 +1767,7 @@ def _assign_pending_chunk(worker_id, folder_filter, max_size_mb, video_only=Fals
                 threading.Thread(target=log_event, daemon=True, args=(
                     "INFO", f"Audio from chunk slices not used for this job ({_drop_audio_mode}); "
                             "a worker will encode the audio track from the source instead.", chunk['job_id'])).start()
+            chunk['content_profile'] = ENCODE_PROFILE   # CRF 57 on every worker version
             chunk['download_url'] = build_download_url(chunk['job_id'], chunk['source_type'], chunk.pop('source_url'))
             # Browser workers can't range-stream a multi-GB source, so they fetch
             # a small pre-cut segment for this chunk instead (see /download_segment).
@@ -2759,12 +2765,10 @@ def _scan_and_queue_inner():
                         job_id, fname, fsize, src_type = item
                         src_url = None
 
-                    # Profile Logic: Remote is ALWAYS live_action
-                    profile = 'standard'
-                    if src_type == 'remote':
-                        profile = 'live_action'
-                    elif 'live_action' in str(job_id).lower():
-                        profile = 'live_action'
+                    # Every video is encoded at CRF 57. Workers before 3.11.0
+                    # only use 57 for the 'live_action' profile, so that is
+                    # what every job carries (see ENCODE_PROFILE).
+                    profile = ENCODE_PROFILE
 
                     cursor.execute("SELECT id FROM jobs WHERE id=?", (job_id,))
                     if not cursor.fetchone():
@@ -3535,6 +3539,7 @@ def get_job():
                         if row: job = dict(row); break
                 
                 if job:
+                    job['content_profile'] = ENCODE_PROFILE   # CRF 57 on every worker version
                     job['download_url'] = build_download_url(job['id'], job['source_type'], job.get('source_url'))
                     conn.execute("UPDATE jobs SET status='processing', worker_id=?, worker_version=?, last_updated=?, started_at=? WHERE id=?",
                         (worker_id, worker_version, datetime.now(), datetime.now(), job['id']))
