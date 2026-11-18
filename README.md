@@ -355,6 +355,25 @@ By default the manager splits long videos into **chunks** of at most `CHUNK_DURA
 - Old workers keep using `/get_job` untouched. The browser worker takes video chunks too (via pre-cut segments — see below), and falls back to `/get_job` for small whole files.
 - Watermarks (`--watermark`) are skipped on chunks so the final video is consistent.
 
+### Audio from chunk slices (read each source once instead of twice)
+
+By default a chunked job reads its source **twice**: the video chunks cover the file once between them, and a separate audio pass downloads the whole file again, because audio is interleaved through it. When the source host's upload speed is what limits the farm, that second download is half the traffic.
+
+With `AUDIO_FROM_CHUNKS = 'on'` (config, or the **AUDIO FROM CHUNKS** selector on the admin page, which needs no restart):
+
+- Each video-chunk worker (worker 3.10.0+) adds a second output to the same FFmpeg run: a **stream copy** of the source's audio and text-subtitle packets for its time range, running one second past the end of its chunk. Those bytes are being downloaded anyway. The slice is uploaded just before the chunk.
+- When the last video chunk is in, the manager rejoins the slices into the complete original packet stream and encodes the audio/subtitle track itself, with the same codec, bitrate, downmix and filters a worker uses. No worker is handed the audio chunk.
+- **Nothing is taken on trust.** At every join the one-second overlap is compared packet by packet (content hash and timestamp); the joined stream is read back and compared with what the slices say it must contain; the last slice must reach the end of the source; and the finished track goes through the same verifier as a worker's upload. Any doubt, at any step, and that job simply reverts to the separate audio pass.
+- The video chunks are not affected: their encode command is unchanged apart from the extra output.
+
+A job falls back to the separate pass (logged as *"Audio from chunk slices not used for this job (reason)"*) when: one of its chunks is taken by an older or browser worker (such workers are steered to other jobs first); a slice is missing, too large (96 MB) or fails a check; the source's audio is not AC-3, E-AC-3, AAC, DTS or Opus (the codecs this was tested with), or it has text subtitles other than SRT/ASS; or the audio ends more than 3 s before the video. A worker whose encode fails with the slice output retries without it, so a slice can never be the reason a chunk fails.
+
+`AUDIO_FROM_CHUNKS = 'verify'` is for checking this against your own sources before relying on it: the separate pass still runs and supplies the final file, the slices are built as well, and the two are compared. Look for **"Audio-from-chunks check: MATCH / MISMATCH"** in the log. It saves no traffic.
+
+The built track is exactly what the manager's own FFmpeg would produce from the whole source (byte-identical in testing on FFmpeg 6.1, 8.1 and 9.0). FFmpeg versions differ slightly from each other, though: on sources whose audio carries an encoder delay, FFmpeg 6.1 places the audio a few milliseconds later (5 ms for AC-3, 23 ms for AAC) than 8.1 and 9.0 do; versions in between were not tested. If the manager's FFmpeg is older than the workers', the check reports this as a constant offset. To make the track identical to a worker's, point `AUDIO_FROM_CHUNKS_FFMPEG_DIR` at a folder containing the same `ffmpeg` and `ffprobe` build the workers use.
+
+The cost is upload from workers to the manager: each chunk brings its share of the source audio (about 17 MB per five minutes for 448 kb/s AC-3).
+
 ### Server-side segmentation (browser workers on big files)
 
 Browser workers can't range-stream a multi-GB source (32-bit WebAssembly, and the wasm has no network), so they'd otherwise be limited to small whole files. Segmentation fixes that:

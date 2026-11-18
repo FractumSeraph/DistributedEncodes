@@ -144,6 +144,22 @@
             </div>
         </div>
 
+        <div class="toolbar" style="margin-top: 10px;">
+            <div class="label">AUDIO FROM CHUNKS:</div>
+            <div class="toolbar-group" style="border-right:none;">
+                <select id="config-audio-mode" onchange="this.dataset.dirty='1'" style="max-width: 100%; background:#111; color:inherit; border:1px solid #444; padding:6px; font-family:inherit; font-size:0.8em;">
+                    <option value="off">OFF: separate audio pass (reads each source twice)</option>
+                    <option value="verify">CHECK: do both, compare, log the result</option>
+                    <option value="on">ON: build audio from the chunks (reads each source once)</option>
+                </select>
+                <button onclick="saveAudioMode()" style="border-color: var(--neon-purple); color: var(--neon-purple);">SAVE</button>
+            </div>
+            <div style="flex-basis:100%; font-size:0.75em; opacity:0.7; margin-top:4px;">
+                Applies to jobs split from now on. Needs worker 3.10.0 or newer; a job touched by an older or browser worker uses the separate pass.
+                In CHECK mode, search the log for "Audio-from-chunks check".
+            </div>
+        </div>
+
         <div class="card" style="border-color: var(--neon-red); margin-top: 20px;">
             <div class="card-header" style="border-color: var(--neon-red);">
                 <h3 style="color:var(--neon-red)">>> ERROR_REPORTS</h3>
@@ -410,7 +426,21 @@
                 if(d.REMOTE_SOURCE_URL && document.activeElement !== field) {
                     field.value = d.REMOTE_SOURCE_URL;
                 }
+                const am = document.getElementById('config-audio-mode');
+                // a choice made but not yet saved must survive the periodic refresh
+                if (am && d.AUDIO_FROM_CHUNKS && document.activeElement !== am && !am.dataset.dirty) am.value = d.AUDIO_FROM_CHUNKS;
             } catch(e) { console.error(e); }
+        }
+
+        async function saveAudioMode() {
+            const mode = document.getElementById('config-audio-mode').value;
+            const r = await fetch('/api/update_config', {
+                method:'POST', headers:{'Content-Type':'application/json'},
+                body:JSON.stringify({AUDIO_FROM_CHUNKS: mode})
+            });
+            if (r.ok) delete document.getElementById('config-audio-mode').dataset.dirty;
+            alert(r.ok ? "Audio setting saved. It applies to jobs split from now on." : "Could not save the audio setting.");
+            loadConfig();
         }
 
         async function saveConfig() {

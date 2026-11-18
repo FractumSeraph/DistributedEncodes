@@ -126,3 +126,32 @@ CHUNKED_ENCODING = True
 # any length. If you want browser volunteers to help on big videos, keep this
 # at/below their MAX CHUNK SEC (120 is a safe starting point).
 CHUNK_DURATION_SEC = 120
+
+# ==============================================================================
+# AUDIO FROM CHUNK SLICES
+# ==============================================================================
+# A chunked job normally reads its source twice: the video chunks cover the
+# file once between them, and a separate audio pass downloads the whole file
+# again. When the source host's upload speed is what limits the farm, that
+# second download is half the traffic.
+#
+#   'off'    (default) the separate audio pass, as before.
+#   'on'     each video-chunk worker (worker 3.10.0+) also saves the untouched
+#            source audio and text subtitles for its slice and sends them with
+#            its chunk; the manager rejoins the slices, checks every join, and
+#            encodes the track itself with the same settings. If anything does
+#            not check out, that job falls back to the separate pass.
+#   'verify' both, for checking 'on' against real sources: the separate pass
+#            still supplies the final file, the slices are built as well, and
+#            the comparison is written to the log ("Audio-from-chunks check").
+#
+# This can also be changed from the admin page without a restart; the admin
+# setting takes precedence over this file. It applies to jobs split afterwards.
+AUDIO_FROM_CHUNKS = 'off'
+
+# Optional: folder containing the ffmpeg and ffprobe to use for building that
+# track, e.g. the same static build the workers download. Not needed when the
+# server's own FFmpeg is version 8.1 or newer. FFmpeg 6.1 places audio that
+# carries an encoder delay a few milliseconds later than the workers do
+# (versions in between were not tested).
+AUDIO_FROM_CHUNKS_FFMPEG_DIR = None
