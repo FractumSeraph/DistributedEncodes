@@ -195,7 +195,7 @@ async function processChunk(chunk) {
     const outPath = "/tmp/cout_" + Date.now() + ".mp4";
     const progPath = "/tmp/cprog_" + Date.now() + ".txt";
     let stopProgress = () => {};
-    const crf = (chunk.content_profile === 'live_action') ? '57' : '63';
+    const crf = '57';   // every video, same as native workers
 
     postMessage({type: 'log', level: 'sys', msg: `Chunk ${chunk.chunk_index} of ${chunk.filename}: downloading segment...`});
     try {
@@ -341,8 +341,8 @@ async function processJob(job) {
         postMessage({type: 'log', level: 'sys', msg: "Starting FFmpeg..."});
         
         // STRICT ENCODING CONFIGURATION
-        // Matches the manager's verified target: SVT-AV1 preset 2 / CRF 63
-        // (57 for the live_action profile, same as native workers), 480p,
+        // Matches the manager's verified target: SVT-AV1 preset 2 / CRF 57
+        // (every video, same as native workers), 480p,
         // mono Opus 24k. Notes specific to the browser build:
         //  - This wasm has --disable-ffprobe, so we can't inspect streams. We map
         //    the first video + first (optional) audio explicitly and drop
@@ -370,7 +370,7 @@ async function processJob(job) {
                 audioFilter = ['-af', af];
             }
         }
-        const crf = (job.content_profile === 'live_action') ? '57' : '63';
+        const crf = '57';   // every video, same as native workers
         const args = [
             '-threads', '1',
             '-v', 'verbose',
