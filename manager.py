@@ -3157,9 +3157,15 @@ def init_db():
                 worker_id TEXT,
                 error_type TEXT,
                 message TEXT,
-                details TEXT
+                details TEXT,
+                diag TEXT
             )
         ''')
+        # Source-read diagnostics sent with an error report (worker 3.12.0+),
+        # plus the manager's own download test of the same file (JSON).
+        # Added after the CREATE so existing databases get the column too.
+        try: cursor.execute("ALTER TABLE error_reports ADD COLUMN diag TEXT")
+        except sqlite3.OperationalError: pass
 
         conn.commit()
         conn.close()
@@ -4213,20 +4219,188 @@ def receive_error_report():
     error_type = sanitize_input(d.get('error_type', 'unknown')) or 'unknown'
     message  = str(d.get('message', ''))[:2048]
     details  = str(d.get('details', ''))[:32768]
+    diag = d.get('diag') if isinstance(d.get('diag'), dict) else None
+    diag_json = None
+    if diag is not None:
+        try:
+            diag_json = json.dumps(diag)[:16384]
+            json.loads(diag_json)          # truncated JSON is worse than none
+        except (TypeError, ValueError):
+            diag_json = None; diag = None
 
     with db_lock:
         conn = db_handler.get_connection()
         try:
-            conn.execute(
-                "INSERT INTO error_reports (timestamp, job_id, worker_id, error_type, message, details) VALUES (?, ?, ?, ?, ?, ?)",
-                (datetime.now(), job_id, worker_id, error_type, message, details)
+            cur = conn.execute(
+                "INSERT INTO error_reports (timestamp, job_id, worker_id, error_type, message, details, diag) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (datetime.now(), job_id, worker_id, error_type, message, details, diag_json)
             )
+            report_id = cur.lastrowid
             conn.commit()
         finally:
             conn.close()
 
     log_event("ERROR", f"Error report from {worker_id} [{error_type}]: {message}", job_id)
+    if diag is not None or _is_source_read_message(message):
+        _start_manager_probe(report_id, job_id, diag)
     return jsonify({"status": "received"})
+
+
+# ------------------------------------------------------------------------------
+# SOURCE-READ DIAGNOSIS
+# A worker that cannot read the source sends (3.12.0+) where FFmpeg stopped and
+# a download test of the same file from its own machine. The manager then
+# downloads the same part of the same file itself. Comparing the two says
+# whether the source host, the worker's network, or the worker's FFmpeg is at
+# fault. Read-only: nothing here changes jobs, chunks or the outage breaker.
+# ------------------------------------------------------------------------------
+_SOURCE_READ_MARKERS = ("could not read the source", "truncated output", "source stream interrupted")
+MANAGER_PROBE_SECONDS = 6.0
+MANAGER_PROBE_MAX_BYTES = 8 * 1024 * 1024
+_MANAGER_PROBE_SEM = threading.BoundedSemaphore(2)
+_MANAGER_PROBE_RECENT = {}        # job_id -> (time, result); reused for 30 s
+_MANAGER_PROBE_LOCK = threading.Lock()
+
+def _is_source_read_message(msg):
+    low = (msg or '').lower()
+    return any(t in low for t in _SOURCE_READ_MARKERS)
+
+def _source_url_for_job(job_id):
+    """(source_type, url-or-path) for a job, or (None, None) if unknown."""
+    with read_lock():
+        conn = db_handler.get_connection()
+        try:
+            row = conn.execute("SELECT source_type, source_url FROM jobs WHERE id=?", (job_id,)).fetchone()
+        finally:
+            conn.close()
+    if not row:
+        return None, None
+    if row[0] == 'remote':
+        return 'remote', build_download_url(job_id, 'remote', row[1])
+    return 'local', os.path.join(SOURCE_DIRECTORY, job_id.replace('/', os.sep))
+
+def _manager_source_probe(job_id, offset=0):
+    """Download a little of a job's source from the manager, like a worker would."""
+    res = {"at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'), "offset": int(max(0, offset or 0))}
+    stype, src = _source_url_for_job(job_id)
+    if stype is None:
+        res["error"] = "job not found"
+        return res
+    if stype == 'local':
+        res["source"] = "local file"
+        if os.path.isfile(src):
+            res["status"] = 200; res["bytes"] = 0
+            res["note"] = "file present on the manager"
+        else:
+            res["error"] = "file missing on the manager"
+        return res
+    res["source"] = "http"
+    try:
+        from urllib.parse import urlsplit
+        res["host"] = urlsplit(src).hostname
+        t = time.time()
+        r = requests.get(src, headers={'User-Agent': 'FractumManager/1.0', 'X-Worker-Token': WORKER_SECRET,
+                                       'Range': f"bytes={res['offset']}-"},
+                         stream=True, timeout=(15, 30))
+        res["status"] = r.status_code
+        res["ttfb_ms"] = int((time.time() - t) * 1000)
+        n = 0; t2 = time.time()
+        try:
+            if r.status_code in (200, 206):
+                for blk in r.iter_content(256 * 1024):
+                    n += len(blk)
+                    if n >= MANAGER_PROBE_MAX_BYTES or time.time() - t2 >= MANAGER_PROBE_SECONDS:
+                        break
+        finally:
+            r.close()
+        el = max(time.time() - t2, 0.001)
+        res["bytes"] = n; res["secs"] = round(el, 2); res["mb_s"] = round(n / el / 1e6, 2)
+        if r.status_code not in (200, 206):
+            res["error"] = f"HTTP {r.status_code}"
+    except Exception as e:
+        res["error"] = f"{type(e).__name__}: {str(e)[:200]}"
+    return res
+
+def _start_manager_probe(report_id, job_id, diag):
+    offset = 0
+    try:
+        offset = int(((diag or {}).get('selftest') or {}).get('offset') or 0)
+    except (TypeError, ValueError):
+        pass
+
+    def _run():
+        with _MANAGER_PROBE_LOCK:
+            prev = _MANAGER_PROBE_RECENT.get(job_id)
+        if prev and time.time() - prev[0] < 30:   # same failure burst only
+            result = dict(prev[1], reused=True)
+        else:
+            if not _MANAGER_PROBE_SEM.acquire(timeout=120):
+                return
+            try:
+                result = _manager_source_probe(job_id, offset)
+            finally:
+                _MANAGER_PROBE_SEM.release()
+            with _MANAGER_PROBE_LOCK:
+                _MANAGER_PROBE_RECENT[job_id] = (time.time(), result)
+                for k in [k for k, v in _MANAGER_PROBE_RECENT.items() if time.time() - v[0] > 600]:
+                    _MANAGER_PROBE_RECENT.pop(k, None)
+        merged = dict(diag or {}); merged["manager_probe"] = result
+        with db_lock:
+            conn = db_handler.get_connection()
+            try:
+                conn.execute("UPDATE error_reports SET diag=? WHERE id=?", (json.dumps(merged)[:16384], report_id))
+                conn.commit()
+            finally:
+                conn.close()
+    threading.Thread(target=_run, daemon=True).start()
+
+def _probe_ok(p):
+    return bool(p) and not p.get('error') and p.get('status') in (200, 206)
+
+def _source_verdict(diag):
+    """(code, sentence) for one source-read failure report's diagnostics."""
+    if not diag:
+        return ("no_data", "No diagnostics: the worker is older than 3.12.0.")
+    st = diag.get('selftest'); mp = diag.get('manager_probe')
+    if not diag.get('diag_version'):
+        # An older worker: only the manager's own test is known.
+        if mp is None:
+            return ("no_data", "No diagnostics: the worker is older than 3.12.0.")
+        if _probe_ok(mp):
+            return ("no_data", f"The worker is older than 3.12.0 and sent no diagnostics; the manager read the "
+                               f"file at {mp.get('mb_s')} MB/s at the time, so the source host was up.")
+        return ("host", f"The worker is older than 3.12.0 and sent no diagnostics; the manager could not read the "
+                        f"file either ({mp.get('error')}), so the source host was likely down.")
+    tls = (diag.get('ffmpeg') or {}).get('tls', '?')
+    if diag.get('source') == 'local file':
+        return ("local", "The worker was reading a file on its own disk, so the network is not involved; "
+                         "check that disk and the file.")
+    if st is None:
+        return ("no_data", "The worker sent no download test.")
+    if mp is None:
+        mp_txt = "the manager's test is still running"
+    elif _probe_ok(mp):
+        mp_txt = f"the manager read it at {mp.get('mb_s')} MB/s"
+    else:
+        mp_txt = f"the manager's test also failed ({mp.get('error')})"
+    if not _probe_ok(st):
+        if mp is not None and not _probe_ok(mp):
+            return ("host", f"Neither the worker ({st.get('error')}) nor the manager could read the file: "
+                            "the source host was down or refusing requests at the time.")
+        return ("worker_network", f"This worker could not download the file ({st.get('error')}), but {mp_txt}: "
+                                  "the problem is on the worker's side (its network, firewall, DNS or ISP route).")
+    speed = st.get('mb_s') or 0
+    if diag.get('phase') in ('opening', 'probing'):
+        tool = "FFprobe" if diag.get('phase') == 'probing' else "FFmpeg"
+        return ("worker_ffmpeg", f"The worker's own download test worked ({speed} MB/s), yet {tool} never got past "
+                                 f"opening the file. That points at this worker's FFmpeg build (TLS: {tls}); "
+                                 "letting the worker download its standard FFmpeg build is the first thing to try.")
+    if speed < 0.5:
+        return ("slow", f"The worker can download the file, but only at {speed} MB/s ({mp_txt}); "
+                        "the encode ran out of data. A slow or congested link on the worker's side is likely.")
+    return ("dropped", f"The download test worked afterwards ({speed} MB/s; {mp_txt}): the connection dropped "
+                       "mid-encode and FFmpeg did not recover. Usually a brief network interruption; "
+                       "if it repeats on one worker, look at its network or FFmpeg build.")
 
 
 @app.route('/api/error_reports')
@@ -4242,11 +4416,101 @@ def api_error_reports():
         conn.row_factory = sqlite3.Row
         try:
             c = conn.cursor()
-            c.execute("SELECT id, timestamp, job_id, worker_id, error_type, message, details FROM error_reports ORDER BY timestamp DESC LIMIT ?", (limit,))
+            c.execute("SELECT id, timestamp, job_id, worker_id, error_type, message, details, diag FROM error_reports ORDER BY timestamp DESC LIMIT ?", (limit,))
             reports = [dict(r) for r in c.fetchall()]
         finally:
             conn.close()
+    for r in reports:
+        try: r['diag'] = json.loads(r['diag']) if r.get('diag') else None
+        except (TypeError, ValueError): r['diag'] = None
+        if r['diag'] is not None or _is_source_read_message(r.get('message')):
+            r['verdict'] = _source_verdict(r['diag'])[1]
     return jsonify({"reports": reports})
+
+
+def _worker_base(worker_id):
+    """'name-Box-3' -> 'name-Box': one machine's job slots counted together."""
+    w = str(worker_id or '')
+    head, _, tail = w.rpartition('-')
+    return head if head and tail.isdigit() else w
+
+@app.route('/api/source_health')
+@requires_auth
+def api_source_health():
+    """Source-read failures per worker machine over the last N hours, next to
+    how much that machine finished, with the latest diagnosis for each."""
+    try:
+        hours = max(1, min(int(request.args.get('hours', 24)), 24 * 14))
+    except (ValueError, TypeError):
+        hours = 24
+    cutoff = datetime.now() - timedelta(hours=hours)
+    with read_lock():
+        conn = db_handler.get_connection(); conn.row_factory = sqlite3.Row
+        try:
+            c = conn.cursor()
+            c.execute("SELECT timestamp, job_id, worker_id, message, diag FROM error_reports "
+                      "WHERE timestamp >= ? ORDER BY timestamp DESC", (cutoff,))
+            reports = [dict(r) for r in c.fetchall()]
+            # Finished work per slot: the earnings ledger keeps one row per
+            # accepted chunk or whole file (chunk rows are deleted once a job
+            # is assembled, so the chunks table cannot be counted).
+            c.execute("SELECT worker_id, COUNT(*) FROM earnings WHERE timestamp >= ? GROUP BY worker_id", (cutoff,))
+            done_rows = c.fetchall()
+        finally:
+            conn.close()
+    machines = {}
+    def _m(base):
+        return machines.setdefault(base, {"worker": base, "failures": 0, "done": 0, "verdicts": {}, "latest": None})
+    for wid, n in done_rows:
+        if wid and not str(wid).startswith('('):
+            _m(_worker_base(wid))["done"] += n
+    for r in reports:
+        try: diag = json.loads(r['diag']) if r.get('diag') else None
+        except (TypeError, ValueError): diag = None
+        if diag is None and not _is_source_read_message(r.get('message')):
+            continue
+        m = _m(_worker_base(r['worker_id']))
+        code, text = _source_verdict(diag)
+        m["failures"] += 1
+        m["verdicts"][code] = m["verdicts"].get(code, 0) + 1
+        if m["latest"] is None:
+            m["latest"] = {"time": str(r['timestamp']), "worker_id": r['worker_id'], "job_id": r['job_id'],
+                           "message": r['message'], "phase": (diag or {}).get('phase'),
+                           "ffmpeg": (diag or {}).get('ffmpeg'), "selftest": (diag or {}).get('selftest'),
+                           "manager_probe": (diag or {}).get('manager_probe'), "verdict": text, "code": code}
+    rows = sorted((m for m in machines.values() if m["failures"]),
+                  key=lambda m: (-m["failures"], m["worker"]))
+    for m in rows:
+        m["failure_rate"] = round(m["failures"] / (m["failures"] + m["done"]), 3) if (m["failures"] + m["done"]) else None
+    quiet = sum(1 for m in machines.values() if not m["failures"] and m["done"])
+    return jsonify({"hours": hours, "machines": rows, "machines_without_failures": quiet})
+
+@app.route('/api/source_test')
+@requires_auth
+def api_source_test():
+    """Download a little of a source from the manager right now (read-only).
+    ?job_id= picks the file; otherwise a remote job being encoded (or queued,
+    or failing that any remote job) is used."""
+    job_id = (request.args.get('job_id') or '').strip()
+    if not job_id:
+        with read_lock():
+            conn = db_handler.get_connection()
+            try:
+                row = conn.execute("SELECT id FROM jobs WHERE source_type='remote' "
+                                   "ORDER BY CASE status WHEN 'processing' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END, "
+                                   "last_updated DESC LIMIT 1").fetchone()
+            finally:
+                conn.close()
+        if not row:
+            return jsonify({"status": "error", "message": "no remote job to test with"}), 404
+        job_id = row[0]
+    if not _MANAGER_PROBE_SEM.acquire(timeout=30):
+        return jsonify({"status": "error", "message": "another test is running"}), 429
+    try:
+        result = _manager_source_probe(job_id, 0)
+    finally:
+        _MANAGER_PROBE_SEM.release()
+    return jsonify({"status": "ok", "job_id": job_id, "result": result})
 
 
 @app.route('/api/download_log')

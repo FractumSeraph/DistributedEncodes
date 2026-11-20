@@ -138,7 +138,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.11.0"
+WORKER_VERSION = "3.12.0"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -1450,6 +1450,120 @@ def _is_source_read_failure(log_buffer):
             return True
     return False
 
+# ---------------------------------------------------------------------------
+# Source-read diagnostics. When FFmpeg cannot read the source, the error report
+# used to carry only FFmpeg's version banner: an FFmpeg stuck while opening the
+# file prints nothing else. These helpers record what the manager needs to tell
+# a worker-side problem (network, FFmpeg build) from a source-host problem.
+# ---------------------------------------------------------------------------
+_FFMPEG_BUILD_INFO = None
+
+def _ffmpeg_build_info():
+    """FFmpeg's version and the TLS library it was built with (cached)."""
+    global _FFMPEG_BUILD_INFO
+    if _FFMPEG_BUILD_INFO is None:
+        info = {"version": "?", "tls": "?"}
+        try:
+            out = subprocess.run([FFMPEG_CMD, '-hide_banner', '-version'], capture_output=True,
+                                 text=True, errors='replace', timeout=20).stdout or ''
+            first = out.splitlines()[0] if out else ''
+            m = re.search(r'ffmpeg version (\S+)', first)
+            if m: info["version"] = m.group(1)[:80]
+            libs = [lib for lib in ('openssl', 'gnutls', 'mbedtls', 'libtls', 'schannel', 'securetransport')
+                    if f'--enable-{lib}' in out]
+            if libs:
+                info["tls"] = ",".join(libs)
+            elif sys.platform == 'win32':
+                info["tls"] = "schannel (Windows default)"
+            elif sys.platform == 'darwin':
+                info["tls"] = "securetransport (macOS default)"
+            else:
+                info["tls"] = "none listed"
+        except Exception:
+            pass
+        _FFMPEG_BUILD_INFO = info
+    return _FFMPEG_BUILD_INFO
+
+def _source_selftest(url, offset=0, seconds=8.0, max_bytes=16 * 1024 * 1024):
+    """Download a little of the source from where the encode needed it, the way
+    FFmpeg would (same URL, same token, a Range request). Returns a dict:
+    resolved addresses, HTTP status, time to first byte, speed, or the error."""
+    import socket
+    from urllib.parse import urlsplit
+    res = {"offset": int(max(0, offset))}
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname or ''
+        port = parts.port or (443 if parts.scheme == 'https' else 80)
+        res["host"] = host
+        t = time.time()
+        addrs = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+        res["dns_ms"] = int((time.time() - t) * 1000)
+        res["ips"] = sorted({a[4][0] for a in addrs})[:4]
+    except Exception as e:
+        res["error"] = f"DNS lookup failed: {type(e).__name__}: {str(e)[:160]}"
+        return res
+    try:
+        hdrs = get_auth_headers()
+        hdrs['Range'] = f"bytes={res['offset']}-"
+        t = time.time()
+        r = requests.get(url, headers=hdrs, stream=True, timeout=(15, 30))
+        res["status"] = r.status_code
+        res["ttfb_ms"] = int((time.time() - t) * 1000)
+        n = 0; t2 = time.time()
+        try:
+            if r.status_code in (200, 206):
+                for blk in r.iter_content(256 * 1024):
+                    n += len(blk)
+                    if n >= max_bytes or time.time() - t2 >= seconds:
+                        break
+        finally:
+            r.close()
+        el = max(time.time() - t2, 0.001)
+        res["bytes"] = n
+        res["secs"] = round(el, 2)
+        res["mb_s"] = round(n / el / 1e6, 2)
+        if r.status_code not in (200, 206):
+            res["error"] = f"HTTP {r.status_code}"
+    except Exception as e:
+        res["error"] = f"{type(e).__name__}: {str(e)[:200]}"
+    return res
+
+def _source_failure_diag(watch, url, is_local, offset=0):
+    """Everything a source-read failure report should carry (see above)."""
+    d = {"diag_version": 1, "worker_version": WORKER_VERSION,
+         "os": f"{platform.system()} {platform.release()}"[:60],
+         "ffmpeg": _ffmpeg_build_info(),
+         "source": "local file" if is_local else "http"}
+    if watch is not None:
+        d.update(watch.diag())
+    if not is_local:
+        d["selftest"] = _source_selftest(url, offset)
+    return d
+
+def _diag_text(d):
+    """The same diagnostics as readable lines, for the report's details."""
+    out = ["", "--- Source-read diagnostics (worker) ---"]
+    ff = d.get("ffmpeg") or {}
+    out.append(f"Worker {d.get('worker_version')} on {d.get('os')}; FFmpeg {ff.get('version')} (TLS: {ff.get('tls')})")
+    ph = d.get("phase")
+    if ph == "probing":
+        out.append("FFprobe could not read the source's stream information (3 attempts).")
+    elif ph == "opening":
+        out.append(f"FFmpeg never got past opening the source ({d.get('waited_s', 0)}s without a first frame).")
+    elif ph == "encoding":
+        out.append(f"Frames stopped at {d.get('pos_s', 0)}s into the encode ({d.get('pct', 0)}%); "
+                   f"no progress for {d.get('stalled_s', 0)}s.")
+    st = d.get("selftest")
+    if st:
+        if st.get("error"):
+            out.append(f"Download test from this worker FAILED: {st['error']} "
+                       f"(host {st.get('host')}, resolved {', '.join(st.get('ips') or []) or '-'})")
+        else:
+            out.append(f"Download test from this worker: HTTP {st.get('status')}, first byte {st.get('ttfb_ms')} ms, "
+                       f"{st.get('mb_s')} MB/s over {st.get('secs')}s (resolved {', '.join(st.get('ips') or [])})")
+    return "\n".join(out)
+
 def _clean_stopped_output(path):
     """Make the output of an ffmpeg that was stopped mid-encode safe to use.
 
@@ -1557,6 +1671,24 @@ class _StreamWatch:
                 if pos is not None:
                     self._pos = pos
             self._pct = pct
+
+    def diag(self):
+        """Where the read stopped, for a failure report: still opening the
+        source, or partway through the encode (and since when)."""
+        with self._lock:
+            last, started, pos, pct = self._last_progress, self._started, self._pos, self._pct
+        now = time.time()
+        if not last:
+            return {"phase": "opening", "waited_s": int(now - started),
+                    "killed_by_watchdog": self.stall_killed}
+        return {"phase": "encoding", "pos_s": round(max(pos, 0.0), 1), "pct": pct,
+                "stalled_s": int(now - last), "killed_by_watchdog": self.stall_killed}
+
+    def kill_reason(self):
+        """Why the watch stopped ffmpeg, in words (only meaningful after a kill)."""
+        if not self._last_progress:
+            return f"FFmpeg could not open the source within {int(self.OPEN_KILL_SEC // 60) or 1} min"
+        return f"Encode stalled with no progress for {int(self.STALL_KILL_SEC // 60) or 1} min"
 
     def start(self):
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -2338,18 +2470,22 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
             requests.post(f"{manager_url}/report_status", json=payload, headers=get_auth_headers(), timeout=10)
         except: pass
 
-    def report_error(rpt_job_id, error_type, message, details=""):
-        """Send a structured error report to the manager for admin visibility."""
+    def report_error(rpt_job_id, error_type, message, details="", diag=None):
+        """Send a structured error report to the manager for admin visibility.
+        `diag` (source-read failures) is also shown as text in the details."""
+        payload = {
+            "job_id": rpt_job_id,
+            "worker_id": worker_id,
+            "error_type": error_type,
+            "message": str(message)[:2048],
+            "details": (str(details)[:30000] + (_diag_text(diag) if diag else ""))[:32768],
+        }
+        if diag:
+            payload["diag"] = diag
         try:
             requests.post(
                 f"{manager_url}/report_error",
-                json={
-                    "job_id": rpt_job_id,
-                    "worker_id": worker_id,
-                    "error_type": error_type,
-                    "message": str(message)[:2048],
-                    "details": str(details)[:32768],
-                },
+                json=payload,
                 headers=get_auth_headers(),
                 timeout=10
             )
@@ -2608,6 +2744,19 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                     log(worker_id, f"Could not read the source (rc="
                                    f"{_ffmpeg_rc_text(proc.returncode) if proc else '?'}) \u2014 "
                                    f"waiting {_delay}s for it to come back ({chunk_tag}).", "WARN")
+                    if _src_retries == 1 and not _is_local:
+                        # Test the download now, while the problem is fresh:
+                        # the full report only goes out after every retry.
+                        try:
+                            _fs = int(chunk.get('file_size') or 0)
+                            _st = _source_selftest(dl_url, int(_fs * start_sec / src_dur)
+                                                   if (_fs > 0 and src_dur > 0 and kind == 'video') else 0)
+                            log(worker_id, "Source download test: " + (
+                                f"FAILED: {_st['error']}" if _st.get('error') else
+                                f"OK, {_st.get('mb_s')} MB/s, first byte {_st.get('ttfb_ms')} ms") +
+                                f" ({chunk_tag}).", "WARN")
+                        except Exception:
+                            pass
                 elif _source_blamed:
                     break  # source still down after every backoff step
                 else:
@@ -2700,8 +2849,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                                    f"source ({chunk_tag}); keeping the {_s_dur:.1f}s already encoded.", "WARN")
                     _stall_salvaged = True; _trunc_note = None
                     break
-                log(worker_id, f"Encode stalled with no progress for {int(watch.STALL_KILL_SEC // 60)} min "
-                               f"({chunk_tag}); stopped ffmpeg.", "WARN")
+                log(worker_id, f"{watch.kill_reason()} ({chunk_tag}); stopped ffmpeg.", "WARN")
             if proc.returncode == 0:
                 # Self-check BEFORE uploading: a dropped source stream can make
                 # ffmpeg see a premature EOF and finish "successfully" with only
@@ -2772,7 +2920,19 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                 err_msg = f"FFmpeg exited with code {_ffmpeg_rc_text(rc)} ({chunk_tag})"
             log(worker_id, err_msg, "ERROR")
             report_chunk("failed", error_msg=err_msg)
-            report_error(job_id, "chunk_encode_failure", err_msg, _error_tail(log_buffer))
+            _diag = None
+            if _trunc_note or _is_source_read_failure(log_buffer):
+                try:
+                    _fs = int(chunk.get('file_size') or 0)
+                    _off = int(_fs * start_sec / src_dur) if (_fs > 0 and src_dur > 0 and kind == 'video') else 0
+                    _diag = _source_failure_diag(watch if proc is not None else None, dl_url, _is_local, _off)
+                    _st = _diag.get('selftest') or {}
+                    log(worker_id, "Source download test: " + (_st.get('error') or
+                        f"HTTP {_st.get('status')}, {_st.get('mb_s')} MB/s") if _st else
+                        "Source is a local file; no download test.", "WARN")
+                except Exception as _de:
+                    log(worker_id, f"Could not collect source diagnostics: {_de}", "WARN")
+            report_error(job_id, "chunk_encode_failure", err_msg, _error_tail(log_buffer), diag=_diag)
             upload_chunk_log()
             cleanup()
             d = WORKER_DETAILS.get(worker_id)
@@ -3395,6 +3555,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                         _smeta = None
                 if probe_data is None:
                     update_status("Probing")
+                _probe_last_err = ''
                 for _probe_attempt in ([] if probe_data else range(3)):
                     try:
                         # Start each attempt clean so a partially-parsed failure
@@ -3426,6 +3587,11 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                         probe_data = _pd  # only assigned once fully parsed
                         break  # probe succeeded
                     except Exception as _probe_err:
+                        # Not str(_probe_err) in the report: a TimeoutExpired
+                        # message includes the command, token header and all.
+                        _probe_last_err = (f"ffprobe timed out after {int(_probe_err.timeout)}s"
+                                           if isinstance(_probe_err, subprocess.TimeoutExpired)
+                                           else f"{type(_probe_err).__name__}: {str(_probe_err)[:200]}")
                         if _probe_attempt < 2:
                             log(worker_id, f"Probe failed (attempt {_probe_attempt+1}/3): {_probe_err}. Retrying in {5*(_probe_attempt+1)}s...", "WARN")
                             time.sleep(5 * (_probe_attempt + 1))
@@ -3434,7 +3600,14 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
 
                 if probe_data is None:
                     post_status("failed", error_msg="FFprobe failed after 3 attempts")
-                    report_error(job_id, "probe_failure", "FFprobe failed after 3 attempts")
+                    _diag = None
+                    try:
+                        _diag = _source_failure_diag(None, dl_url, _is_local, 0)
+                        _diag["phase"] = "probing"
+                    except Exception as _de:
+                        log(worker_id, f"Could not collect source diagnostics: {_de}", "WARN")
+                    report_error(job_id, "probe_failure", "FFprobe failed after 3 attempts (could not read the source)",
+                                 _probe_last_err, diag=_diag)
                     continue
 
                 log(worker_id, f"Encoding ({total_min}m)...")
@@ -3701,8 +3874,7 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                                            f"the source; keeping the {_s_dur:.1f}s already encoded.", "WARN")
                             _wf_stall_salvaged = True; _wf_trunc_note = None
                             break
-                        log(worker_id, f"Encode stalled with no progress for {int(watch.STALL_KILL_SEC // 60)} min; "
-                                       "stopped ffmpeg.", "WARN")
+                        log(worker_id, f"{watch.kill_reason()}; stopped ffmpeg.", "WARN")
                     if proc.returncode == 0:
                         # Self-check BEFORE uploading: a dropped source stream
                         # can make ffmpeg see a premature EOF and exit 0 with a
@@ -3845,7 +4017,18 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                     log(worker_id, "--------------------------", "ERROR")
                     post_status("failed", error_msg=err_msg)
                     if not SHUTDOWN_EVENT.is_set():
-                        report_error(job_id, "encode_failure", err_msg, _error_tail(log_buffer))
+                        _diag = None
+                        if _wf_trunc_note or _is_source_read_failure(log_buffer):
+                            try:
+                                _fs = int(job.get('file_size') or 0)
+                                _wd = watch.diag() if proc is not None else {}
+                                _off = (int(_fs * float(_wd.get('pos_s') or 0) / total_sec)
+                                        if (_fs > 0 and total_sec > 0) else 0)
+                                _diag = _source_failure_diag(watch if proc is not None else None,
+                                                             dl_url, _is_local, _off)
+                            except Exception as _de:
+                                log(worker_id, f"Could not collect source diagnostics: {_de}", "WARN")
+                        report_error(job_id, "encode_failure", err_msg, _error_tail(log_buffer), diag=_diag)
                     upload_encode_log()
                     # Stopped mid-encode: leave the partial file and its
                     # checkpoint so the next start resumes instead of starting

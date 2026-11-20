@@ -81,6 +81,15 @@
         .et-network_error { border: 1px solid var(--neon-orange); color: var(--neon-orange); }
         .et-other { border: 1px solid var(--text-dim); color: var(--text-dim); }
 
+        /* Source-read health: one stacked card per machine on narrow screens */
+        @media (max-width: 760px) {
+            .card table.sh-table { min-width: 0; }
+            .sh-table thead { display: none; }
+            .sh-table, .sh-table tbody, .sh-table tr, .sh-table td { display: block; width: auto; }
+            .sh-table tr { border-bottom: 1px solid #333; padding: 6px 0; }
+            .sh-table td { border-bottom: none; padding: 3px 10px; }
+            .sh-table td[data-label]::before { content: attr(data-label); display: block; font-size: 0.75em; color: var(--neon-purple); }
+        }
         .detail-row td { background: #0d0d0d; padding: 10px 15px !important; border-bottom: 1px solid #333; }
         .detail-pre { white-space: pre-wrap; word-break: break-all; font-size: 0.78em; color: #aaa; max-height: 250px; overflow-y: auto; margin: 0; background: rgba(0,0,0,0.4); padding: 8px; border: 1px solid #333; }
     </style>
@@ -157,6 +166,34 @@
             <div style="flex-basis:100%; font-size:0.75em; opacity:0.7; margin-top:4px;">
                 Applies to jobs split from now on. Needs worker 3.10.0 or newer; a job touched by an older or browser worker uses the separate pass.
                 In CHECK mode, search the log for "Audio-from-chunks check".
+            </div>
+        </div>
+
+        <div class="card" style="border-color: var(--neon-orange); margin-top: 20px;">
+            <div class="card-header" style="border-color: var(--neon-orange); flex-wrap: wrap; gap: 8px;">
+                <h3 style="color:var(--neon-orange)">>> SOURCE_READ_HEALTH <span style="font-size:0.75em; color:var(--text-dim);">(last 24h)</span></h3>
+                <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+                    <span id="src-test-result" style="font-size:0.78em; color:var(--text-dim);"></span>
+                    <button onclick="testSourceNow()" id="src-test-btn" style="border-color: var(--neon-orange); color: var(--neon-orange);">[ TEST SOURCE FROM MANAGER ]</button>
+                </div>
+            </div>
+            <div style="font-size:0.75em; color:var(--text-dim); padding:8px 15px 0;">
+                When a worker cannot read a source, it (3.12.0+) reports where FFmpeg stopped and runs its own download test; the manager then downloads the same part of the same file. The verdict compares the two.
+            </div>
+            <div class="scroll-box" style="max-height: 360px;">
+                <table class="sh-table">
+                    <thead>
+                        <tr>
+                            <th width="15%">MACHINE</th>
+                            <th width="10%">FAILED / DONE</th>
+                            <th width="15%">LAST FAILURE</th>
+                            <th width="15%">WORKER TEST</th>
+                            <th width="15%">MANAGER TEST</th>
+                            <th width="30%">VERDICT</th>
+                        </tr>
+                    </thead>
+                    <tbody id="source-health-list"></tbody>
+                </table>
             </div>
         </div>
 
@@ -264,10 +301,76 @@
         }
 
         async function refreshAll() {
-            await Promise.all([loadJobs(), loadLogs(), loadErrorReports(), loadConfig(), loadPayouts()]);
+            await Promise.all([loadJobs(), loadLogs(), loadErrorReports(), loadConfig(), loadPayouts(), loadSourceHealth()]);
             applyFilters();
             renderErrorReports();
             renderPayouts();
+            renderSourceHealth();
+        }
+
+        let sourceHealth = null;
+        async function loadSourceHealth() {
+            try {
+                const r = await fetch('/api/source_health?hours=24');
+                sourceHealth = r.ok ? await r.json() : null;
+            } catch(e) { sourceHealth = null; }
+        }
+
+        function probeText(p) {
+            if (!p) return '<span style="color:#555;">—</span>';
+            if (p.error) return `<span style="color:var(--neon-red);">FAILED: ${escapeHTML(String(p.error))}</span>`;
+            if (p.source === 'local file') return '<span style="color:var(--neon-green);">file present</span>';
+            return `<span style="color:var(--neon-green);">${escapeHTML(String(p.mb_s))} MB/s</span>` +
+                   `<span style="color:#666;"> · HTTP ${escapeHTML(String(p.status))} · ${escapeHTML(String(p.ttfb_ms))} ms</span>`;
+        }
+
+        function renderSourceHealth() {
+            const tbody = document.getElementById('source-health-list');
+            if (!tbody) return;
+            const rows = (sourceHealth && sourceHealth.machines) || [];
+            if (!sourceHealth) {
+                tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; color:#555;">// UNAVAILABLE //</td></tr>';
+                return;
+            }
+            if (rows.length === 0) {
+                const n = sourceHealth.machines_without_failures || 0;
+                tbody.innerHTML = `<tr><td colspan="6" style="text-align:center; color:var(--neon-green);">// NO SOURCE-READ FAILURES · ${n} machine(s) finished work without one //</td></tr>`;
+                return;
+            }
+            tbody.innerHTML = rows.map(m => {
+                const L = m.latest || {};
+                const rate = (m.failure_rate !== null && m.failure_rate !== undefined) ? ` <span style="color:#666;">(${Math.round(m.failure_rate*100)}%)</span>` : '';
+                const where = L.phase === 'opening' ? 'stuck opening the file'
+                            : L.phase === 'encoding' ? 'stopped mid-encode' : '';
+                const ff = L.ffmpeg ? `<div style="color:#666; font-size:0.85em;">FFmpeg ${escapeHTML(String(L.ffmpeg.version||'?')).slice(0,40)} · TLS ${escapeHTML(String(L.ffmpeg.tls||'?'))}</div>` : '';
+                return `<tr>
+                    <td><span class="worker-tag">${escapeHTML(m.worker)}</span>${ff}</td>
+                    <td data-label="FAILED / DONE"><span style="color:var(--neon-red);">${m.failures}</span> / ${m.done}${rate}</td>
+                    <td data-label="LAST FAILURE" style="font-size:0.85em;">${fmtTs(L.time)}<div style="color:#666;">${escapeHTML(where)}</div><div style="color:#666;" title="${escapeHTML(L.job_id||'')}">${escapeHTML((L.job_id||'').split('/').pop().slice(0,60))}</div></td>
+                    <td data-label="WORKER TEST" style="font-size:0.85em;">${probeText(L.selftest)}</td>
+                    <td data-label="MANAGER TEST" style="font-size:0.85em;">${probeText(L.manager_probe)}</td>
+                    <td data-label="VERDICT" style="font-size:0.85em;">${escapeHTML(L.verdict||'')}</td>
+                </tr>`;
+            }).join('');
+        }
+
+        async function testSourceNow() {
+            const btn = document.getElementById('src-test-btn');
+            const out = document.getElementById('src-test-result');
+            btn.disabled = true; out.textContent = 'testing…';
+            try {
+                const r = await fetch('/api/source_test');
+                const d = await r.json();
+                if (!r.ok) { out.textContent = d.message || ('HTTP ' + r.status); return; }
+                const p = d.result || {};
+                const name = (d.job_id||'').split('/').pop();
+                out.innerHTML = (p.error
+                    ? `<span style="color:var(--neon-red);">FAILED: ${escapeHTML(String(p.error))}</span>`
+                    : `<span style="color:var(--neon-green);">OK ${escapeHTML(String(p.mb_s))} MB/s</span> · HTTP ${escapeHTML(String(p.status))} · first byte ${escapeHTML(String(p.ttfb_ms))} ms`)
+                    + ` <span style="color:#666;">(${escapeHTML(name.slice(0,50))})</span>`;
+            } catch(e) {
+                out.textContent = 'test failed: ' + e;
+            } finally { btn.disabled = false; }
         }
 
         let payoutPending = null;
@@ -494,11 +597,15 @@
 
             tbody.innerHTML = errReportsData.map((r, idx) => {
                 const etClass = `et-${(r.error_type||'other').toLowerCase().replace(/[^a-z0-9_]/g,'_')}`;
-                const hasDetails = r.details && r.details.trim().length > 0;
+                const verdictBlock = r.verdict
+                    ? `<div style="margin-bottom:6px; font-size:0.85em; color:var(--neon-orange);">DIAGNOSIS: ${escapeHTML(r.verdict)}</div>` +
+                      (r.diag && r.diag.manager_probe ? `<div style="margin-bottom:6px; font-size:0.8em; color:#aaa;">Manager download test: ${probeText(r.diag.manager_probe)}</div>` : '')
+                    : '';
+                const hasDetails = (r.details && r.details.trim().length > 0) || !!verdictBlock;
                 const jobShort = (r.job_id||'').split('/').pop();
                 const detailId = `err-detail-${idx}`;
                 const detailRow = hasDetails
-                    ? `<tr id="${detailId}" style="display:${expandAllDetails?'table-row':'none'}" class="detail-row"><td colspan="5"><div style="margin-bottom:4px; font-size:0.8em; color:var(--neon-red);">DETAILS:</div><pre class="detail-pre">${escapeHTML(r.details)}</pre></td></tr>`
+                    ? `<tr id="${detailId}" style="display:${expandAllDetails?'table-row':'none'}" class="detail-row"><td colspan="5">${verdictBlock}<div style="margin-bottom:4px; font-size:0.8em; color:var(--neon-red);">DETAILS:</div><pre class="detail-pre">${escapeHTML(r.details||'')}</pre></td></tr>`
                     : '';
                 return `
                 <tr style="cursor:${hasDetails?'pointer':'default'}" onclick="${hasDetails?`toggleDetail('${detailId}')`:''}" title="${hasDetails?'Click to expand details':''}">

@@ -303,6 +303,7 @@ Navigate to `https://your-domain.com/admin` (HTTP Basic Auth — credentials fro
 | Job Registry | Filter by status (failed / active / queued / done), search by worker or filename |
 | LOG button | Download the raw FFmpeg `.log.gz` for any job |
 | Error Reports | Structured error log sent by workers — includes FFmpeg output or Python traceback |
+| Source Read Health | Per machine: source-read failures vs finished work (24h), the worker's and the manager's download tests, and a verdict. **Test source from manager** downloads a little of a source right now |
 | System Logs | Real-time event log with ERROR / WARN / INFO filter |
 | Config | Set or change the Remote Source URL without restarting |
 | Prune Dead Workers | Reset jobs stalled for more than 10 minutes |
@@ -311,6 +312,26 @@ Navigate to `https://your-domain.com/admin` (HTTP Basic Auth — credentials fro
 | Archive History | Rename completed jobs so they can be re-encoded |
 | Purge Queue | Delete all queued jobs (files are re-queued on next scan) |
 | Clear Errors | Remove all error reports |
+
+#### Diagnosing "Could not read the source"
+
+When FFmpeg cannot read a source, a worker (3.12.0 or newer) adds to its error report:
+
+- **where FFmpeg stopped**: still opening the file, or partway through the encode (and how far);
+- **its FFmpeg build** and the TLS library it uses for HTTPS;
+- **a download test from the worker's own machine**: the same file, from the point where the encode needed it, with the HTTP status, time to first byte and speed (or the error). This test also runs at the first failed attempt, so its result shows in the worker's window long before the final report.
+
+When the report arrives, the manager downloads the same part of the same file itself (a few MB). Comparing the two gives the verdict shown in **Source Read Health** and in the report's details:
+
+| Worker test | Manager test | Verdict |
+|---|---|---|
+| fails | works | the worker's network, firewall, DNS or ISP route |
+| fails | fails | the source host was down or refusing requests |
+| works, but FFmpeg never opened the file | — | the worker's FFmpeg build (try letting the worker download its standard build) |
+| works, but slowly | — | a slow or congested link on the worker's side |
+| works | — | the connection dropped mid-encode and did not recover |
+
+Reports from older workers carry only the manager's test, which still shows whether the source host was up at the time. None of this changes jobs, chunks or the source-outage pause.
 
 ---
 
