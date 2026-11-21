@@ -212,6 +212,15 @@
         .os-title { color: var(--neon-purple); font-weight: bold; margin-bottom: 8px; display: block; font-size: 1.1em; }
         code { background: rgba(0,0,0,0.5); padding: 2px 6px; color: var(--neon-pink); border: 1px solid #333; font-size: 0.9em; display: block; overflow-x: auto; margin-top: 5px; }
 
+        .notice {
+            border: 1px solid var(--neon-pink); background: rgba(255, 0, 170, 0.08);
+            padding: 12px 16px; margin-bottom: 20px; line-height: 1.6; font-size: 0.9em;
+            box-shadow: 0 0 8px rgba(255, 0, 170, 0.3);
+        }
+        .notice-title { color: var(--neon-pink); font-weight: bold; margin-right: 6px; }
+        .notice a { color: var(--neon-green); overflow-wrap: anywhere; }
+        .notice a:hover { color: var(--neon-pink); }
+
     </style>
 </head>
 <body>
@@ -223,6 +232,11 @@
             </div>
             
             <button class="join-btn" onclick="openModal()">[+] HELP: RUN WORKER APP</button>
+        </div>
+
+        <div class="notice" role="note">
+            <div><span class="notice-title">NOTICE:</span>Anime will be listed under <strong>&ldquo;Series&rdquo;</strong>. It was taken down briefly while the website is rebuilt, and will be back shortly.</div>
+            <div>Questions? You can reach me on Discord: <a href="https://discord.fractumseraph.net/" target="_blank" rel="noopener noreferrer">discord.fractumseraph.net</a></div>
         </div>
 
         <div class="kpi-row">
