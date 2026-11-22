@@ -206,10 +206,16 @@ async function processChunk(chunk) {
         const lead = parseFloat(resp.headers.get('X-Segment-Lead') || '0') || 0;
         const dur  = parseFloat(resp.headers.get('X-Segment-Duration') || String(chunk.duration_sec)) || chunk.duration_sec;
 
-        const data = new Uint8Array(await resp.arrayBuffer());
+        // canOwn: the in-memory file system takes this buffer as the file's
+        // contents instead of copying it. A 10-minute 1080p segment is about
+        // 450 MB, and the copy doubled that - the difference between fitting
+        // and crashing on a tablet.
+        let data = new Uint8Array(await resp.arrayBuffer());
+        const segBytes = data.length;
         try { FS.mkdir('/tmp'); } catch(e) {}
-        FS.writeFile(segPath, data);
-        postMessage({type: 'log', level: 'sys', msg: `Segment ${data.length} bytes; encoding [lead=${lead.toFixed(2)}s dur=${dur.toFixed(2)}s]...`});
+        FS.writeFile(segPath, data, { canOwn: true });
+        data = null;
+        postMessage({type: 'log', level: 'sys', msg: `Segment ${segBytes} bytes; encoding [lead=${lead.toFixed(2)}s dur=${dur.toFixed(2)}s]...`});
 
         // Same targets as the native chunk path: video-only, SVT-AV1 preset 2,
         // CRF (profile-aware), 480p, timestamps re-zeroed for clean concat.
@@ -327,7 +333,7 @@ async function processJob(job) {
         // Ensure /tmp exists
         try { FS.mkdir('/tmp'); } catch(e) {}
         
-        FS.writeFile(inputPath, data);
+        FS.writeFile(inputPath, data, { canOwn: true });   // no second copy (see processChunk)
         
         // Verify input exists (sanity check)
         try {

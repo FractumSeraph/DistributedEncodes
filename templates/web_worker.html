@@ -219,12 +219,12 @@
                     <input type="text" id="wallet" value="" placeholder="FractumCoin address" style="width: 220px;">
                 </div>
                 <div>
-                    <label title="Browser encoding is memory-limited. Larger files may crash the tab.">MAX SOURCE MB:</label>
-                    <input type="text" id="maxSizeMb" value="150" style="width: 80px;">
+                    <label title="Largest download this browser will take: a whole small file, or one chunk of a big film (a 10-minute chunk of a typical 1080p film is about 450 MB). Browsers cannot hold more than 1000 MB.">MAX SOURCE MB:</label>
+                    <input type="text" id="maxSizeMb" value="600" style="width: 80px;">
                 </div>
                 <div>
-                    <label title="Longest chunk (seconds) this browser will accept. Long chunks can exhaust the 32-bit WASM memory and crash. Lower it if you see crashes.">MAX CHUNK SEC:</label>
-                    <input type="text" id="maxChunkSec" value="120" style="width: 80px;">
+                    <label title="Longest chunk (seconds) this browser will accept. A 10-minute chunk of 1080p needed about 1 GB of memory in testing; lower this if the tab crashes on a low-memory device.">MAX CHUNK SEC:</label>
+                    <input type="text" id="maxChunkSec" value="600" style="width: 80px;">
                 </div>
             </div>
             <div style="border: 1px dashed var(--neon-purple, #b026ff); padding: 10px 12px; margin-bottom: 15px; font-size: 0.85em;">
@@ -258,7 +258,7 @@
     let currentChunk = null;   // {job_id, chunk_index} of an in-flight chunk, for release + heartbeat
 
     // Must be >= manager MIN_CLIENT_VERSION or /get_job returns "Update Required".
-    const WEB_WORKER_VERSION = "3.5.2";
+    const WEB_WORKER_VERSION = "3.6.0";
 
     // Worker token: injected by the manager (/web) so the page authenticates
     // out of the box; ?token= in the URL overrides. Empty only if the manager
@@ -457,16 +457,26 @@
     }
 
     let currentWallet = "";
-    let currentMaxSizeMb = 150;
-    let currentMaxChunkSec = 120;
+    // Defaults: 10-minute chunks fit in about 1 GB of browser memory (tested
+    // with 1080p H.264 at 6.5 Mbps: 451 MB segment, 0.96 GB peak). A browser
+    // cannot hold a multi-GB whole film, so the size box is capped.
+    const DEFAULT_MAX_SIZE_MB = 600, MAX_SIZE_CEILING_MB = 1000, DEFAULT_MAX_CHUNK_SEC = 600;
+    let currentMaxSizeMb = DEFAULT_MAX_SIZE_MB;
+    let currentMaxChunkSec = DEFAULT_MAX_CHUNK_SEC;
 
     // Remember the settings in this browser, so a device keeps its name
     // (they used to reset to Anonymous / WebNode on every visit).
-    const SETTINGS_KEY = 'fractum_web_worker_settings';
+    const SETTINGS_KEY = 'fractum_web_worker_settings_v2';   // v2: new size/chunk defaults
     const SETTING_FIELDS = ['username', 'workerName', 'wallet', 'maxSizeMb', 'maxChunkSec'];
     function loadSettings() {
         try {
-            const saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}');
+            let saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || 'null');
+            if (!saved) {
+                // Settings saved by 3.5.2 kept the old 150 MB / 120 s limits:
+                // carry over only the name and wallet, take the new defaults.
+                const old = JSON.parse(localStorage.getItem('fractum_web_worker_settings') || '{}');
+                saved = { username: old.username, workerName: old.workerName, wallet: old.wallet };
+            }
             for (const id of SETTING_FIELDS) {
                 const el = document.getElementById(id);
                 if (el && typeof saved[id] === 'string' && saved[id] !== '') el.value = saved[id];
@@ -495,9 +505,14 @@
         const node = document.getElementById('workerName').value.trim() || "WebNode";
         currentWallet = document.getElementById('wallet').value.trim();
         const mb = parseInt(document.getElementById('maxSizeMb').value, 10);
-        currentMaxSizeMb = (Number.isFinite(mb) && mb > 0) ? mb : 150;
+        currentMaxSizeMb = (Number.isFinite(mb) && mb > 0) ? mb : DEFAULT_MAX_SIZE_MB;
+        if (currentMaxSizeMb > MAX_SIZE_CEILING_MB) {
+            currentMaxSizeMb = MAX_SIZE_CEILING_MB;
+            document.getElementById('maxSizeMb').value = String(MAX_SIZE_CEILING_MB);
+            log(`MAX SOURCE MB lowered to ${MAX_SIZE_CEILING_MB}: a browser tab cannot hold a bigger download.`, 'sys');
+        }
         const mcs = parseInt(document.getElementById('maxChunkSec').value, 10);
-        currentMaxChunkSec = (Number.isFinite(mcs) && mcs > 0) ? mcs : 120;
+        currentMaxChunkSec = (Number.isFinite(mcs) && mcs > 0) ? mcs : DEFAULT_MAX_CHUNK_SEC;
         const runId = Math.floor(Date.now() / 1000);
         currentWorkerId = `${user}-${node}-${runId}-1`;
 
