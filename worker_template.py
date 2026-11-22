@@ -138,7 +138,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.13.0"
+WORKER_VERSION = "3.13.1"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -3010,6 +3010,11 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
             rc = proc.returncode if proc else -1
             if _trunc_note:
                 err_msg = f"Truncated output ({_trunc_note}) — source stream interrupted ({chunk_tag})"
+            elif _is_source_read_failure(log_buffer) and _is_local:
+                err_msg = (f"Could not read the local source file \u2014 "
+                           f"FFmpeg exited with code {_ffmpeg_rc_text(rc)} ({chunk_tag})")
+                log(worker_id, f"This machine's own copy of the file may be damaged or incomplete: {dl_url}. "
+                               "Compare it with the server's copy.", "WARN")
             elif _is_source_read_failure(log_buffer):
                 err_msg = (f"Could not read the source \u2014 "
                            f"FFmpeg exited with code {_ffmpeg_rc_text(rc)} ({chunk_tag})")
@@ -4096,7 +4101,19 @@ def worker_task(worker_id, manager_url, temp_dir, quota_tracker, single_mode=Fal
                 else:
                     rc = proc.returncode if proc else -1
                     err_msg = f"FFmpeg exited with code {_ffmpeg_rc_text(rc)}"
-                    if _is_source_read_failure(log_buffer):
+                    if _is_source_read_failure(log_buffer) and _is_local:
+                        err_msg = (f"Could not read the local source file — "
+                                   f"FFmpeg exited with code {_ffmpeg_rc_text(rc)}")
+                        _where = ""
+                        try:
+                            _p = float((watch.diag() if proc is not None else {}).get('pos_s') or 0)
+                            if _p > 0:
+                                _where = f" around {int(_p // 3600)}:{int(_p % 3600 // 60):02d}:{int(_p % 60):02d}"
+                        except Exception:
+                            pass
+                        log(worker_id, f"This machine's own copy of the file may be damaged or incomplete{_where}: "
+                                       f"{dl_url}. Compare it with the server's copy.", "WARN")
+                    elif _is_source_read_failure(log_buffer):
                         err_msg = (f"Could not read the source — "
                                    f"FFmpeg exited with code {_ffmpeg_rc_text(rc)}")
                     if _wf_trunc_note:

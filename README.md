@@ -334,7 +334,9 @@ When the report arrives, the manager downloads the same part of the same file it
 | works, but slowly | — | a slow or congested link on the worker's side |
 | works | — | the connection dropped mid-encode and did not recover |
 
-Reports from older workers carry only the manager's test, which still shows whether the source host was up at the time. None of this changes jobs, chunks or the source-outage pause.
+Reports from older workers carry only the manager's test, which still shows whether the source host was up at the time.
+
+A failed source read is not held against the job (so an outage cannot push jobs to permanently failed). Instead, when the **same machine** fails to read the same job's source twice, that machine is not given the job again for 12 hours, so another worker takes it. This does not apply while the source host is marked as down. A worker running with `--local-source` reports a failure of its own copy as "Could not read the local source file" (worker 3.13.1+); those failures do not count toward the source-outage pause, since the source host is not involved.
 
 ---
 
