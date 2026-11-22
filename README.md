@@ -45,7 +45,15 @@ Encoded output is intended for [https://vsv.fractumseraph.net/](https://vsv.frac
 
 The `WORKER_SECRET` environment variable is the preferred way to pass the auth token.
 
-**Which FFmpeg the worker uses.** On Windows and Linux (x64 and arm64) the worker downloads and uses its own copy of the newest FFmpeg *release* build (BtbN, about 130 MB), even when another FFmpeg is installed. Builds found on a machine vary (development snapshots, old distro packages, different HTTPS libraries), and one such build hung on every source it opened while the same machine downloaded the files without trouble. The worker keeps its copy current: when a newer FFmpeg release branch appears it switches to it at the next start. An FFmpeg found on the machine is used only if the download fails. To choose a specific build deliberately, pass `--ffmpeg PATH`; it must have `libsvtav1` and `libopus` and be FFmpeg 7.1 or newer. macOS has no such build, so there the worker uses the installed FFmpeg (for example from Homebrew).
+**Which FFmpeg the worker uses.** On Windows and Linux, on x64 and ARM64 (including native Windows-on-ARM builds), the worker keeps its own copy of the newest FFmpeg *release* build from BtbN, even when another FFmpeg is installed. New FFmpeg releases often encode faster or better, and builds found on a machine vary (development snapshots, old distro packages, different HTTPS libraries; one such build hung on every source it opened).
+
+- **Newest first, but only if it works here.** Before a build is used, the worker runs a one-second test encode with SVT-AV1 and Opus on that machine and reads it back. A build that fails (missing encoder, CPU or OS it cannot run on) is discarded and the next newest release is tried; the build already in use is kept until a replacement passes.
+- **Found even when GitHub's list is unavailable.** New release branches are discovered from BtbN's asset list, or, when that cannot be read, by checking whether the next version numbers exist.
+- **Kept current while running.** The worker checks at start and then once a day. A newer release branch is installed as soon as it is found; a rebuild of the same branch (point releases, fixes) at most once a week. Each build lives in its own folder under `ffmpeg_builds/`, and switching only changes which build *new* encodes use, so encodes already running finish undisturbed.
+- **Your choice wins.** `--ffmpeg PATH` uses a specific build instead; it must have `libsvtav1` and `libopus` and be FFmpeg 7.1 or newer. If no managed build can be installed, the worker falls back to an FFmpeg found on the machine and says so.
+- **macOS** has no BtbN build, so the worker uses the installed FFmpeg (`brew install ffmpeg`; keep it current with `brew upgrade ffmpeg`).
+
+Encoding settings are the same whichever build is used.
 
 ---
 
