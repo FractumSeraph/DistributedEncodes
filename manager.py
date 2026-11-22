@@ -1433,6 +1433,36 @@ def _note_worker_job_source_failure(worker_id, job_id):
                           f"not giving it to that machine for {WORKER_JOB_EXCLUDE_SEC // 3600} h "
                           "so another worker can take it.", job_id)
 
+# Queued LOCAL jobs whose file is not on disk (e.g. a folder taken down for a
+# while). Handing them out only produced 404 loops on workers and pushed the
+# jobs to permanently_failed; they are skipped instead and offered again once
+# the file is back (re-checked every LOCAL_MISSING_RECHECK_SEC).
+LOCAL_MISSING_RECHECK_SEC = 600
+_LOCAL_MISSING = {}                    # job_id -> time it may be re-checked
+_LOCAL_MISSING_LOG = {"t": 0.0}
+
+def _local_source_present(job_id):
+    """True when a local job's file exists on the manager. A missing file is
+    remembered for LOCAL_MISSING_RECHECK_SEC so the queue scan skips it."""
+    path = os.path.join(SOURCE_DIRECTORY, str(job_id).replace('/', os.sep))
+    if os.path.isfile(path):
+        _LOCAL_MISSING.pop(job_id, None)
+        return True
+    _LOCAL_MISSING[job_id] = time.time() + LOCAL_MISSING_RECHECK_SEC
+    if time.time() - _LOCAL_MISSING_LOG["t"] > 600:
+        _LOCAL_MISSING_LOG["t"] = time.time()
+        threading.Thread(target=log_event, daemon=True, args=(
+            "WARN", f"Skipping queued local job(s) whose source file is missing on the manager "
+                    f"({len(_LOCAL_MISSING)} known so far, e.g. this one). They stay queued and are "
+                    "handed out again once the file is back.", job_id)).start()
+    return False
+
+def _missing_local_ids(limit=500):
+    now = time.time()
+    for k in [k for k, t in _LOCAL_MISSING.items() if t <= now]:
+        _LOCAL_MISSING.pop(k, None)
+    return list(_LOCAL_MISSING)[:limit]
+
 def _jobs_excluded_for(worker_id, limit=300):
     """Job ids this worker's machine should not be given right now."""
     if not worker_id:
@@ -1543,12 +1573,12 @@ def _claim_job_for_split(folder_filter, max_size_mb, worker_id=None):
         try:
             params = []
             query_parts = ["status='queued'", "COALESCE(fail_count,0) < 5", "COALESCE(chunkable,1)=1"]
-            _excl = _jobs_excluded_for(worker_id)
+            _excl = _jobs_excluded_for(worker_id) + _missing_local_ids()
             if _excl:
                 query_parts.append(f"id NOT IN ({','.join('?' * len(_excl))})")
                 params.extend(_excl)
             if max_size_mb and str(max_size_mb).isdigit():
-                query_parts.append("file_size <= ?")
+                query_parts.append("file_size > 0 AND file_size <= ?")
                 params.append(int(max_size_mb) * 1024 * 1024)
             if folder_filter:
                 query_parts.append("id LIKE ?")
@@ -1568,6 +1598,14 @@ def _claim_job_for_split(folder_filter, max_size_mb, worker_id=None):
             c = conn.cursor()
             c.execute(sql, tuple(params))
             row = c.fetchone()
+            _skip = []
+            while row is not None and row['source_type'] != 'remote' and not _local_source_present(row['id']):
+                _skip.append(row['id'])
+                if len(_skip) >= 200:
+                    return None
+                sql2 = sql.replace(" ORDER BY", f" AND id NOT IN ({','.join('?' * len(_skip))}) ORDER BY", 1)
+                c.execute(sql2, tuple(params + _skip))
+                row = c.fetchone()
             if row is None:
                 return None
             job = dict(row)
@@ -1762,6 +1800,7 @@ def _assign_pending_chunk(worker_id, folder_filter, max_size_mb, video_only=Fals
                 params.extend(_excl)
             if max_size_mb and str(max_size_mb).isdigit():
                 # Estimate the bytes this chunk will stream (audio reads the whole file)
+                query_parts.append("COALESCE(j.file_size, 0) > 0")
                 query_parts.append("(CASE WHEN c.kind='audio' THEN j.file_size "
                                    "ELSE j.file_size * c.duration_sec / MAX(COALESCE(j.source_duration_sec, 1), 1) END) <= ?")
                 params.append(int(max_size_mb) * 1024 * 1024)
@@ -3598,23 +3637,38 @@ def get_job():
                         params = [source_type]
                         query_parts = ["status='queued'", "source_type=?", "COALESCE(fail_count,0) < 5"]
                         _excl = _jobs_excluded_for(worker_id)
+                        if source_type == 'local':
+                            _excl = _excl + _missing_local_ids()
                         if _excl:
                             query_parts.append(f"id NOT IN ({','.join('?' * len(_excl))})")
                             params.extend(_excl)
                         
                         if max_size_mb and max_size_mb.isdigit():
-                            query_parts.append("file_size <= ?")
+                            # Size 0 means unknown (the scan could not read it):
+                            # never hand that to a size-limited worker (a browser
+                            # was given a 5 GB film this way).
+                            query_parts.append("file_size > 0 AND file_size <= ?")
                             params.append(int(max_size_mb) * 1024 * 1024)
                         if folder_filter:
                             query_parts.append("id LIKE ?")
                             params.append(f"{folder_filter}%")
                         
-                        # [ADDED] content_profile to SELECT query
                         # Whole-file-only jobs first: they are the ones only /get_job can serve.
-                        sql = (f"SELECT id, filename, file_size, source_type, source_url, content_profile, source_hash, stream_meta "
-                               f"FROM jobs WHERE {' AND '.join(query_parts)} "
-                               f"ORDER BY CASE WHEN COALESCE(chunkable,1)=0 THEN 0 ELSE 1 END, id ASC LIMIT 1")
-                        c.execute(sql, tuple(params)); row = c.fetchone()
+                        # A local job whose file is gone is remembered and skipped
+                        # (bounded), instead of being handed out as a 404.
+                        _skip = []
+                        while True:
+                            _qp = query_parts + ([f"id NOT IN ({','.join('?' * len(_skip))})"] if _skip else [])
+                            sql = (f"SELECT id, filename, file_size, source_type, source_url, content_profile, source_hash, stream_meta "
+                                   f"FROM jobs WHERE {' AND '.join(_qp)} "
+                                   f"ORDER BY CASE WHEN COALESCE(chunkable,1)=0 THEN 0 ELSE 1 END, id ASC LIMIT 1")
+                            c.execute(sql, tuple(params + _skip)); row = c.fetchone()
+                            if row is None or source_type != 'local' or _local_source_present(row['id']):
+                                break
+                            _skip.append(row['id'])
+                            if len(_skip) >= 200:
+                                row = None
+                                break
                         if row: job = dict(row); break
                 
                 if job:
@@ -5520,6 +5574,45 @@ def _reclaim_stuck_work(cursor, now, logs):
     for key in [k for k in _PROGRESS_SEEN if k not in live]:
         _PROGRESS_SEEN.pop(key, None)
 
+_SIZE_FILL = {"next": 0.0}
+
+def _fill_unknown_sizes(batch=40):
+    """Queued remote jobs whose size the scan could not read have file_size 0,
+    which used to slip past every worker size limit. Look a few up per run
+    (HEAD requests, outside db_lock)."""
+    if time.time() < _SIZE_FILL["next"]:
+        return
+    _SIZE_FILL["next"] = time.time() + 600
+    with read_lock():
+        conn = db_handler.get_connection()
+        try:
+            rows = conn.execute("SELECT id, source_url FROM jobs WHERE status='queued' AND source_type='remote' "
+                                "AND COALESCE(file_size, 0) <= 0 LIMIT ?", (batch,)).fetchall()
+        finally:
+            conn.close()
+    found = []
+    for jid, surl in rows:
+        url = build_download_url(jid, 'remote', surl)
+        if not url:
+            continue
+        try:
+            h = requests.head(url, headers={'User-Agent': 'FractumManager/1.0', 'X-Worker-Token': WORKER_SECRET},
+                              timeout=15, allow_redirects=True)
+            size = int(h.headers.get('content-length', 0) or 0) if h.status_code == 200 else 0
+        except Exception:
+            size = 0
+        if size > 0:
+            found.append((size, jid))
+    if found:
+        with db_lock:
+            conn = db_handler.get_connection()
+            try:
+                conn.executemany("UPDATE jobs SET file_size=? WHERE id=? AND COALESCE(file_size, 0) <= 0", found)
+                conn.commit()
+            finally:
+                conn.close()
+        log_event("INFO", f"Filled in the file size of {len(found)} queued job(s) the scan could not size.")
+
 def maintenance_loop():
     while True:
         try:
@@ -5647,6 +5740,11 @@ def maintenance_loop():
 
             # Prune quarantine (files older than 1 hour)
             sweep_quarantine()
+
+            try:
+                _fill_unknown_sizes()
+            except Exception as e:
+                print(f"[!] Size fill-in failed: {e}")
 
             # Prune encode_logs (files older than 30 days)
             log_dir = os.path.join(os.getcwd(), "encode_logs")
