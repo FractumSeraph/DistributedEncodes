@@ -1337,6 +1337,7 @@ SOURCE_OUTAGE_COOLDOWN_SEC = 300
 # the rest are for older workers and for the manager's own probe failures.
 _SOURCE_DOWN_MARKERS = (
     'could not read the source',
+    'could not read the local source file',   # worker 3.13.0+, --local-source
     'server returned 5xx',
     'http error 5',
     'error opening input',
@@ -1385,6 +1386,64 @@ def _source_is_down():
     with _source_lock:
         return time.time() < _source_outage_until
 
+def _is_local_source_failure(reason):
+    """The worker was reading its OWN copy of the file (--local-source): a
+    failure says nothing about the source host, so it must not feed the
+    outage breaker."""
+    return 'local source file' in (reason or '').lower()
+
+# A machine that fails to read the same job's source twice is not given that
+# job again for a while. "Could not read the source" is treated as no fault of
+# the job (so an outage cannot push jobs to permanently_failed), which also
+# meant nothing ever stopped one machine from failing the same job forever:
+# a volunteer's damaged local copy of one film was handed back to the same
+# slot 16 times in 28 hours while every other worker could have done it.
+WORKER_JOB_EXCLUDE_AFTER = 2           # source-read failures, same machine + job
+WORKER_JOB_EXCLUDE_SEC = 12 * 3600
+_WJ_FAILS = {}                         # (machine, job_id) -> [failure times]
+_WJ_EXCLUDED = {}                      # (machine, job_id) -> excluded until
+_WJ_LOCK = threading.Lock()
+
+def _machine_of(worker_id):
+    """'name-Box-3' -> 'name-Box': one machine's job slots counted together."""
+    w = str(worker_id or '')
+    head, _, tail = w.rpartition('-')
+    return head if head and tail.isdigit() else w
+
+def _note_worker_job_source_failure(worker_id, job_id):
+    """Count a source-read failure against this machine for this job. Not
+    while the source is known to be down: then every machine fails alike."""
+    if not worker_id or not job_id or _source_is_down():
+        return
+    key = (_machine_of(worker_id), job_id)
+    now = time.time()
+    newly = False
+    with _WJ_LOCK:
+        times = [t for t in _WJ_FAILS.get(key, []) if now - t < WORKER_JOB_EXCLUDE_SEC] + [now]
+        _WJ_FAILS[key] = times
+        if len(times) >= WORKER_JOB_EXCLUDE_AFTER and _WJ_EXCLUDED.get(key, 0) < now:
+            _WJ_EXCLUDED[key] = now + WORKER_JOB_EXCLUDE_SEC
+            _WJ_FAILS.pop(key, None)
+            newly = True
+        if len(_WJ_FAILS) > 5000:      # bound memory: drop the stalest keys
+            for k in sorted(_WJ_FAILS, key=lambda k: _WJ_FAILS[k][-1])[:1000]:
+                _WJ_FAILS.pop(k, None)
+    if newly:
+        log_event("WARN", f"{key[0]} could not read this source {WORKER_JOB_EXCLUDE_AFTER} times; "
+                          f"not giving it to that machine for {WORKER_JOB_EXCLUDE_SEC // 3600} h "
+                          "so another worker can take it.", job_id)
+
+def _jobs_excluded_for(worker_id, limit=300):
+    """Job ids this worker's machine should not be given right now."""
+    if not worker_id:
+        return []
+    machine = _machine_of(worker_id)
+    now = time.time()
+    with _WJ_LOCK:
+        for k in [k for k, t in _WJ_EXCLUDED.items() if t <= now]:
+            _WJ_EXCLUDED.pop(k, None)
+        return [j for (mch, j) in _WJ_EXCLUDED if mch == machine][:limit]
+
 def _register_chunk_failure(job_id, kind, chunk_index, worker_id, reason):
     """A worker reported a chunk failure (or its upload failed verification)."""
     with db_lock:
@@ -1410,7 +1469,9 @@ def _register_chunk_failure(job_id, kind, chunk_index, worker_id, reason):
                           "last_updated=? WHERE job_id=? AND kind=? AND chunk_index=?",
                           (datetime.now(), job_id, kind, chunk_index))
                 conn.commit()
-                _note_source_failure()
+                if not _is_local_source_failure(reason):
+                    _note_source_failure()
+                _note_worker_job_source_failure(worker_id, job_id)
                 log_event("WARN", f"Chunk {kind}#{chunk_index} returned unpenalised "
                                   f"(source unreadable): {reason}", job_id)
                 return
@@ -1473,7 +1534,7 @@ def _wholefile_share_available(folder_filter, max_size_mb):
     except Exception:
         return False
 
-def _claim_job_for_split(folder_filter, max_size_mb):
+def _claim_job_for_split(folder_filter, max_size_mb, worker_id=None):
     """Pick the next queued, chunk-eligible job and mark it as being split.
     Returns the job row dict or None. Runs entirely under db_lock."""
     with db_lock:
@@ -1482,6 +1543,10 @@ def _claim_job_for_split(folder_filter, max_size_mb):
         try:
             params = []
             query_parts = ["status='queued'", "COALESCE(fail_count,0) < 5", "COALESCE(chunkable,1)=1"]
+            _excl = _jobs_excluded_for(worker_id)
+            if _excl:
+                query_parts.append(f"id NOT IN ({','.join('?' * len(_excl))})")
+                params.extend(_excl)
             if max_size_mb and str(max_size_mb).isdigit():
                 query_parts.append("file_size <= ?")
                 params.append(int(max_size_mb) * 1024 * 1024)
@@ -1691,6 +1756,10 @@ def _assign_pending_chunk(worker_id, folder_filter, max_size_mb, video_only=Fals
             if folder_filter:
                 query_parts.append("j.id LIKE ?")
                 params.append(f"{folder_filter}%")
+            _excl = _jobs_excluded_for(worker_id)
+            if _excl:
+                query_parts.append(f"j.id NOT IN ({','.join('?' * len(_excl))})")
+                params.extend(_excl)
             if max_size_mb and str(max_size_mb).isdigit():
                 # Estimate the bytes this chunk will stream (audio reads the whole file)
                 query_parts.append("(CASE WHEN c.kind='audio' THEN j.file_size "
@@ -3528,6 +3597,10 @@ def get_job():
 
                         params = [source_type]
                         query_parts = ["status='queued'", "source_type=?", "COALESCE(fail_count,0) < 5"]
+                        _excl = _jobs_excluded_for(worker_id)
+                        if _excl:
+                            query_parts.append(f"id NOT IN ({','.join('?' * len(_excl))})")
+                            params.extend(_excl)
                         
                         if max_size_mb and max_size_mb.isdigit():
                             query_parts.append("file_size <= ?")
@@ -3646,7 +3719,7 @@ def get_chunk():
                 # An unsplittable candidate is requeued with chunkable=0 and gets
                 # picked up whole via /get_job instead.
                 try:
-                    job = _claim_job_for_split(folder_filter, max_size_mb)
+                    job = _claim_job_for_split(folder_filter, max_size_mb, worker_id)
                     if job is not None and _split_claimed_job(job):
                         chunk = _assign_pending_chunk(worker_id, folder_filter, max_size_mb, video_only=video_only,
                                                       max_chunk_sec=max_chunk_sec, worker_version=worker_version)
@@ -4254,7 +4327,8 @@ def receive_error_report():
 # whether the source host, the worker's network, or the worker's FFmpeg is at
 # fault. Read-only: nothing here changes jobs, chunks or the outage breaker.
 # ------------------------------------------------------------------------------
-_SOURCE_READ_MARKERS = ("could not read the source", "truncated output", "source stream interrupted")
+_SOURCE_READ_MARKERS = ("could not read the source", "could not read the local source file",
+                        "truncated output", "source stream interrupted")
 MANAGER_PROBE_SECONDS = 6.0
 MANAGER_PROBE_MAX_BYTES = 8 * 1024 * 1024
 _MANAGER_PROBE_SEM = threading.BoundedSemaphore(2)
@@ -4373,8 +4447,13 @@ def _source_verdict(diag):
                         f"file either ({mp.get('error')}), so the source host was likely down.")
     tls = (diag.get('ffmpeg') or {}).get('tls', '?')
     if diag.get('source') == 'local file':
-        return ("local", "The worker was reading a file on its own disk, so the network is not involved; "
-                         "check that disk and the file.")
+        where = ""
+        if diag.get('phase') == 'encoding' and diag.get('pos_s'):
+            p = float(diag.get('pos_s') or 0)
+            where = f" (it stopped at {int(p // 3600)}:{int(p % 3600 // 60):02d}:{int(p % 60):02d})"
+        return ("local", f"The worker was reading its own copy of the file{where}, so the network is not "
+                         "involved: that copy is probably damaged or incomplete. Compare it with the server's "
+                         "copy; after two such failures the job goes to other workers.")
     if st is None:
         return ("no_data", "The worker sent no download test.")
     if mp is None:
@@ -4430,9 +4509,7 @@ def api_error_reports():
 
 def _worker_base(worker_id):
     """'name-Box-3' -> 'name-Box': one machine's job slots counted together."""
-    w = str(worker_id or '')
-    head, _, tail = w.rpartition('-')
-    return head if head and tail.isdigit() else w
+    return _machine_of(worker_id)
 
 @app.route('/api/source_health')
 @requires_auth
@@ -4645,6 +4722,7 @@ def report_status():
         log_event("WARN", f"Worker {worker_id} (v{worker_version}) reported failure: {err_msg}", d.get('job_id'))
 
     _source_unreadable = False
+    _src_fail_job = None
     with db_lock:
         conn = db_handler.get_connection()
         try:
@@ -4677,7 +4755,10 @@ def report_status():
                              "started_at=NULL, last_updated=? "
                              "WHERE id=? AND COALESCE(chunked, 0)=0 AND worker_id=? AND status='failed'",
                              (datetime.now(), job_id_val, worker_id))
-                _source_unreadable = _is_source_failure(_fail_reason)
+                _source_unreadable = (_is_source_failure(_fail_reason)
+                                      and not _is_local_source_failure(_fail_reason))
+                if _is_source_failure(_fail_reason):
+                    _src_fail_job = (worker_id, job_id_val)
             elif status == 'failed':
                 # Only count the failure if this worker actually owned the job
                 # (the UPDATE above changed the row). Re-read to confirm.
@@ -4690,6 +4771,8 @@ def report_status():
             conn.close()
     if _source_unreadable:
         _note_source_failure()
+    if _src_fail_job:
+        _note_worker_job_source_failure(*_src_fail_job)
     return jsonify({"status": "received"})
 
 @app.route('/api/stats')
