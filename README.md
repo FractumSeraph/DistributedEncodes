@@ -40,9 +40,12 @@ Encoded output is intended for [https://vsv.fractumseraph.net/](https://vsv.frac
 | `--max-size-mb N` | `0` (no limit) | Skip source files larger than N MB |
 | `--local-source DIR` | *(none)* | Read source files directly from disk instead of HTTP — useful when the worker runs on the same machine as the manager |
 | `--no-chunks` | off | Opt out of chunked encoding — always take whole files |
+| `--ffmpeg PATH` | *(worker's own build)* | Use this FFmpeg instead of the worker's own build (see below); `ffprobe` is taken from the same folder |
 | `--wallet ADDR` | *(none)* | FractumCoin wallet address — verified uploads are credited to it for later payout (saved to `worker_config.json`) |
 
 The `WORKER_SECRET` environment variable is the preferred way to pass the auth token.
+
+**Which FFmpeg the worker uses.** On Windows and Linux (x64 and arm64) the worker downloads and uses its own copy of the newest FFmpeg *release* build (BtbN, about 130 MB), even when another FFmpeg is installed. Builds found on a machine vary (development snapshots, old distro packages, different HTTPS libraries), and one such build hung on every source it opened while the same machine downloaded the files without trouble. The worker keeps its copy current: when a newer FFmpeg release branch appears it switches to it at the next start. An FFmpeg found on the machine is used only if the download fails. To choose a specific build deliberately, pass `--ffmpeg PATH`; it must have `libsvtav1` and `libopus` and be FFmpeg 7.1 or newer. macOS has no such build, so there the worker uses the installed FFmpeg (for example from Homebrew).
 
 ---
 
@@ -102,7 +105,7 @@ Open **PowerShell** (no admin needed) and paste:
 irm https://encode.fractumseraph.net/install/windows | iex
 ```
 
-The script asks for a username and a worker name (press Enter to use the computer's name), installs Python 3.11 per-user if it is missing, downloads the worker into `%USERPROFILE%\FractumWorker`, and starts it. FFmpeg (~40 MB portable build) and the TUI library are fetched automatically on first run.
+The script asks for a username and a worker name (press Enter to use the computer's name), installs Python 3.11 per-user if it is missing, downloads the worker into `%USERPROFILE%\FractumWorker`, and starts it. The worker's own FFmpeg build (~130 MB) and the TUI library are fetched automatically on first run.
 
 - Re-run the same line any time to update and restart the worker — the identity saved in `worker_config.json` is reused, so it only asks once.
 - Append `?jobs=2` or `?series_id=X` (combine with `&`) to the URL to run more parallel jobs or focus on one series.
@@ -127,7 +130,7 @@ The script asks for a username and a worker name (press Enter to use the compute
    python worker.py --manager "https://encode.fractumseraph.net/" --username "MyName" --workername "MyPC" --jobs 1
    ```
 
-   > FFmpeg is downloaded automatically (~40 MB portable build) if it is not found on the system.
+   > The worker downloads its own FFmpeg build (~130 MB) on first run, even if another FFmpeg is installed (see "Which FFmpeg the worker uses" above).
 
 </details>
 

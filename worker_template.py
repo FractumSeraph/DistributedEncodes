@@ -138,7 +138,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.12.0"
+WORKER_VERSION = "3.13.0"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -2264,23 +2264,120 @@ def ffmpeg_meets_min_version(cmd):
     except Exception:
         return True
 
-def check_ffmpeg():
+def has_libopus(cmd):
+    """True when the given ffmpeg can encode Opus audio (libopus)."""
+    try:
+        res = subprocess.run([cmd, "-hide_banner", "-encoders"], stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, encoding='utf-8', errors='replace', timeout=15)
+        return "libopus" in res.stdout
+    except Exception:
+        return False
+
+def ffmpeg_is_capable(cmd):
+    """Everything the encodes need: SVT-AV1, Opus, and FFmpeg 7.1 or newer."""
+    return has_svtav1(cmd) and has_libopus(cmd) and ffmpeg_meets_min_version(cmd)
+
+def _sibling_ffprobe(ffmpeg_path):
+    """The ffprobe next to a given ffmpeg, or plain 'ffprobe' from the PATH."""
+    d = os.path.dirname(os.path.abspath(ffmpeg_path)) if os.path.dirname(ffmpeg_path) else ''
+    if d:
+        for name in ("ffprobe.exe", "ffprobe"):
+            p = os.path.join(d, name)
+            if os.path.exists(p):
+                return p
+    return "ffprobe"
+
+def _local_ffmpeg_is_managed(local_ffmpeg):
+    """True when the ffmpeg in the worker folder is one this worker downloaded
+    (a download records its source in the meta file); False for a binary
+    someone copied there by hand."""
+    if not os.path.exists(local_ffmpeg) or not os.path.exists(_FFMPEG_META_FILE):
+        return False
+    try:
+        with open(_FFMPEG_META_FILE) as f:
+            if not json.load(f).get('url'):
+                return False
+        # And it must still BE a release build of the kind we download
+        # ("ffmpeg version n8.1.2-57-g…"): a binary swapped in by hand after
+        # an earlier download keeps the meta file but not this signature.
+        out = subprocess.run([local_ffmpeg, "-version"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             encoding='utf-8', errors='replace', timeout=15).stdout or ''
+        return bool(re.match(r'ffmpeg version n\d+\.\d+', out))
+    except Exception:
+        return False
+
+def check_ffmpeg(override=None):
+    """Pick the FFmpeg to use. Returns True when it is the worker's own managed
+    build (which update_ffmpeg_if_stale() then keeps current).
+
+    Policy: on Windows and Linux (x64 and arm64) the worker uses its OWN copy of
+    the newest FFmpeg *release* build (BtbN), not whatever it happens to find.
+    Builds found on the machine vary widely - development snapshots, old distro
+    packages, builds with a different TLS stack - and one of those hung on
+    every source open on a volunteer's machine while its own downloads worked.
+    A build found on the machine is only used when the download fails. Use
+    --ffmpeg PATH to choose a specific binary deliberately. Other platforms
+    (macOS) have no managed build and use the one installed (e.g. Homebrew)."""
     global FFMPEG_CMD, FFPROBE_CMD
 
     local_ffmpeg = os.path.abspath("ffmpeg.exe" if platform.system() == "Windows" else "./ffmpeg")
     local_ffprobe = os.path.abspath("ffprobe.exe" if platform.system() == "Windows" else "./ffprobe")
 
-    if os.path.exists(local_ffmpeg) and has_svtav1(local_ffmpeg) and ffmpeg_meets_min_version(local_ffmpeg):
+    if override:
+        cmd = override if (os.path.dirname(override) or os.path.exists(override)) else (shutil.which(override) or override)
+        if not (shutil.which(cmd) or os.path.exists(cmd)):
+            print(f"[CRITICAL ERROR] --ffmpeg {override}: file not found.")
+            sys.exit(1)
+        if not ffmpeg_is_capable(cmd):
+            print(f"[CRITICAL ERROR] --ffmpeg {override} cannot be used: it needs libsvtav1, libopus "
+                  "and FFmpeg 7.1 or newer.")
+            sys.exit(1)
+        FFMPEG_CMD = os.path.abspath(cmd) if os.path.exists(cmd) else cmd
+        FFPROBE_CMD = _sibling_ffprobe(FFMPEG_CMD)
+        print(f"[*] Using the FFmpeg chosen with --ffmpeg: {FFMPEG_CMD}")
+        return False
+
+    managed_platform = _ffmpeg_platform_tag()[0] is not None
+    if managed_platform:
+        if _local_ffmpeg_is_managed(local_ffmpeg) and ffmpeg_is_capable(local_ffmpeg):
+            FFMPEG_CMD = local_ffmpeg
+            if os.path.exists(local_ffprobe): FFPROBE_CMD = local_ffprobe
+            return True
+        found = local_ffmpeg if os.path.exists(local_ffmpeg) else (shutil.which("ffmpeg") or None)
+        if found:
+            print(f"[*] Found an FFmpeg at {found}; downloading the worker's own build (newest FFmpeg "
+                  "release) instead, so every worker encodes with a known-good version.")
+            print("    To keep using that one, start the worker with --ffmpeg PATH.")
+        ok = download_ffmpeg_windows() if platform.system() == "Windows" else download_ffmpeg_linux()
+        if ok and os.path.exists(local_ffmpeg) and ffmpeg_is_capable(local_ffmpeg):
+            FFMPEG_CMD = local_ffmpeg
+            if os.path.exists(local_ffprobe): FFPROBE_CMD = local_ffprobe
+            return True
+        print("[!] Could not download the worker's own FFmpeg build; looking for one on this machine.")
+        if os.path.exists(local_ffmpeg) and ffmpeg_is_capable(local_ffmpeg):
+            FFMPEG_CMD = local_ffmpeg
+            if os.path.exists(local_ffprobe): FFPROBE_CMD = local_ffprobe
+            return False
+        if shutil.which("ffmpeg") and ffmpeg_is_capable("ffmpeg"):
+            FFMPEG_CMD = "ffmpeg"
+            FFPROBE_CMD = "ffprobe"
+            return False
+        print("\n[CRITICAL ERROR] Could not find or download FFmpeg 7.1+ with libsvtav1 and libopus.")
+        print("Please install FFmpeg 7.1 or newer with SVT-AV1 support manually, or pass --ffmpeg PATH.")
+        sys.exit(1)
+
+    # No managed build for this platform: use what is installed.
+    if os.path.exists(local_ffmpeg) and ffmpeg_is_capable(local_ffmpeg):
         FFMPEG_CMD = local_ffmpeg
         if os.path.exists(local_ffprobe): FFPROBE_CMD = local_ffprobe
-        return
+        return False
 
-    if shutil.which("ffmpeg") and has_svtav1("ffmpeg") and ffmpeg_meets_min_version("ffmpeg"):
+    if shutil.which("ffmpeg") and ffmpeg_is_capable("ffmpeg"):
         FFMPEG_CMD = "ffmpeg"
         FFPROBE_CMD = "ffprobe"
-        return
+        return False
 
-    print("[!] No FFmpeg found with libsvtav1 support at version 7.1 or newer.")
+    print("[!] No FFmpeg found with libsvtav1 and libopus support at version 7.1 or newer.")
 
     download_success = False
     if platform.system() == "Windows":
@@ -4155,8 +4252,8 @@ def run_worker(args):
         except:
             print("[!] Failed to save wallet to configuration file.")
 
-    check_ffmpeg()
-    update_ffmpeg_if_stale()
+    if check_ffmpeg(getattr(args, 'ffmpeg', None)):
+        update_ffmpeg_if_stale()
 
     manager_url = (args.manager or DEFAULT_MANAGER_URL).rstrip('/')
     username = args.username or DEFAULT_USERNAME
@@ -4438,6 +4535,11 @@ if __name__ == "__main__":
     parser.add_argument("--no-tui", action="store_true", default=False, help="Disable Textual TUI and use plain terminal output")
     parser.add_argument("--force-tui", action="store_true", default=False, help="Force Textual TUI even in SSH/tmux environments (may have input issues)")
     parser.add_argument("--max-size-mb", type=int, default=0, help="Skip source files larger than this size in MB (0 = no limit)")
+    parser.add_argument("--ffmpeg", default=None, metavar="PATH",
+                        help="Use this FFmpeg binary instead of the worker's own build (the newest "
+                             "FFmpeg release, downloaded automatically on Windows and Linux). ffprobe "
+                             "is taken from the same folder. It must have libsvtav1 and libopus and "
+                             "be FFmpeg 7.1 or newer.")
     parser.add_argument("--local-source", default=None, metavar="DIR",
                         help="Path to the source media directory on this machine. When set and the "
                              "source file exists locally, it is read directly instead of streaming "
