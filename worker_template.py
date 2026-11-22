@@ -138,7 +138,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.13.1"
+WORKER_VERSION = "3.14.0"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -1933,38 +1933,98 @@ def _compute_source_hash(dl_url, is_local):
 # FFMPEG MANAGEMENT
 # ==============================================================================
 
-# FFmpeg auto-download policy: BtbN RELEASE-branch builds only ("nX.Y-latest"),
-# NEVER "master-latest" — master is a daily dev snapshot, and nodes running it
-# hit real regressions in production (an mp4 muxer assertion abort mid-encode,
-# and fragmented-mp4 output the manager's ffprobe read as 0-duration).
-# BtbN rotates WHICH release branches its 'latest' tag carries (n7.1 aged out
-# and started 404ing), so the exact version is DISCOVERED from the release's
-# asset list at download time — newest release branch wins — with the versions
-# below as hardcoded fallbacks when discovery is unavailable.
-# (arm64 uses BtbN too: the johnvansickle static builds have no libsvtav1.)
-_FFMPEG_FALLBACK_VERSIONS = ("9.0", "8.1")  # newest first; refresh occasionally
+# Which FFmpeg the worker uses (README: "Which FFmpeg the worker uses").
+#
+# On Windows and Linux, x64 and arm64, the worker keeps its OWN copy of the
+# newest FFmpeg RELEASE build from BtbN ("nX.Y-latest"), never "master-latest":
+# master is a daily development snapshot, and nodes running snapshots hit real
+# regressions (an mp4 muxer abort mid-encode, fragmented mp4 read back as
+# 0-duration, and a build that hung on every HTTPS source it opened).
+#
+# - The newest release branch is found from BtbN's asset list; when that list
+#   cannot be read (GitHub API rate limit, blocked page), newer branches are
+#   found by asking whether the next version numbers exist.
+# - A build is only used after a short test encode with libsvtav1 and libopus
+#   on THIS machine: a build that cannot run here (CPU, OS, missing encoder) is
+#   discarded and the next newest is tried; the build in use is kept until a
+#   replacement has passed.
+# - Each build lives in its own folder under ffmpeg_builds/. Switching only
+#   changes which binary NEW encodes start, so encodes already running finish
+#   on the build they started with and no file in use is ever replaced.
+# - Checked at start and then every FFMPEG_BRANCH_CHECK_SEC while running; a
+#   rebuild of the same release branch is picked up at most every
+#   FFMPEG_REFRESH_SEC (each download is 100-200 MB).
+_FFMPEG_FALLBACK_VERSIONS = ("9.0", "8.1")  # newest first; used only when discovery fails
 _FFMPEG_DL_BASE = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/"
+_FFMPEG_MIRROR = "https://vsv.fractumseraph.net/"   # Windows fallback when GitHub is unreachable
+_FFMPEG_BUILDS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ffmpeg_builds')
+FFMPEG_BRANCH_CHECK_SEC = 24 * 3600
+FFMPEG_REFRESH_SEC = 7 * 24 * 3600
+_FFMPEG_MGMT_LOCK = threading.Lock()
+_FFMPEG_MANAGED = False      # True while the worker's own build is in use
+
+def _windows_native_arch():
+    """'x64', 'arm64' or 'x86' for the Windows MACHINE (not this Python: an
+    x64 Python on an ARM64 PC runs emulated and reports AMD64)."""
+    try:
+        from ctypes import wintypes
+        k = ctypes.windll.kernel32
+        fn = getattr(k, 'IsWow64Process2', None)
+        if fn is not None:
+            k.GetCurrentProcess.restype = wintypes.HANDLE
+            pm, nm = ctypes.c_ushort(0), ctypes.c_ushort(0)
+            if fn(k.GetCurrentProcess(), ctypes.byref(pm), ctypes.byref(nm)):
+                return {0xAA64: 'arm64', 0x8664: 'x64', 0x014C: 'x86'}.get(nm.value)
+    except Exception:
+        pass
+    m = (os.environ.get('PROCESSOR_ARCHITEW6432') or os.environ.get('PROCESSOR_ARCHITECTURE')
+         or platform.machine() or '').lower()
+    if 'arm64' in m or 'aarch64' in m:
+        return 'arm64'
+    return 'x64' if m in ('amd64', 'x86_64') else (m or None)
 
 def _ffmpeg_platform_tag():
-    """(platform_tag, archive_ext) for BtbN asset names, or (None, None)."""
-    if platform.system() == "Windows":
-        return "win64", "zip"
-    arch = platform.machine().lower()
-    if arch in ['x86_64', 'amd64']:
-        return "linux64", "tar.xz"
-    if arch in ['aarch64', 'arm64']:
-        return "linuxarm64", "tar.xz"
+    """(platform_tag, archive_ext) for BtbN asset names, or (None, None) when
+    BtbN has no build for this OS/CPU (macOS, 32-bit, other architectures)."""
+    system = platform.system()
+    if system == "Windows":
+        arch = _windows_native_arch()
+        if arch == 'arm64': return "winarm64", "zip"
+        if arch == 'x64':   return "win64", "zip"
+        return None, None
+    if system == "Linux":
+        arch = platform.machine().lower()
+        if arch in ('x86_64', 'amd64'):  return "linux64", "tar.xz"
+        if arch in ('aarch64', 'arm64'): return "linuxarm64", "tar.xz"
     return None, None
 
-def _discover_ffmpeg_release_url():
-    """Find the newest RELEASE-branch build in BtbN's 'latest' release.
-    Tries the GitHub API first, then the assets HTML (no API rate limit).
-    Returns a download URL or None; never returns a master-latest build."""
+def _vt(version):
+    """'9.0' -> (9, 0) for comparisons."""
+    try:
+        a, b = str(version).split('.')[:2]
+        return (int(a), int(b))
+    except Exception:
+        return (0, 0)
+
+def _ffmpeg_asset_name(version):
+    plat, ext = _ffmpeg_platform_tag()
+    return f"ffmpeg-n{version}-latest-{plat}-gpl-{version}.{ext}"
+
+def _ffmpeg_asset_exists(version):
+    try:
+        r = requests.head(_FFMPEG_DL_BASE + _ffmpeg_asset_name(version), allow_redirects=True, timeout=20,
+                          headers={'User-Agent': f'FractumWorker/{WORKER_VERSION}'})
+        return r.status_code == 200
+    except Exception:
+        return False
+
+def _ffmpeg_release_versions():
+    """Release branches BtbN publishes for this platform, newest first ('9.0')."""
     plat, ext = _ffmpeg_platform_tag()
     if not plat:
-        return None
-    names = []
+        return []
     hdrs = {'User-Agent': f'FractumWorker/{WORKER_VERSION}'}
+    names = []
     try:
         r = requests.get("https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest",
                          headers=dict(hdrs, Accept='application/vnd.github+json'), timeout=20)
@@ -1980,255 +2040,327 @@ def _discover_ffmpeg_release_url():
                 names = re.findall(r'ffmpeg-n[\d.]+-latest-[a-z0-9]+-gpl-[\d.]+\.(?:zip|tar\.xz)', r.text)
         except Exception:
             pass
-    best = None  # (major, minor, asset_name)
     pat = re.compile(rf'^ffmpeg-n(\d+)\.(\d+)-latest-{plat}-gpl-(\d+)\.(\d+)\.{re.escape(ext)}$')
+    found = set()
     for n in set(names):
         m = pat.match(n)
         if m and m.group(1) == m.group(3) and m.group(2) == m.group(4):
-            ver = (int(m.group(1)), int(m.group(2)))
-            if best is None or ver > best[:2]:
-                best = (ver[0], ver[1], n)
-    return _FFMPEG_DL_BASE + best[2] if best else None
+            found.add(f"{m.group(1)}.{m.group(2)}")
+    listed = bool(found)
+    # Look past the newest known branch: the next minor and the next major.
+    # This is what finds a new release when the list could not be read.
+    newest = max((_vt(v) for v in (found or _FFMPEG_FALLBACK_VERSIONS)), default=(0, 0))
+    for _ in range(4):
+        step = None
+        for cand in ((newest[0], newest[1] + 1), (newest[0] + 1, 0)):
+            v = f"{cand[0]}.{cand[1]}"
+            if v not in found and _ffmpeg_asset_exists(v):
+                found.add(v); step = cand
+                break
+        if step is None:
+            break
+        newest = step
+    if not listed:
+        found.update(_FFMPEG_FALLBACK_VERSIONS)
+    return sorted(found, key=_vt, reverse=True)
 
-def _ffmpeg_candidate_urls():
-    """Download URLs to try, best first: the discovered newest release build,
-    then hardcoded fallback versions for when discovery is unreachable."""
+def _ffmpeg_selftest(ffmpeg, ffprobe):
+    """(ok, reason): can this build do our encodes ON THIS MACHINE? Checks the
+    encoders and version, then encodes one second with libsvtav1 + libopus and
+    reads the result back with the matching ffprobe."""
+    if not ffmpeg_is_capable(ffmpeg):
+        return False, "missing libsvtav1 or libopus, or older than FFmpeg 7.1"
+    os.makedirs(_FFMPEG_BUILDS_DIR, exist_ok=True)
+    tmp = os.path.join(_FFMPEG_BUILDS_DIR, f"selftest_{os.getpid()}_{threading.get_ident()}.mkv")
+    try:
+        res = subprocess.run([ffmpeg, '-hide_banner', '-nostdin', '-v', 'error', '-y',
+                              '-f', 'lavfi', '-i', 'testsrc2=size=320x240:rate=24',
+                              '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000',
+                              '-t', '1', '-map', '0:v', '-map', '1:a',
+                              '-c:v', 'libsvtav1', '-preset', '12', '-crf', '50', '-pix_fmt', 'yuv420p',
+                              '-c:a', 'libopus', '-b:a', '24k', '-ac', '1', '-f', 'matroska', tmp],
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, encoding='utf-8',
+                             errors='replace', timeout=180)
+        if res.returncode != 0 or not os.path.exists(tmp) or os.path.getsize(tmp) == 0:
+            return False, f"test encode failed (rc={res.returncode}): {(res.stdout or '').strip()[-200:]}"
+        pr = subprocess.run([ffprobe, '-v', 'error', '-show_entries', 'stream=codec_name',
+                             '-of', 'csv=p=0', tmp], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            encoding='utf-8', errors='replace', timeout=60)
+        codecs = set((pr.stdout or '').split())
+        if pr.returncode != 0 or not {'av1', 'opus'} <= codecs:
+            return False, f"ffprobe could not read the test encode back ({' '.join(sorted(codecs)) or pr.returncode})"
+        return True, ""
+    except Exception as e:
+        return False, f"{type(e).__name__}: {str(e)[:200]}"
+    finally:
+        try:
+            if os.path.exists(tmp): os.remove(tmp)
+        except OSError:
+            pass
+
+def _extract_ffmpeg_binaries(archive, dest):
+    """Copy just ffmpeg and ffprobe out of a BtbN archive into dest."""
+    os.makedirs(dest, exist_ok=True)
+    exe = ".exe" if archive.endswith('.zip') else ""
+    want = {f"ffmpeg{exe}", f"ffprobe{exe}"}
+    got = set()
+    if archive.endswith('.zip'):
+        with zipfile.ZipFile(archive) as z:
+            for n in z.namelist():
+                base = n.rsplit('/', 1)[-1]
+                if base in want and '/bin/' in f"/{n}":
+                    with z.open(n) as src, open(os.path.join(dest, base), 'wb') as out:
+                        shutil.copyfileobj(src, out)
+                    got.add(base)
+    else:
+        with tarfile.open(archive, 'r:xz') as t:
+            for m in t.getmembers():
+                base = m.name.rsplit('/', 1)[-1]
+                if m.isfile() and base in want and '/bin/' in f"/{m.name}":
+                    src = t.extractfile(m)
+                    with open(os.path.join(dest, base), 'wb') as out:
+                        shutil.copyfileobj(src, out)
+                    os.chmod(os.path.join(dest, base), 0o755)
+                    got.add(base)
+    return got == want
+
+def _install_ffmpeg_build(version):
+    """Download one release build into its own folder and test it here.
+    Returns its state dict, or None (nothing is left behind on failure)."""
     plat, ext = _ffmpeg_platform_tag()
     if not plat:
-        return []
-    urls = []
-    discovered = _discover_ffmpeg_release_url()
-    if discovered:
-        urls.append(discovered)
-    for v in _FFMPEG_FALLBACK_VERSIONS:
-        u = f"{_FFMPEG_DL_BASE}ffmpeg-n{v}-latest-{plat}-gpl-{v}.{ext}"
-        if u not in urls:
-            urls.append(u)
-    return urls
+        return None
+    name = _ffmpeg_asset_name(version)
+    urls = [_FFMPEG_DL_BASE + name]
+    if platform.system() == "Windows":
+        urls.append(_FFMPEG_MIRROR + name)
+    os.makedirs(_FFMPEG_BUILDS_DIR, exist_ok=True)
+    dest = os.path.join(_FFMPEG_BUILDS_DIR, f"n{version}-{time.strftime('%Y%m%d-%H%M%S')}")
+    archive = dest + ".download"
+    exe = ".exe" if platform.system() == "Windows" else ""
+    for url in urls:
+        try:
+            print(f"[*] Downloading FFmpeg {version} ({plat}): {url}")
+            with requests.get(url, stream=True, allow_redirects=True, timeout=180,
+                              headers={'User-Agent': f'FractumWorker/{WORKER_VERSION}'}) as r:
+                r.raise_for_status()
+                etag, lm = r.headers.get('ETag', ''), r.headers.get('Last-Modified', '')
+                total = int(r.headers.get('content-length', 0)); done = 0
+                with open(archive, 'wb') as f:
+                    for blk in r.iter_content(chunk_size=1 << 20):
+                        f.write(blk); done += len(blk)
+                        if total > 0:
+                            _download_progress(int(done * 100 / total))
+            print("\n[*] Extracting FFmpeg...")
+            if not _extract_ffmpeg_binaries(archive, dest):
+                raise RuntimeError("ffmpeg/ffprobe not found in the archive")
+        except Exception as e:
+            print(f"\n[!] FFmpeg download failed: {e}")
+            shutil.rmtree(dest, ignore_errors=True)
+            continue
+        finally:
+            try:
+                if os.path.exists(archive): os.remove(archive)
+            except OSError:
+                pass
+        ff, fp = os.path.join(dest, f"ffmpeg{exe}"), os.path.join(dest, f"ffprobe{exe}")
+        print(f"[*] Testing FFmpeg {version} on this machine...")
+        ok, why = _ffmpeg_selftest(ff, fp)
+        if not ok:
+            print(f"[!] FFmpeg {version} does not work on this machine ({why}); not using it.")
+            shutil.rmtree(dest, ignore_errors=True)
+            return None
+        return {"managed": 2, "version": version, "url": url, "dir": dest, "ffmpeg": ff, "ffprobe": fp,
+                "etag": etag, "last_modified": lm, "installed_at": time.time()}
+    return None
 
-def _ffmpeg_primary_url():
-    """The URL the staleness checker tracks — best available candidate."""
-    urls = _ffmpeg_candidate_urls()
-    return urls[0] if urls else None
-
-def _save_ffmpeg_meta(url):
-    """Store the ETag/Last-Modified of url so we can detect upstream updates."""
+def _load_ffmpeg_state():
     try:
-        r = requests.head(url, allow_redirects=True, timeout=15)
-        meta = {
-            "url":           url,
-            "etag":          r.headers.get('ETag', ''),
-            "last_modified": r.headers.get('Last-Modified', ''),
-        }
-        with open(_FFMPEG_META_FILE, 'w') as f:
-            json.dump(meta, f)
+        with open(_FFMPEG_META_FILE) as f:
+            st = json.load(f)
+        return st if isinstance(st, dict) else {}
+    except Exception:
+        return {}
+
+def _save_ffmpeg_state(st):
+    try:
+        tmp = _FFMPEG_META_FILE + ".tmp"
+        with open(tmp, 'w') as f:
+            json.dump(st, f)
+        os.replace(tmp, _FFMPEG_META_FILE)
     except Exception:
         pass
 
-def update_ffmpeg_if_stale():
-    """Re-download the local ffmpeg binary if the upstream build is newer.
+def _use_ffmpeg_build(st):
+    """Point NEW encodes at this build. Running ones keep the binary they started."""
+    global FFMPEG_CMD, FFPROBE_CMD, _FFMPEG_BUILD_INFO, _FFMPEG_MANAGED
+    FFMPEG_CMD = st["ffmpeg"]
+    FFPROBE_CMD = st["ffprobe"] if os.path.exists(st.get("ffprobe") or '') else _sibling_ffprobe(st["ffmpeg"])
+    _FFMPEG_BUILD_INFO = None
+    _FFMPEG_MANAGED = True
 
-    Uses a HEAD request to compare the ETag/Last-Modified stored after the
-    last download.  A full download (~100-200 MB) only happens when the
-    upstream file has actually changed.
-    """
-    global FFMPEG_CMD, FFPROBE_CMD
-    local_bin = os.path.abspath("ffmpeg.exe" if platform.system() == "Windows" else "./ffmpeg")
-    if not os.path.exists(local_bin):
-        return  # nothing local to update; check_ffmpeg() handles first install
-
-    url = _ffmpeg_primary_url()
-    if url is None:
-        return
-
-    # Load stored meta
-    stored_etag = stored_lm = ""
-    if os.path.exists(_FFMPEG_META_FILE):
+def _current_managed_build():
+    """The worker's own build recorded in the state file, if it still exists and
+    is still a release build. Adopts the single-binary layout used before
+    worker 3.14.0 (./ffmpeg plus a record of its download URL)."""
+    st = _load_ffmpeg_state()
+    if st.get("managed") == 2:
+        ff = st.get("ffmpeg") or ''
+        return st if os.path.exists(ff) and _is_release_build(ff) else None
+    legacy = os.path.abspath("ffmpeg.exe" if platform.system() == "Windows" else "./ffmpeg")
+    m = re.search(r'ffmpeg-n(\d+\.\d+)-latest-', st.get("url") or '')
+    if m and os.path.exists(legacy) and _is_release_build(legacy):
+        lp = os.path.abspath("ffprobe.exe" if platform.system() == "Windows" else "./ffprobe")
         try:
-            with open(_FFMPEG_META_FILE) as f:
-                m = json.load(f)
-            if m.get('url') == url:
-                stored_etag = m.get('etag', '')
-                stored_lm   = m.get('last_modified', '')
-            elif m.get('url'):
-                # The download channel changed (e.g. master-latest -> pinned
-                # n7.1 release): the local binary came from the WRONG channel,
-                # so replace it now instead of silently keeping it forever.
-                print("[*] FFmpeg download channel changed — fetching the pinned build...")
-                ok = download_ffmpeg_windows() if platform.system() == "Windows" else download_ffmpeg_linux()
-                if ok:
-                    _save_ffmpeg_meta(url)
-                    _lp = os.path.abspath("ffprobe.exe" if platform.system() == "Windows" else "./ffprobe")
-                    FFMPEG_CMD = local_bin
-                    if os.path.exists(_lp): FFPROBE_CMD = _lp
-                    print("[*] FFmpeg updated successfully.")
-                return
-        except Exception:
-            pass
+            installed = os.path.getmtime(legacy)
+        except OSError:
+            installed = 0
+        return {"managed": 2, "version": m.group(1), "url": st.get("url"), "dir": None,
+                "ffmpeg": legacy, "ffprobe": lp, "etag": st.get("etag", ""),
+                "last_modified": st.get("last_modified", ""), "installed_at": installed,
+                "legacy": True}
+    return None
 
-    # HEAD request to check remote freshness
+def _is_release_build(ffmpeg):
+    """True for a BtbN-style release build ("ffmpeg version n9.0.2-61-g...")."""
     try:
-        r = requests.head(url, allow_redirects=True, timeout=15)
-        remote_etag = r.headers.get('ETag', '')
-        remote_lm   = r.headers.get('Last-Modified', '')
+        out = subprocess.run([ffmpeg, "-version"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             encoding='utf-8', errors='replace', timeout=15).stdout or ''
+        return bool(re.match(r'ffmpeg version n\d+\.\d+', out))
     except Exception:
-        return  # network unavailable — skip silently
-
-    # If we have nothing stored yet, just save and return (no spurious download)
-    if not stored_etag and not stored_lm:
-        _save_ffmpeg_meta(url)
-        return
-
-    changed = False
-    if remote_etag  and remote_etag  != stored_etag:  changed = True
-    if remote_lm    and remote_lm    != stored_lm:    changed = True
-
-    if not changed:
-        return
-
-    print("[*] Newer FFmpeg build detected upstream — updating...")
-    if platform.system() == "Windows":
-        ok = download_ffmpeg_windows()
-    else:
-        ok = download_ffmpeg_linux()
-
-    if ok:
-        _save_ffmpeg_meta(url)
-        # Re-point FFMPEG_CMD to the freshly extracted binary
-        local_ffprobe = os.path.abspath("ffprobe.exe" if platform.system() == "Windows" else "./ffprobe")
-        FFMPEG_CMD = local_bin
-        if os.path.exists(local_ffprobe):
-            FFPROBE_CMD = local_ffprobe
-        print("[*] FFmpeg updated successfully.")
-
-def download_ffmpeg_windows():
-    print("[*] FFmpeg not found. Attempting download (FULL Version ~128MB)...")
-
-    # Newest release-branch build (discovered) first, hardcoded fallbacks,
-    # then the project mirror as a last resort when GitHub is unreachable.
-    # The mirror is tried with each candidate's ORIGINAL filename (so any
-    # current BtbN win64-gpl zip dropped there under its real name works),
-    # then a stable alias, then the legacy n7.1 mirror file.
-    _mirror = "https://vsv.fractumseraph.net/"
-    _cands = _ffmpeg_candidate_urls()
-    urls = _cands + [_mirror + u.rsplit('/', 1)[-1] for u in _cands] + [
-        _mirror + "ffmpeg-latest-win64-gpl.zip",
-        _mirror + "ffmpeg-n7.1-latest-win64-gpl-7.1.zip"
-    ]
-
-    temp_zip = "ffmpeg_temp.zip"
-
-    for url in urls:
-        print(f"[*] Trying mirror: {url}")
-        try:
-            with requests.get(url, stream=True, timeout=180) as r:
-                r.raise_for_status()
-                total_size = int(r.headers.get('content-length', 0))
-                downloaded = 0
-                
-                with open(temp_zip, 'wb') as f:
-                    for chunk in r.iter_content(chunk_size=8192):
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        if total_size > 0:
-                            pct = int((downloaded / total_size) * 100)
-                            _download_progress(pct)
-            print("\n[*] Extracting FFmpeg...")
-            
-            with zipfile.ZipFile(temp_zip) as z:
-                ffmpeg_path = None
-                ffprobe_path = None
-                for file in z.namelist():
-                    if file.endswith("bin/ffmpeg.exe"): ffmpeg_path = file
-                    if file.endswith("bin/ffprobe.exe"): ffprobe_path = file
-                
-                if not ffmpeg_path or not ffprobe_path:
-                    print("\n[!] Binaries not found in zip.")
-                    continue
-                
-                with open("ffmpeg.exe", "wb") as f: f.write(z.read(ffmpeg_path))
-                with open("ffprobe.exe", "wb") as f: f.write(z.read(ffprobe_path))
-                
-            os.remove(temp_zip)
-            print("[*] FFmpeg installed locally!")
-            _save_ffmpeg_meta(url)
-            return True
-            
-        except Exception as e:
-            print(f"\n[!] Mirror failed: {e}")
-            if os.path.exists(temp_zip): os.remove(temp_zip)
-            continue
-            
-    return False
-
-def download_ffmpeg_linux():
-    print("[*] Downloading static FFmpeg build (BtbN)...")
-    urls = _ffmpeg_candidate_urls()
-    if not urls:
-        print(f"[!] Unsupported architecture for auto-download: {platform.machine().lower()}")
         return False
-    for url in urls:
-        if _download_ffmpeg_linux_from(url):
-            return True
-    return False
 
-def _download_ffmpeg_linux_from(url):
+def _upstream_changed(st):
+    """Has BtbN rebuilt this branch since we downloaded it?"""
     try:
-        print(f"[*] Trying: {url}")
-        r = requests.get(url, stream=True, allow_redirects=True, timeout=180)
-        r.raise_for_status()
-
-        tar_name = f"ffmpeg_static_{int(time.time())}.tar.xz"
-        total_size = int(r.headers.get('content-length', 0))
-        downloaded = 0
-        
-        with open(tar_name, 'wb') as f:
-             for chunk in r.iter_content(chunk_size=8192):
-                 f.write(chunk)
-                 downloaded += len(chunk)
-                 if total_size > 0:
-                     pct = int((downloaded / total_size) * 100)
-                     _download_progress(pct)
-        
-        print("\n[*] Extracting FFmpeg...")
-        ext_dir = f"temp_ffmpeg_ext_{int(time.time())}"
-        os.makedirs(ext_dir, exist_ok=True)
-        
-        with tarfile.open(tar_name, "r:xz") as tar:
-            tar.extractall(path=ext_dir)
-            
-        found_ffmpeg = False
-        for root, dirs, files in os.walk(ext_dir):
-            for file in files:
-                if file == "ffmpeg":
-                    shutil.move(os.path.join(root, file), "ffmpeg")
-                    found_ffmpeg = True
-                elif file == "ffprobe":
-                    shutil.move(os.path.join(root, file), "ffprobe")
-
-        if os.path.exists(tar_name): os.remove(tar_name)
-        if os.path.exists(ext_dir): shutil.rmtree(ext_dir)
-        
-        if found_ffmpeg:
-            os.chmod("ffmpeg", 0o755)
-            if os.path.exists("ffprobe"): os.chmod("ffprobe", 0o755)
-            print("[*] FFmpeg installed locally!")
-            _save_ffmpeg_meta(url)
-            return True
-        else:
-            print("[!] Could not find 'ffmpeg' binary in extracted archive.")
+        r = requests.head(_FFMPEG_DL_BASE + _ffmpeg_asset_name(st["version"]), allow_redirects=True,
+                          timeout=20, headers={'User-Agent': f'FractumWorker/{WORKER_VERSION}'})
+        if r.status_code != 200:
             return False
-
-    except Exception as e:
-        print(f"\n[!] Linux Download failed: {e}")
+        et, lm = r.headers.get('ETag', ''), r.headers.get('Last-Modified', '')
+        return bool((et and et != st.get("etag")) or (lm and lm != st.get("last_modified")))
+    except Exception:
         return False
+
+def _cleanup_old_ffmpeg_builds(keep_dir=None, legacy_too=False):
+    """Remove builds other than the one in use. Files still running (another
+    slot's encode on Windows) cannot be deleted; they go at the next start."""
+    try:
+        for d in os.listdir(_FFMPEG_BUILDS_DIR):
+            p = os.path.join(_FFMPEG_BUILDS_DIR, d)
+            if keep_dir and os.path.abspath(p) == os.path.abspath(keep_dir):
+                continue
+            if os.path.isdir(p):
+                shutil.rmtree(p, ignore_errors=True)
+            elif d.endswith('.download') or d.startswith('selftest_'):
+                try: os.remove(p)
+                except OSError: pass
+    except OSError:
+        pass
+    if legacy_too:
+        # The pre-3.14.0 layout kept one build next to the worker. Remove it
+        # only if it is a release build (i.e. ours), never a hand-placed one.
+        names = ("ffmpeg.exe", "ffprobe.exe") if platform.system() == "Windows" else ("ffmpeg", "ffprobe")
+        legacy_ff = os.path.abspath(names[0])
+        if os.path.exists(legacy_ff) and _is_release_build(legacy_ff):
+            for n in names:
+                try:
+                    os.remove(os.path.abspath(n))
+                except OSError:
+                    pass
+
+def _migrate_legacy_ffmpeg(cur, now):
+    """Move a pre-3.14.0 build (./ffmpeg next to the worker) into its own
+    folder instead of downloading the same version again. Runs at start,
+    before any encode, so the files are not in use."""
+    exe = ".exe" if platform.system() == "Windows" else ""
+    dest = os.path.join(_FFMPEG_BUILDS_DIR, f"n{cur['version']}-{time.strftime('%Y%m%d-%H%M%S')}")
+    try:
+        os.makedirs(dest, exist_ok=True)
+        ff, fp = os.path.join(dest, f"ffmpeg{exe}"), os.path.join(dest, f"ffprobe{exe}")
+        shutil.move(cur["ffmpeg"], ff)
+        if os.path.exists(cur.get("ffprobe") or ''):
+            shutil.move(cur["ffprobe"], fp)
+        ok, why = _ffmpeg_selftest(ff, fp)
+        if not ok:
+            print(f"[!] The existing FFmpeg build does not pass the test encode ({why}); replacing it.")
+            shutil.rmtree(dest, ignore_errors=True)
+            return None
+    except Exception as e:
+        print(f"[!] Could not move the existing FFmpeg build into {_FFMPEG_BUILDS_DIR}: {e}")
+        return None
+    new = dict(cur, dir=dest, ffmpeg=ff, ffprobe=fp, last_branch_check=now)
+    new.pop("legacy", None)
+    if not new.get("installed_at"):
+        new["installed_at"] = now
+    _save_ffmpeg_state(new)
+    _use_ffmpeg_build(new)
+    return new
+
+def ensure_best_ffmpeg(force=False):
+    """Make sure the newest release build that works here is in use. Returns
+    True when a managed build is in use afterwards. Rate-limited to one
+    version check per FFMPEG_BRANCH_CHECK_SEC unless force."""
+    with _FFMPEG_MGMT_LOCK:
+        cur = _current_managed_build()
+        now = time.time()
+        if cur and not force and now - float(cur.get("last_branch_check") or 0) < FFMPEG_BRANCH_CHECK_SEC:
+            return True
+        versions = _ffmpeg_release_versions()
+        if cur:
+            cur["last_branch_check"] = now
+            if not cur.get("legacy"):
+                _save_ffmpeg_state(cur)
+        if not versions:
+            return bool(cur)
+        if cur and cur.get("legacy") and _vt(versions[0]) <= _vt(cur["version"]):
+            moved = _migrate_legacy_ffmpeg(cur, now)
+            if moved:
+                return True
+        if cur:
+            if _vt(versions[0]) <= _vt(cur["version"]):
+                # Already on the newest branch: take a rebuild of it (point
+                # releases, fixes) at most every FFMPEG_REFRESH_SEC.
+                if cur.get("legacy") is None and now - float(cur.get("installed_at") or 0) < FFMPEG_REFRESH_SEC:
+                    return True
+                if not cur.get("legacy") and not _upstream_changed(cur):
+                    cur["installed_at"] = now
+                    _save_ffmpeg_state(cur)
+                    return True
+                candidates = [cur["version"]]
+            else:
+                candidates = [v for v in versions if _vt(v) > _vt(cur["version"])]
+        else:
+            candidates = versions
+        for v in candidates:
+            new = _install_ffmpeg_build(v)
+            if new:
+                new["last_branch_check"] = now
+                _save_ffmpeg_state(new)
+                _use_ffmpeg_build(new)
+                info = _ffmpeg_build_info()
+                print(f"[*] Using FFmpeg {info.get('version')} (the worker's own build).")
+                _cleanup_old_ffmpeg_builds(keep_dir=new["dir"], legacy_too=bool(cur and cur.get("legacy")))
+                return True
+        return bool(cur)
+
+def _ffmpeg_update_loop():
+    """While running, check for a newer FFmpeg release once a day."""
+    while not SHUTDOWN_EVENT.wait(3600):
+        if not _FFMPEG_MANAGED:
+            return
+        try:
+            ensure_best_ffmpeg()
+        except Exception as e:
+            print(f"[!] FFmpeg update check failed: {e}")
 
 def has_svtav1(cmd):
     """Checks if the given ffmpeg command supports libsvtav1"""
     try:
-        res = subprocess.run([cmd, "-hide_banner", "-encoders"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, encoding='utf-8', errors='replace')
+        res = subprocess.run([cmd, "-hide_banner", "-encoders"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             encoding='utf-8', errors='replace', timeout=15)
         return "libsvtav1" in res.stdout
-    except:
+    except Exception:
         return False
 
 # Minimum supported FFmpeg = 7.1, expressed as its libavformat version (61.7).
@@ -2287,37 +2419,15 @@ def _sibling_ffprobe(ffmpeg_path):
                 return p
     return "ffprobe"
 
-def _local_ffmpeg_is_managed(local_ffmpeg):
-    """True when the ffmpeg in the worker folder is one this worker downloaded
-    (a download records its source in the meta file); False for a binary
-    someone copied there by hand."""
-    if not os.path.exists(local_ffmpeg) or not os.path.exists(_FFMPEG_META_FILE):
-        return False
-    try:
-        with open(_FFMPEG_META_FILE) as f:
-            if not json.load(f).get('url'):
-                return False
-        # And it must still BE a release build of the kind we download
-        # ("ffmpeg version n8.1.2-57-g…"): a binary swapped in by hand after
-        # an earlier download keeps the meta file but not this signature.
-        out = subprocess.run([local_ffmpeg, "-version"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                             encoding='utf-8', errors='replace', timeout=15).stdout or ''
-        return bool(re.match(r'ffmpeg version n\d+\.\d+', out))
-    except Exception:
-        return False
-
 def check_ffmpeg(override=None):
-    """Pick the FFmpeg to use. Returns True when it is the worker's own managed
-    build (which update_ffmpeg_if_stale() then keeps current).
+    """Pick the FFmpeg to use at start. Returns True when it is the worker's own
+    managed build (which _ffmpeg_update_loop() then keeps current).
 
-    Policy: on Windows and Linux (x64 and arm64) the worker uses its OWN copy of
-    the newest FFmpeg *release* build (BtbN), not whatever it happens to find.
-    Builds found on the machine vary widely - development snapshots, old distro
-    packages, builds with a different TLS stack - and one of those hung on
-    every source open on a volunteer's machine while its own downloads worked.
-    A build found on the machine is only used when the download fails. Use
-    --ffmpeg PATH to choose a specific binary deliberately. Other platforms
-    (macOS) have no managed build and use the one installed (e.g. Homebrew)."""
+    Windows and Linux on x64/arm64: the worker's own newest working release
+    build (see the policy comment above ensure_best_ffmpeg). A build found on
+    the machine is only used when no managed build can be installed. --ffmpeg
+    PATH chooses a specific binary deliberately. Other platforms (macOS) have
+    no managed build and use the one installed (e.g. Homebrew)."""
     global FFMPEG_CMD, FFPROBE_CMD
 
     local_ffmpeg = os.path.abspath("ffmpeg.exe" if platform.system() == "Windows" else "./ffmpeg")
@@ -2337,23 +2447,22 @@ def check_ffmpeg(override=None):
         print(f"[*] Using the FFmpeg chosen with --ffmpeg: {FFMPEG_CMD}")
         return False
 
-    managed_platform = _ffmpeg_platform_tag()[0] is not None
-    if managed_platform:
-        if _local_ffmpeg_is_managed(local_ffmpeg) and ffmpeg_is_capable(local_ffmpeg):
-            FFMPEG_CMD = local_ffmpeg
-            if os.path.exists(local_ffprobe): FFPROBE_CMD = local_ffprobe
+    plat, _ = _ffmpeg_platform_tag()
+    if plat:
+        cur = _current_managed_build()
+        if cur:
+            _use_ffmpeg_build(cur)
+            if not cur.get("legacy"):
+                _cleanup_old_ffmpeg_builds(keep_dir=cur.get("dir"))
+        else:
+            found = local_ffmpeg if os.path.exists(local_ffmpeg) else (shutil.which("ffmpeg") or None)
+            if found:
+                print(f"[*] Found an FFmpeg at {found}; installing the worker's own build (the newest FFmpeg "
+                      "release that works on this machine) instead, so every worker encodes with a known-good version.")
+                print("    To keep using that one, start the worker with --ffmpeg PATH.")
+        if ensure_best_ffmpeg(force=cur is None or bool(cur.get("legacy"))):
             return True
-        found = local_ffmpeg if os.path.exists(local_ffmpeg) else (shutil.which("ffmpeg") or None)
-        if found:
-            print(f"[*] Found an FFmpeg at {found}; downloading the worker's own build (newest FFmpeg "
-                  "release) instead, so every worker encodes with a known-good version.")
-            print("    To keep using that one, start the worker with --ffmpeg PATH.")
-        ok = download_ffmpeg_windows() if platform.system() == "Windows" else download_ffmpeg_linux()
-        if ok and os.path.exists(local_ffmpeg) and ffmpeg_is_capable(local_ffmpeg):
-            FFMPEG_CMD = local_ffmpeg
-            if os.path.exists(local_ffprobe): FFPROBE_CMD = local_ffprobe
-            return True
-        print("[!] Could not download the worker's own FFmpeg build; looking for one on this machine.")
+        print("[!] Could not install the worker's own FFmpeg build; looking for one on this machine.")
         if os.path.exists(local_ffmpeg) and ffmpeg_is_capable(local_ffmpeg):
             FFMPEG_CMD = local_ffmpeg
             if os.path.exists(local_ffprobe): FFPROBE_CMD = local_ffprobe
@@ -2366,34 +2475,22 @@ def check_ffmpeg(override=None):
         print("Please install FFmpeg 7.1 or newer with SVT-AV1 support manually, or pass --ffmpeg PATH.")
         sys.exit(1)
 
-    # No managed build for this platform: use what is installed.
+    # No managed build for this OS/CPU: use what is installed.
     if os.path.exists(local_ffmpeg) and ffmpeg_is_capable(local_ffmpeg):
         FFMPEG_CMD = local_ffmpeg
         if os.path.exists(local_ffprobe): FFPROBE_CMD = local_ffprobe
         return False
-
     if shutil.which("ffmpeg") and ffmpeg_is_capable("ffmpeg"):
         FFMPEG_CMD = "ffmpeg"
         FFPROBE_CMD = "ffprobe"
         return False
-
-    print("[!] No FFmpeg found with libsvtav1 and libopus support at version 7.1 or newer.")
-
-    download_success = False
-    if platform.system() == "Windows":
-        download_success = download_ffmpeg_windows()
+    print("\n[CRITICAL ERROR] No FFmpeg 7.1+ with libsvtav1 and libopus found.")
+    if platform.system() == "Darwin":
+        print("On macOS: brew install ffmpeg   (Homebrew's build includes SVT-AV1 and Opus).")
     else:
-        download_success = download_ffmpeg_linux()
-
-    if download_success:
-        if os.path.exists(local_ffmpeg) and has_svtav1(local_ffmpeg):
-            FFMPEG_CMD = local_ffmpeg
-            if os.path.exists(local_ffprobe): FFPROBE_CMD = local_ffprobe
-            return
-
-    print("\n[CRITICAL ERROR] Could not find or download FFmpeg 7.1+ with 'libsvtav1' support.")
-    print("Please install FFmpeg 7.1 or newer with SVT-AV1 support manually.")
+        print("Please install FFmpeg 7.1 or newer with SVT-AV1 and Opus support, or pass --ffmpeg PATH.")
     sys.exit(1)
+
 
 def verify_connection(manager_url):
     try:
@@ -4270,7 +4367,7 @@ def run_worker(args):
             print("[!] Failed to save wallet to configuration file.")
 
     if check_ffmpeg(getattr(args, 'ffmpeg', None)):
-        update_ffmpeg_if_stale()
+        threading.Thread(target=_ffmpeg_update_loop, daemon=True).start()
 
     manager_url = (args.manager or DEFAULT_MANAGER_URL).rstrip('/')
     username = args.username or DEFAULT_USERNAME
