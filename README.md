@@ -416,7 +416,8 @@ Browser workers can't range-stream a multi-GB source (32-bit WebAssembly, and th
 - It fetches that chunk's bytes from **`/download_segment`**, which stream-copies (`-c copy`, no re-encode) just a small, keyframe-aligned segment covering the chunk's time range and returns it with `X-Segment-Lead` / `X-Segment-Duration` headers.
 - The browser seeks by the lead and encodes exactly `[start, start+dur]` — identical to what a native chunk worker produces — then uploads via `/upload_chunk`.
 - The whole-file **audio** chunk is skipped by browser nodes (`video_only`); a native worker encodes it. The manager assembles as usual.
-- **Memory limit:** a browser node advertises a **MAX CHUNK SEC** (default 120) and is only handed chunks at or under that length. Long chunks (e.g. 300s of 1080p) exhaust the 32-bit WebAssembly heap and trap it (`unreachable executed`), so this cap keeps browser encodes from crashing. Native workers take any length. For browser volunteers to get work, keep `CHUNK_DURATION_SEC` at or below their MAX CHUNK SEC.
+- **Memory limit:** a browser node advertises a **MAX CHUNK SEC** (default 600, i.e. 10 minutes) and a **MAX SOURCE MB** (default 600, capped at 1000), and is only handed chunks within both (the size is estimated per chunk). A 10-minute chunk of a typical 1080p film (H.264 at 6.5 Mbps) is a 451 MB download and peaked at about 1 GB of browser memory in testing (web worker 3.6.0, which stores the download without a second copy). On low-memory devices lower MAX CHUNK SEC if the tab crashes. Native workers take any length. For browser volunteers to get work, keep `CHUNK_DURATION_SEC` at or below their MAX CHUNK SEC.
+- **Speed:** a browser encodes on one thread, so a 10-minute chunk takes hours (about 3.5 h on a server core; longer on a tablet). Keep the tab in the foreground and the screen on: phones and tablets pause background tabs.
 
 So a browser volunteer only ever downloads ~one chunk's worth of data (e.g. ~30 MB for a 2-min slice of a 2 GB file), never the whole source. Boundaries come from the single per-job chunk plan, so browser and desktop chunks tile identically.
 
@@ -459,7 +460,7 @@ Volunteers can encode small files directly in their browser — no Python, no FF
 
 - The page authenticates automatically (the worker token is injected server-side).
 - **Big files, too:** browser nodes take chunks of large videos via *server-side segmentation* — the manager stream-copies just the piece for one chunk into a small standalone file and sends that, so the browser never downloads a multi-GB source. See "Server-side segmentation" below.
-- Whole-file browser jobs still accept only small sources — set **MAX SOURCE MB** on the page (default 150). Browser encoding is memory-bound (32-bit WebAssembly), so large *whole* files can crash the tab; the manager filters jobs by that size.
+- Whole-file browser jobs accept only sources up to **MAX SOURCE MB** (default 600, at most 1000). Browser encoding is memory-bound (32-bit WebAssembly), so a multi-GB *whole* film cannot work; big films reach browsers as chunks instead.
 - **Rebuilding the WASM:** the FFmpeg→WebAssembly bundle (SVT-AV1 with WebAssembly SIMD + Opus) is built by [`wasm-build/build.sh`](wasm-build/README.md); read that README before changing component or compiler versions.
 - Threads require cross-origin isolation; the manager already sends the needed `Cross-Origin-Opener-Policy` / `Cross-Origin-Embedder-Policy` headers, and the `.wasm` is served with the correct `application/wasm` type.
 - Subtitles are dropped in the browser (no `ffprobe` in the wasm build to filter subtitle types safely); output is video + Opus audio.

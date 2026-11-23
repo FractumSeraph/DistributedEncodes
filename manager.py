@@ -3773,7 +3773,12 @@ def get_chunk():
                 # An unsplittable candidate is requeued with chunkable=0 and gets
                 # picked up whole via /get_job instead.
                 try:
-                    job = _claim_job_for_split(folder_filter, max_size_mb, worker_id)
+                    # No size limit on WHICH job gets split: this worker only
+                    # downloads one chunk, and the per-chunk size estimate in
+                    # _assign_pending_chunk enforces its limit. Filtering by
+                    # the whole file's size meant a browser (600 MB limit)
+                    # could never start splitting a film larger than that.
+                    job = _claim_job_for_split(folder_filter, None, worker_id)
                     if job is not None and _split_claimed_job(job):
                         chunk = _assign_pending_chunk(worker_id, folder_filter, max_size_mb, video_only=video_only,
                                                       max_chunk_sec=max_chunk_sec, worker_version=worker_version)
