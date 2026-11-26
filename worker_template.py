@@ -138,7 +138,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.14.0"
+WORKER_VERSION = "3.15.0"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -1533,12 +1533,21 @@ def _source_failure_diag(watch, url, is_local, offset=0):
     """Everything a source-read failure report should carry (see above)."""
     d = {"diag_version": 1, "worker_version": WORKER_VERSION,
          "os": f"{platform.system()} {platform.release()}"[:60],
-         "ffmpeg": _ffmpeg_build_info(),
+         "ffmpeg": dict(_ffmpeg_build_info(), origin=_FFMPEG_ORIGIN),
          "source": "local file" if is_local else "http"}
+    if _FFMPEG_ORIGIN == "fallback" and _FFMPEG_INSTALL_ERR:
+        d["ffmpeg"]["install_error"] = _FFMPEG_INSTALL_ERR
     if watch is not None:
         d.update(watch.diag())
     if not is_local:
         d["selftest"] = _source_selftest(url, offset)
+        st = d["selftest"] or {}
+        if (_FFMPEG_ORIGIN == "fallback" and not st.get("error")
+                and d.get("phase") in ("opening", "probing", "encoding")):
+            # The network is fine but this FFmpeg got stuck: the build in use
+            # is the likely cause, so try to replace it now (in the background).
+            threading.Thread(target=_retry_managed_ffmpeg, daemon=True,
+                             args=(FFMPEG_FAILURE_RETRY_SEC, " after a source read it got stuck on")).start()
     return d
 
 def _diag_text(d):
@@ -1546,6 +1555,12 @@ def _diag_text(d):
     out = ["", "--- Source-read diagnostics (worker) ---"]
     ff = d.get("ffmpeg") or {}
     out.append(f"Worker {d.get('worker_version')} on {d.get('os')}; FFmpeg {ff.get('version')} (TLS: {ff.get('tls')})")
+    origin = ff.get("origin")
+    if origin == "override":
+        out.append("This FFmpeg was chosen with --ffmpeg (not the worker's own build).")
+    elif origin == "fallback":
+        out.append("The worker's own FFmpeg build could not be installed"
+                   f"{' (' + ff['install_error'] + ')' if ff.get('install_error') else ''}; using one found on the machine.")
     ph = d.get("phase")
     if ph == "probing":
         out.append("FFprobe could not read the source's stream information (3 attempts).")
@@ -1962,6 +1977,16 @@ FFMPEG_BRANCH_CHECK_SEC = 24 * 3600
 FFMPEG_REFRESH_SEC = 7 * 24 * 3600
 _FFMPEG_MGMT_LOCK = threading.Lock()
 _FFMPEG_MANAGED = False      # True while the worker's own build is in use
+# Why the FFmpeg in use was chosen, for source-read reports: "managed",
+# "override" (--ffmpeg), "fallback" (the worker's own build could not be
+# installed; _FFMPEG_INSTALL_ERR says why) or "system" (no managed build for
+# this OS/CPU).
+_FFMPEG_ORIGIN = "system"
+_FFMPEG_INSTALL_ERR = ""
+_FFMPEG_LAST_RETRY = 0.0
+_FFMPEG_RETRY_LOCK = threading.Lock()
+FFMPEG_FALLBACK_RETRY_SEC = 6 * 3600     # retry the install this often while on a fallback build
+FFMPEG_FAILURE_RETRY_SEC = 3600          # ...or this soon after a source read the build got stuck on
 
 def _windows_native_arch():
     """'x64', 'arm64' or 'x86' for the Windows MACHINE (not this Python: an
@@ -2156,6 +2181,7 @@ def _install_ffmpeg_build(version):
                 raise RuntimeError("ffmpeg/ffprobe not found in the archive")
         except Exception as e:
             print(f"\n[!] FFmpeg download failed: {e}")
+            _note_install_error(f"download of {name} from {url.split('/')[2]} failed: {e}")
             shutil.rmtree(dest, ignore_errors=True)
             continue
         finally:
@@ -2168,11 +2194,16 @@ def _install_ffmpeg_build(version):
         ok, why = _ffmpeg_selftest(ff, fp)
         if not ok:
             print(f"[!] FFmpeg {version} does not work on this machine ({why}); not using it.")
+            _note_install_error(f"FFmpeg {version} failed its test encode on this machine: {why}")
             shutil.rmtree(dest, ignore_errors=True)
             return None
         return {"managed": 2, "version": version, "url": url, "dir": dest, "ffmpeg": ff, "ffprobe": fp,
                 "etag": etag, "last_modified": lm, "installed_at": time.time()}
     return None
+
+def _note_install_error(msg):
+    global _FFMPEG_INSTALL_ERR
+    _FFMPEG_INSTALL_ERR = str(msg).replace("\n", " ")[:300]
 
 def _load_ffmpeg_state():
     try:
@@ -2198,6 +2229,9 @@ def _use_ffmpeg_build(st):
     FFPROBE_CMD = st["ffprobe"] if os.path.exists(st.get("ffprobe") or '') else _sibling_ffprobe(st["ffmpeg"])
     _FFMPEG_BUILD_INFO = None
     _FFMPEG_MANAGED = True
+    global _FFMPEG_ORIGIN, _FFMPEG_INSTALL_ERR
+    _FFMPEG_ORIGIN = "managed"
+    _FFMPEG_INSTALL_ERR = ""
 
 def _current_managed_build():
     """The worker's own build recorded in the state file, if it still exists and
@@ -2345,14 +2379,35 @@ def ensure_best_ffmpeg(force=False):
         return bool(cur)
 
 def _ffmpeg_update_loop():
-    """While running, check for a newer FFmpeg release once a day."""
+    """While running, check for a newer FFmpeg release once a day; on a
+    fallback build, keep trying to install the worker's own build."""
     while not SHUTDOWN_EVENT.wait(3600):
-        if not _FFMPEG_MANAGED:
+        if _FFMPEG_ORIGIN == "managed":
+            try:
+                ensure_best_ffmpeg()
+            except Exception as e:
+                print(f"[!] FFmpeg update check failed: {e}")
+        elif _FFMPEG_ORIGIN == "fallback":
+            _retry_managed_ffmpeg(FFMPEG_FALLBACK_RETRY_SEC)
+        else:
             return
-        try:
-            ensure_best_ffmpeg()
-        except Exception as e:
-            print(f"[!] FFmpeg update check failed: {e}")
+
+def _retry_managed_ffmpeg(min_gap, why=""):
+    """On a fallback build, try again to install the worker's own build (at
+    most once per min_gap). Encodes already running keep their binary."""
+    global _FFMPEG_LAST_RETRY
+    with _FFMPEG_RETRY_LOCK:   # several slots can fail at once: one attempt
+        if _FFMPEG_ORIGIN != "fallback" or time.time() - _FFMPEG_LAST_RETRY < min_gap:
+            return
+        _FFMPEG_LAST_RETRY = time.time()
+    print(f"[*] Trying again to install the worker's own FFmpeg build{why}...")
+    try:
+        if ensure_best_ffmpeg(force=True):
+            print("[*] Switched to the worker's own FFmpeg build; new encodes use it.")
+            return
+    except Exception as e:
+        _note_install_error(f"install attempt failed: {e}")
+    print(f"[!] Still on the fallback FFmpeg: {_FFMPEG_INSTALL_ERR or 'unknown reason'}")
 
 def has_svtav1(cmd):
     """Checks if the given ffmpeg command supports libsvtav1"""
@@ -2420,15 +2475,16 @@ def _sibling_ffprobe(ffmpeg_path):
     return "ffprobe"
 
 def check_ffmpeg(override=None):
-    """Pick the FFmpeg to use at start. Returns True when it is the worker's own
-    managed build (which _ffmpeg_update_loop() then keeps current).
+    """Pick the FFmpeg to use at start. Returns True when _ffmpeg_update_loop()
+    should run: on the worker's own managed build (kept current) or on a
+    fallback build (the install is retried).
 
     Windows and Linux on x64/arm64: the worker's own newest working release
     build (see the policy comment above ensure_best_ffmpeg). A build found on
     the machine is only used when no managed build can be installed. --ffmpeg
     PATH chooses a specific binary deliberately. Other platforms (macOS) have
     no managed build and use the one installed (e.g. Homebrew)."""
-    global FFMPEG_CMD, FFPROBE_CMD
+    global FFMPEG_CMD, FFPROBE_CMD, _FFMPEG_ORIGIN, _FFMPEG_LAST_RETRY
 
     local_ffmpeg = os.path.abspath("ffmpeg.exe" if platform.system() == "Windows" else "./ffmpeg")
     local_ffprobe = os.path.abspath("ffprobe.exe" if platform.system() == "Windows" else "./ffprobe")
@@ -2445,6 +2501,7 @@ def check_ffmpeg(override=None):
         FFMPEG_CMD = os.path.abspath(cmd) if os.path.exists(cmd) else cmd
         FFPROBE_CMD = _sibling_ffprobe(FFMPEG_CMD)
         print(f"[*] Using the FFmpeg chosen with --ffmpeg: {FFMPEG_CMD}")
+        _FFMPEG_ORIGIN = "override"
         return False
 
     plat, _ = _ffmpeg_platform_tag()
@@ -2460,17 +2517,25 @@ def check_ffmpeg(override=None):
                 print(f"[*] Found an FFmpeg at {found}; installing the worker's own build (the newest FFmpeg "
                       "release that works on this machine) instead, so every worker encodes with a known-good version.")
                 print("    To keep using that one, start the worker with --ffmpeg PATH.")
-        if ensure_best_ffmpeg(force=cur is None or bool(cur.get("legacy"))):
-            return True
-        print("[!] Could not install the worker's own FFmpeg build; looking for one on this machine.")
+        try:
+            if ensure_best_ffmpeg(force=cur is None or bool(cur.get("legacy"))):
+                return True
+        except Exception as e:
+            _note_install_error(f"install attempt failed: {e}")
+        print("[!] Could not install the worker's own FFmpeg build"
+              f"{': ' + _FFMPEG_INSTALL_ERR if _FFMPEG_INSTALL_ERR else ''}")
+        print("    Looking for one on this machine; the worker keeps trying to install its own while it runs.")
+        _FFMPEG_LAST_RETRY = time.time()
         if os.path.exists(local_ffmpeg) and ffmpeg_is_capable(local_ffmpeg):
             FFMPEG_CMD = local_ffmpeg
             if os.path.exists(local_ffprobe): FFPROBE_CMD = local_ffprobe
-            return False
+            _FFMPEG_ORIGIN = "fallback"
+            return True
         if shutil.which("ffmpeg") and ffmpeg_is_capable("ffmpeg"):
             FFMPEG_CMD = "ffmpeg"
             FFPROBE_CMD = "ffprobe"
-            return False
+            _FFMPEG_ORIGIN = "fallback"
+            return True
         print("\n[CRITICAL ERROR] Could not find or download FFmpeg 7.1+ with libsvtav1 and libopus.")
         print("Please install FFmpeg 7.1 or newer with SVT-AV1 support manually, or pass --ffmpeg PATH.")
         sys.exit(1)

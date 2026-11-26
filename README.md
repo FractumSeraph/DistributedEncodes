@@ -50,7 +50,7 @@ The `WORKER_SECRET` environment variable is the preferred way to pass the auth t
 - **Newest first, but only if it works here.** Before a build is used, the worker runs a one-second test encode with SVT-AV1 and Opus on that machine and reads it back. A build that fails (missing encoder, CPU or OS it cannot run on) is discarded and the next newest release is tried; the build already in use is kept until a replacement passes.
 - **Found even when GitHub's list is unavailable.** New release branches are discovered from BtbN's asset list, or, when that cannot be read, by checking whether the next version numbers exist.
 - **Kept current while running.** The worker checks at start and then once a day. A newer release branch is installed as soon as it is found; a rebuild of the same branch (point releases, fixes) at most once a week. Each build lives in its own folder under `ffmpeg_builds/`, and switching only changes which build *new* encodes use, so encodes already running finish undisturbed.
-- **Your choice wins.** `--ffmpeg PATH` uses a specific build instead; it must have `libsvtav1` and `libopus` and be FFmpeg 7.1 or newer. If no managed build can be installed, the worker falls back to an FFmpeg found on the machine and says so.
+- **Your choice wins.** `--ffmpeg PATH` uses a specific build instead; it must have `libsvtav1` and `libopus` and be FFmpeg 7.1 or newer. If no managed build can be installed, the worker falls back to an FFmpeg found on the machine, says why, and keeps trying to install its own while it runs: every 6 hours, and within the hour after that fallback build gets stuck on a source the worker itself can download (worker 3.15.0+). Source-read error reports name which FFmpeg was in use and why (its own build, `--ffmpeg`, or a fallback plus the install error).
 - **macOS** has no BtbN build, so the worker uses the installed FFmpeg (`brew install ffmpeg`; keep it current with `brew upgrade ffmpeg`).
 
 Encoding settings are the same whichever build is used.
@@ -338,7 +338,7 @@ When the report arrives, the manager downloads the same part of the same file it
 |---|---|---|
 | fails | works | the worker's network, firewall, DNS or ISP route |
 | fails | fails | the source host was down or refusing requests |
-| works, but FFmpeg never opened the file | — | the worker's FFmpeg build (try letting the worker download its standard build) |
+| works, but FFmpeg never opened the file | — | the worker's FFmpeg build: the verdict says whether it was the worker's own build, one chosen with `--ffmpeg`, or a fallback (and why the worker's own could not be installed) |
 | works, but slowly | — | a slow or congested link on the worker's side |
 | works | — | the connection dropped mid-encode and did not recover |
 
