@@ -4530,9 +4530,25 @@ def _source_verdict(diag):
     speed = st.get('mb_s') or 0
     if diag.get('phase') in ('opening', 'probing'):
         tool = "FFprobe" if diag.get('phase') == 'probing' else "FFmpeg"
+        ff = diag.get('ffmpeg') or {}
+        origin = ff.get('origin')
+        if origin == 'managed':
+            fix = ("it is already on the worker's own build, so look at the machine itself "
+                   "(antivirus or firewall inspecting FFmpeg's connections, a proxy).")
+        elif origin == 'override':
+            fix = ("the worker was started with --ffmpeg and so uses that build: remove --ffmpeg so it "
+                   "installs its own.")
+        elif origin == 'fallback':
+            err = ff.get('install_error')
+            fix = ("the worker could not install its own build"
+                   + (f" ({err})" if err else "")
+                   + " and fell back to one found on the machine; it retries the install now. "
+                     "If that keeps failing, that error is what to fix.")
+        else:
+            fix = "letting the worker download its standard FFmpeg build is the first thing to try."
         return ("worker_ffmpeg", f"The worker's own download test worked ({speed} MB/s), yet {tool} never got past "
-                                 f"opening the file. That points at this worker's FFmpeg build (TLS: {tls}); "
-                                 "letting the worker download its standard FFmpeg build is the first thing to try.")
+                                 f"opening the file. That points at this worker's FFmpeg build "
+                                 f"({ff.get('version', '?')}, TLS: {tls}); {fix}")
     if speed < 0.5:
         return ("slow", f"The worker can download the file, but only at {speed} MB/s ({mp_txt}); "
                         "the encode ran out of data. A slow or congested link on the worker's side is likely.")
