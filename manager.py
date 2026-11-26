@@ -4538,6 +4538,9 @@ def _source_verdict(diag):
         elif origin == 'override':
             fix = ("the worker was started with --ffmpeg and so uses that build: remove --ffmpeg so it "
                    "installs its own.")
+        elif origin == 'verified':
+            fix = ("it was an FFmpeg found on the machine that had passed the worker's start-up tests; "
+                   "the worker stops trusting it and installs its own build now.")
         elif origin == 'fallback':
             err = ff.get('install_error')
             fix = ("the worker could not install its own build"
@@ -4636,6 +4639,31 @@ def api_source_health():
         m["failure_rate"] = round(m["failures"] / (m["failures"] + m["done"]), 3) if (m["failures"] + m["done"]) else None
     quiet = sum(1 for m in machines.values() if not m["failures"] and m["done"])
     return jsonify({"hours": hours, "machines": rows, "machines_without_failures": quiet})
+
+@app.route('/api/source_sample')
+@requires_worker_auth
+def api_source_sample():
+    """One real source file for a worker to test an FFmpeg it found on its
+    machine against, before trusting it (worker 3.16.0+). A test encode alone
+    passes builds that then hang on every source they stream over HTTPS."""
+    with read_lock():
+        conn = db_handler.get_connection()
+        try:
+            row = None
+            for where in ("status='queued' AND source_type='remote'",
+                          "status='processing' AND source_type='remote'",
+                          "status='completed' AND source_type='remote'",
+                          "status IN ('queued','processing')"):
+                row = conn.execute(f"SELECT id, source_type, source_url, file_size FROM jobs WHERE {where} "
+                                   "AND COALESCE(file_size,0) > 0 ORDER BY RANDOM() LIMIT 1").fetchone()
+                if row:
+                    break
+        finally:
+            conn.close()
+    url = build_download_url(row[0], row[1], row[2]) if row else ""
+    if not url:
+        return jsonify({"status": "none"})
+    return jsonify({"status": "ok", "url": url, "size": row[3]})
 
 @app.route('/api/source_test')
 @requires_auth

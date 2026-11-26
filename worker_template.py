@@ -138,7 +138,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.15.1"
+WORKER_VERSION = "3.16.0"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -146,6 +146,8 @@ SHUTDOWN_EVENT = threading.Event()
 # SHUTDOWN_EVENT alone the worker is draining: active work is allowed to finish.
 ABORT_EVENT = threading.Event()
 UPDATE_AVAILABLE = False
+NO_AUTO_UPDATE = False       # --no-auto-update: announce new versions, never install them
+_ANNOUNCED_UPDATES = set()
 LAST_UPDATE_CHECK = 0
 CHECK_LOCK = threading.Lock()
 CONSOLE_LOCK = threading.Lock()
@@ -1070,6 +1072,12 @@ def check_version(manager_url):
             new_version = match.group(1).decode('ascii', 'replace')
             if new_version == WORKER_VERSION: return False
             if os.environ.get(_UPDATE_FAILED_ENV) == new_version: return False
+            if NO_AUTO_UPDATE:
+                if new_version not in _ANNOUNCED_UPDATES:
+                    _ANNOUNCED_UPDATES.add(new_version)
+                    safe_print(f"[!] Worker {new_version} is available (this is {WORKER_VERSION}). Auto-update is off; "
+                               f"to update, download {manager_url}/dl/worker over this script and restart.")
+                return False
             if _vet_update(body) != new_version:
                 safe_print(f"[!] Update {new_version} offered by the manager is incomplete or invalid. Ignoring it.")
                 return False
@@ -1542,7 +1550,7 @@ def _source_failure_diag(watch, url, is_local, offset=0):
     if not is_local:
         d["selftest"] = _source_selftest(url, offset)
         st = d["selftest"] or {}
-        if (_FFMPEG_ORIGIN == "fallback" and not st.get("error")
+        if (_FFMPEG_ORIGIN in ("fallback", "verified") and not st.get("error")
                 and d.get("phase") in ("opening", "probing", "encoding")):
             # The network is fine but this FFmpeg got stuck: the build in use
             # is the likely cause, so try to replace it now (in the background).
@@ -1558,6 +1566,8 @@ def _diag_text(d):
     origin = ff.get("origin")
     if origin == "override":
         out.append("This FFmpeg was chosen with --ffmpeg (not the worker's own build).")
+    elif origin == "verified":
+        out.append("This FFmpeg was found on the machine and had passed the worker's start-up tests.")
     elif origin == "fallback":
         out.append("The worker's own FFmpeg build could not be installed"
                    f"{' (' + ff['install_error'] + ')' if ff.get('install_error') else ''}; using one found on the machine.")
@@ -1977,10 +1987,17 @@ FFMPEG_REFRESH_SEC = 7 * 24 * 3600
 _FFMPEG_MGMT_LOCK = threading.Lock()
 _FFMPEG_MANAGED = False      # True while the worker's own build is in use
 # Why the FFmpeg in use was chosen, for source-read reports: "managed",
-# "override" (--ffmpeg), "fallback" (the worker's own build could not be
-# installed; _FFMPEG_INSTALL_ERR says why) or "system" (no managed build for
-# this OS/CPU).
+# "override" (--ffmpeg), "verified" (an FFmpeg found on the machine that is as
+# new as the newest release and passed the start-up tests, so nothing was
+# downloaded), "fallback" (the worker's own build could not be installed;
+# _FFMPEG_INSTALL_ERR says why) or "system" (no managed build for this OS/CPU).
 _FFMPEG_ORIGIN = "system"
+_FFMPEG_SYSTEM_LEVEL = None    # (major, minor) release level of a "verified" build
+_FFMPEG_SYSTEM_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.ffmpeg_system.json')
+# libavformat version of each release branch: how a development snapshot
+# ("N-12345-g...", "git-2026-...") is placed among releases. A branch missing
+# here just means such snapshots are not trusted to be that new.
+_LAVF_OF_RELEASE = {"7.1": (61, 7), "8.0": (62, 3), "8.1": (62, 12), "9.0": (63, 1)}
 _FFMPEG_INSTALL_ERR = ""
 _FFMPEG_LAST_RETRY = 0.0
 _FFMPEG_RETRY_LOCK = threading.Lock()
@@ -2121,6 +2138,135 @@ def _ffmpeg_selftest(ffmpeg, ffprobe):
             if os.path.exists(tmp): os.remove(tmp)
         except OSError:
             pass
+
+def _ffmpeg_release_level(ffmpeg):
+    """(major, minor) release this build is, or is at least as new as, or None.
+    Release and distro builds name it ("n9.0.2-...", "9.0.1", "8.0-full_build",
+    "7.1.5-0+deb13u1"); snapshots are placed by their libavformat version."""
+    try:
+        out = subprocess.run([ffmpeg, '-version'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             encoding='utf-8', errors='replace', timeout=15).stdout or ''
+    except Exception:
+        return None
+    m = re.match(r'ffmpeg version n?(\d+)\.(\d+)', out)
+    if m:
+        return (int(m.group(1)), int(m.group(2)))
+    m = re.search(r'libavformat\s+(\d+)\.\s*(\d+)', out)
+    if not m:
+        return None
+    lavf = (int(m.group(1)), int(m.group(2)))
+    known = [_vt(v) for v, lv in _LAVF_OF_RELEASE.items() if lavf >= lv]
+    return max(known) if known else None
+
+def _file_fingerprint(path):
+    try:
+        st = os.stat(path)
+        return {"path": os.path.abspath(path), "size": st.st_size, "mtime": int(st.st_mtime)}
+    except OSError:
+        return None
+
+def _load_system_verdict(path):
+    """A remembered failed test for exactly this binary (same path, size, date)."""
+    fp = _file_fingerprint(path)
+    try:
+        with open(_FFMPEG_SYSTEM_FILE) as f:
+            rec = json.load(f)
+        if fp and all(rec.get(k) == fp[k] for k in fp) and not rec.get("ok"):
+            return rec
+    except Exception:
+        pass
+    return None
+
+def _save_system_verdict(path, ok, why=""):
+    fp = _file_fingerprint(path)
+    if not fp:
+        return
+    try:
+        with open(_FFMPEG_SYSTEM_FILE, 'w') as f:
+            json.dump(dict(fp, ok=bool(ok), why=str(why)[:300], at=int(time.time())), f)
+    except Exception:
+        pass
+
+def _ffmpeg_source_read_test(ffmpeg, ffprobe, manager_url):
+    """(result, reason): can this build read a real source the way an encode
+    does (over HTTPS, seeking into the file)? result is True, False (it could
+    not, though the worker itself downloads that file fine: the build is at
+    fault) or None (inconclusive: no sample, or the network failed too)."""
+    try:
+        r = requests.get(f"{manager_url}/api/source_sample", headers=get_auth_headers(), timeout=20)
+        url = (r.json() or {}).get("url") if r.status_code == 200 else None
+    except Exception:
+        url = None
+    if not url:
+        return None, "the manager offered no source file to test with"
+    hdr = f"X-Worker-Token: {WORKER_SECRET}\r\n"
+    is_http = url.startswith(('http://', 'https://'))
+    why = ""
+    try:
+        pr = subprocess.run([ffprobe, '-v', 'error'] + (['-headers', hdr] if is_http else []) +
+                            ['-show_entries', 'format=duration', '-of', 'csv=p=0', url],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, encoding='utf-8',
+                            errors='replace', timeout=120)
+        dur = float(((pr.stdout or '').strip().splitlines() or ['0'])[0])
+        if pr.returncode != 0 or dur <= 0:
+            raise RuntimeError(f"ffprobe failed: {(pr.stdout or '').strip()[-150:]}")
+        res = subprocess.run([ffmpeg, '-hide_banner', '-nostdin', '-v', 'error'] +
+                             (_http_input_flags(hdr) if is_http else []) +
+                             ['-ss', f"{dur * 0.4:.3f}", '-i', url, '-t', '5', '-map', '0:v:0',
+                              '-f', 'null', '-'],
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, encoding='utf-8',
+                             errors='replace', timeout=180)
+        if res.returncode == 0:
+            return True, ""
+        why = f"reading it failed (rc={res.returncode}): {(res.stdout or '').strip()[-150:]}"
+    except subprocess.TimeoutExpired as e:
+        why = f"{os.path.basename(str(e.cmd[0]))} got stuck reading it ({int(e.timeout)}s)"
+    except Exception as e:
+        why = str(e)[:200]
+    st = _source_selftest(url, 0, seconds=4.0, max_bytes=8 * 1024 * 1024) if is_http else {}
+    if st.get("error"):
+        return None, f"{why}; the worker's own download of it failed too ({st['error']})"
+    return False, f"{why}, though the worker itself downloads that file fine"
+
+def _try_system_ffmpeg(found, manager_url):
+    """Use an FFmpeg found on the machine instead of downloading one, if it is
+    at least as new as the newest release and passes the same tests as the
+    worker's own build plus a real source read. Returns True when in use."""
+    global FFMPEG_CMD, FFPROBE_CMD, _FFMPEG_ORIGIN, _FFMPEG_SYSTEM_LEVEL, _FFMPEG_BUILD_INFO
+    level = _ffmpeg_release_level(found)
+    versions = _ffmpeg_release_versions()
+    newest = _vt(versions[0]) if versions else None
+    shown = f"{level[0]}.{level[1]}" if level else "unknown"
+    if not level or not newest or level < newest:
+        print(f"[*] The FFmpeg at {found} is release {shown}; the newest is "
+              f"{versions[0] if versions else 'unknown'}, so the worker installs that instead.")
+        return False
+    bad = _load_system_verdict(found)
+    if bad:
+        print(f"[*] The FFmpeg at {found} failed the worker's tests before ({bad.get('why')}); not using it.")
+        return False
+    fp = _sibling_ffprobe(found)
+    print(f"[*] Found FFmpeg {shown} at {found} (as new as the newest release); testing it on this machine...")
+    ok, why = _ffmpeg_selftest(found, fp)
+    if ok:
+        print("[*] Test encode OK; now reading a real source file with it...")
+        res, why = _ffmpeg_source_read_test(found, fp, manager_url)
+        if res is None:
+            print(f"[!] Could not finish the source read test ({why}); installing the worker's own build instead.")
+            return False
+        ok = res
+    if not ok:
+        print(f"[!] Not using it: {why}")
+        _save_system_verdict(found, False, why)
+        return False
+    _save_system_verdict(found, True)
+    FFMPEG_CMD = found
+    FFPROBE_CMD = fp
+    _FFMPEG_BUILD_INFO = None
+    _FFMPEG_ORIGIN = "verified"
+    _FFMPEG_SYSTEM_LEVEL = level
+    print(f"[*] Using the FFmpeg at {found}: it passed every test, so nothing needs downloading.")
+    return True
 
 def _extract_ffmpeg_binaries(archive, dest):
     """Copy just ffmpeg and ffprobe out of a BtbN archive into dest. The
@@ -2389,17 +2535,40 @@ def _ffmpeg_update_loop():
                 print(f"[!] FFmpeg update check failed: {e}")
         elif _FFMPEG_ORIGIN == "fallback":
             _retry_managed_ffmpeg(FFMPEG_FALLBACK_RETRY_SEC)
+        elif _FFMPEG_ORIGIN == "verified":
+            _check_system_still_newest()
         else:
             return
+
+_SYSTEM_LAST_CHECK = 0.0
+
+def _check_system_still_newest():
+    """Once a day: when a release newer than the verified system FFmpeg comes
+    out, install the worker's own build of it."""
+    global _SYSTEM_LAST_CHECK
+    if time.time() - _SYSTEM_LAST_CHECK < FFMPEG_BRANCH_CHECK_SEC:
+        return
+    _SYSTEM_LAST_CHECK = time.time()
+    versions = _ffmpeg_release_versions()
+    if versions and _FFMPEG_SYSTEM_LEVEL and _vt(versions[0]) > _FFMPEG_SYSTEM_LEVEL:
+        print(f"[*] FFmpeg {versions[0]} is out, newer than the one found on this machine; installing it.")
+        try:
+            ensure_best_ffmpeg(force=True)
+        except Exception as e:
+            print(f"[!] FFmpeg update failed: {e}")
 
 def _retry_managed_ffmpeg(min_gap, why=""):
     """On a fallback build, try again to install the worker's own build (at
     most once per min_gap). Encodes already running keep their binary."""
     global _FFMPEG_LAST_RETRY
     with _FFMPEG_RETRY_LOCK:   # several slots can fail at once: one attempt
-        if _FFMPEG_ORIGIN != "fallback" or time.time() - _FFMPEG_LAST_RETRY < min_gap:
+        if _FFMPEG_ORIGIN not in ("fallback", "verified") or time.time() - _FFMPEG_LAST_RETRY < min_gap:
             return
         _FFMPEG_LAST_RETRY = time.time()
+        if _FFMPEG_ORIGIN == "verified":
+            # It passed the start-up tests but got stuck on a real source:
+            # remember that, so the next start does not trust it again.
+            _save_system_verdict(FFMPEG_CMD, False, "got stuck on a source the worker itself could download")
     print(f"[*] Trying again to install the worker's own FFmpeg build{why}...")
     try:
         if ensure_best_ffmpeg(force=True):
@@ -2474,14 +2643,16 @@ def _sibling_ffprobe(ffmpeg_path):
                 return p
     return "ffprobe"
 
-def check_ffmpeg(override=None):
+def check_ffmpeg(override=None, manager_url=None):
     """Pick the FFmpeg to use at start. Returns True when _ffmpeg_update_loop()
     should run: on the worker's own managed build (kept current) or on a
     fallback build (the install is retried).
 
     Windows and Linux on x64/arm64: the worker's own newest working release
-    build (see the policy comment above ensure_best_ffmpeg). A build found on
-    the machine is only used when no managed build can be installed. --ffmpeg
+    build (see the policy comment above ensure_best_ffmpeg), unless an FFmpeg
+    on the machine is at least as new and passes a test encode and a real
+    source read (then nothing is downloaded). Otherwise a build found on the
+    machine is only used when no managed build can be installed. --ffmpeg
     PATH chooses a specific binary deliberately. Other platforms (macOS) have
     no managed build and use the one installed (e.g. Homebrew)."""
     global FFMPEG_CMD, FFPROBE_CMD, _FFMPEG_ORIGIN, _FFMPEG_LAST_RETRY
@@ -2513,10 +2684,12 @@ def check_ffmpeg(override=None):
                 _cleanup_old_ffmpeg_builds(keep_dir=cur.get("dir"))
         else:
             found = local_ffmpeg if os.path.exists(local_ffmpeg) else (shutil.which("ffmpeg") or None)
-            if found:
-                print(f"[*] Found an FFmpeg at {found}; installing the worker's own build (the newest FFmpeg "
-                      "release that works on this machine) instead, so every worker encodes with a known-good version.")
-                print("    To keep using that one, start the worker with --ffmpeg PATH.")
+            if found and manager_url and ffmpeg_is_capable(found):
+                try:
+                    if _try_system_ffmpeg(found, manager_url):
+                        return True
+                except Exception as e:
+                    print(f"[!] Testing the FFmpeg at {found} failed: {e}")
         try:
             if ensure_best_ffmpeg(force=cur is None or bool(cur.get("legacy"))):
                 return True
@@ -4431,9 +4604,6 @@ def run_worker(args):
         except:
             print("[!] Failed to save wallet to configuration file.")
 
-    if check_ffmpeg(getattr(args, 'ffmpeg', None)):
-        threading.Thread(target=_ffmpeg_update_loop, daemon=True).start()
-
     manager_url = (args.manager or DEFAULT_MANAGER_URL).rstrip('/')
     username = args.username or DEFAULT_USERNAME
     base_workername = args.workername or DEFAULT_WORKERNAME
@@ -4444,8 +4614,19 @@ def run_worker(args):
     if WORKER_SECRET == "DefaultInsecureSecret":
         print("[*] INFO: Using default WORKER_SECRET. Compatible with public manager defaults.")
     
+    global NO_AUTO_UPDATE
+    NO_AUTO_UPDATE = bool(getattr(args, 'no_auto_update', False))
+    if NO_AUTO_UPDATE:
+        print("[*] Auto-update is off (--no-auto-update): new worker versions are announced, not installed.")
+
     if not verify_connection(manager_url): sys.exit(1)
+    # Update first, then pick FFmpeg: the new version may choose differently,
+    # and an FFmpeg download right before a restart would be wasted.
     if check_version(manager_url): apply_update(manager_url)
+
+    # Needs the manager (and the token) to test an FFmpeg found on the machine.
+    if check_ffmpeg(getattr(args, 'ffmpeg', None), manager_url):
+        threading.Thread(target=_ffmpeg_update_loop, daemon=True).start()
     
     quota_tracker = None
     if args.daily_quota > 0:
@@ -4723,6 +4904,8 @@ if __name__ == "__main__":
                         help="Path to the source media directory on this machine. When set and the "
                              "source file exists locally, it is read directly instead of streaming "
                              "over HTTP (useful when this worker runs on the server itself).")
+    parser.add_argument("--no-auto-update", action="store_true", default=False,
+                        help="Never replace this script with a newer version from the manager; just say when one is available")
     parser.add_argument("--no-chunks", action="store_true", default=False,
                         help="Opt out of chunked encoding: always take whole files instead of "
                              "time-slices of videos split across multiple workers.")
