@@ -3348,6 +3348,17 @@ def download_worker_script():
     resp.headers['Content-Type'] = 'text/x-python; charset=utf-8'
     return resp
 
+@app.route('/dl/worker.sig')
+def download_worker_signature():
+    """The project owner's signature of worker_template.py (made with
+    ssh-keygen -Y sign, kept next to it as worker_template.py.sig). Workers
+    3.17.0+ install an update only when this verifies with a key built into
+    them; the signing key never lives on this server."""
+    sig = WORKER_TEMPLATE_FILE + '.sig'
+    if not os.path.exists(sig):
+        return abort(404)
+    return send_file(os.path.abspath(sig), mimetype='text/plain')
+
 # [ADDED] Route to serve the watermark font to workers
 @app.route('/dl/font')
 def download_font():

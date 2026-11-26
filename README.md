@@ -40,7 +40,7 @@ Encoded output is intended for [https://vsv.fractumseraph.net/](https://vsv.frac
 | `--max-size-mb N` | `0` (no limit) | Skip source files larger than N MB |
 | `--local-source DIR` | *(none)* | Read source files directly from disk instead of HTTP — useful when the worker runs on the same machine as the manager |
 | `--no-chunks` | off | Opt out of chunked encoding — always take whole files |
-| `--no-auto-update` | off | Never replace the worker script with a newer version from the manager; the worker only says when one is available (download `<manager>/dl/worker` over the script yourself). The manager still turns away workers older than its `MIN_CLIENT_VERSION` |
+| `--no-auto-update` | off | Never replace the worker script with a newer version from the manager; the worker only says when one is available (download `<manager>/dl/worker` over the script yourself). The manager still turns away workers older than its `MIN_CLIENT_VERSION`. Updates that are installed are always checked against the project's signing key (see Security Notes) |
 | `--ffmpeg PATH` | *(worker's own build)* | Use this FFmpeg instead of the worker's own build (see below); `ffprobe` is taken from the same folder |
 | `--wallet ADDR` | *(none)* | FractumCoin wallet address — verified uploads are credited to it for later payout (saved to `worker_config.json`) |
 
@@ -570,3 +570,29 @@ snapshots print a warning (unreleased builds have produced broken uploads).
 - Put the server behind a reverse proxy (nginx / Caddy) with HTTPS in production.
 - `ADMIN_PASS` is used for HTTP Basic Auth on the `/admin` route. Do not reuse a password you use elsewhere.
 - Workers are validated against a minimum version (`MIN_CLIENT_VERSION` in `manager.py`). Outdated workers are denied jobs until they auto-update.
+
+### Signed worker updates (worker 3.17.0+)
+
+Workers install a new `worker.py` from the manager only when it is **signed by the project owner's key** and is **newer** than the one running. The signing key never lives on the manager server, so someone who breaks into the server, or into the git checkout it serves from, cannot push code onto volunteers' machines: workers refuse the update, keep running their current version, and say why.
+
+- The trusted public key(s) are built into the worker (`UPDATE_SIGNING_KEYS` in `worker_template.py`, Ed25519 only, checked in pure Python with no extra package). Add a second, backup key there while you still can sign: if the only private key is lost, workers can only be updated by reinstalling them.
+- The signature is an ordinary OpenSSH signature, kept next to the script as `worker_template.py.sig` and served at `/dl/worker.sig`. If the manager fills a custom `WORKER_SECRET` into the script it serves, workers undo that one line before checking, so one signature works for every manager.
+- `launch_worker.ps1` hands each fresh download to the worker already installed (`worker.py --install-update worker.py.new`), which applies the same check. The `/install` one-liners and the Docker image download the worker from the manager every time they start, and the one-liners are themselves served by the manager, so those cannot protect a first install from a compromised server; once installed, every update is checked.
+- Running your own manager with your own changes to the worker? Put your own public key in `UPDATE_SIGNING_KEYS` and sign with it, or start workers with `--no-auto-update`.
+
+**Releasing a worker update** (after the change is merged into `main`), on the machine that holds the private key:
+
+```
+git pull
+ssh-keygen -Y sign -f FractumEncodes -n fractum-worker worker_template.py
+git add worker_template.py.sig
+git commit -m "Sign worker <version>"
+git push
+```
+
+(Remove the old `worker_template.py.sig` first, or answer `y` when `ssh-keygen` asks to overwrite it.) Then pull on the manager. Until the matching signature is there, workers refuse the new version and retry every ten minutes; nothing breaks. To check a signature yourself:
+
+```
+echo "fractum ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHH/vpS1Q+KoSPBObtdZYEztRqC8Nppg/mkkTsBQGG7c" > allowed_signers
+ssh-keygen -Y verify -f allowed_signers -I fractum -n fractum-worker -s worker_template.py.sig < worker_template.py
+```

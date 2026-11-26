@@ -79,8 +79,21 @@ if (-not $pythonExists) {
 try { pip install requests --disable-pip-version-check | Out-Null } catch { python -m pip install requests | Out-Null }
 
 # --- 4. Download Worker ---
+# A worker already here decides whether the download may replace it: workers
+# 3.17.0+ only accept a script signed by the project's key. (An older worker
+# does not know --install-update; argparse then exits with 2 and the download
+# is used as before.)
 try {
-    Invoke-WebRequest $WorkerUrl -OutFile "worker.py" -UseBasicParsing
+    if (Test-Path "worker.py") {
+        Invoke-WebRequest $WorkerUrl -OutFile "worker.py.new" -UseBasicParsing
+        python worker.py --install-update worker.py.new --manager $ManagerUrl
+        if ($LASTEXITCODE -eq 2 -and (Test-Path "worker.py.new")) {
+            Move-Item -Force "worker.py.new" "worker.py"
+        }
+        if (Test-Path "worker.py.new") { Remove-Item -Force "worker.py.new" }
+    } else {
+        Invoke-WebRequest $WorkerUrl -OutFile "worker.py" -UseBasicParsing
+    }
 } catch {
     if (-not (Test-Path "worker.py")) {
         Show-Error "Could not download worker script.`nCheck internet connection."
