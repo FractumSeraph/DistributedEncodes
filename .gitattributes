@@ -1,0 +1,5 @@
+# The release signature covers these exact bytes: never convert line endings
+# (Git for Windows would otherwise check worker_template.py out with CRLF, and a
+# signature made from that copy would not match the one the manager serves).
+worker_template.py text eol=lf
+worker_template.py.sig text eol=lf

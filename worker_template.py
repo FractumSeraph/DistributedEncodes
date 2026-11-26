@@ -138,7 +138,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.16.0"
+WORKER_VERSION = "3.17.0"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -1055,6 +1055,211 @@ def _vet_update(body):
         return None
     return match.group(1)
 
+
+# ---------------------------------------------------------------------------
+# Signed updates (worker 3.17.0+)
+#
+# A new worker script is installed only when it carries a valid signature
+# from one of these keys. The private keys stay with the project owner, never
+# on the manager server, so someone who breaks into the server (or into the
+# git checkout it serves from) cannot push code onto volunteers' machines.
+# Signatures are OpenSSH "SSHSIG" signatures made with
+#     ssh-keygen -Y sign -f <key> -n fractum-worker worker_template.py
+# and served next to the script as /dl/worker.sig. Ed25519 keys only. Running
+# your own manager with your own worker? Put your public key(s) here.
+# ---------------------------------------------------------------------------
+UPDATE_SIGNING_KEYS = [
+    # ssh-ed25519 public key blobs (the middle part of the .pub file)
+    "AAAAC3NzaC1lZDI1NTE5AAAAIHH/vpS1Q+KoSPBObtdZYEztRqC8Nppg/mkkTsBQGG7c",  # FractumEncodes
+]
+UPDATE_SIG_NAMESPACE = "fractum-worker"
+
+# Ed25519 verification (RFC 8032), pure Python so no extra package is needed.
+_ED_P = 2 ** 255 - 19
+_ED_L = 2 ** 252 + 27742317777372353535851937790883648493
+_ED_D = -121665 * pow(121666, _ED_P - 2, _ED_P) % _ED_P
+_ED_I = pow(2, (_ED_P - 1) // 4, _ED_P)
+
+def _ed_add(P, Q):
+    (X1, Y1, Z1, T1), (X2, Y2, Z2, T2) = P, Q
+    p = _ED_P
+    A = (Y1 - X1) * (Y2 - X2) % p
+    B = (Y1 + X1) * (Y2 + X2) % p
+    C = 2 * T1 * T2 * _ED_D % p
+    D = 2 * Z1 * Z2 % p
+    E, F, G, H = B - A, D - C, D + C, B + A
+    return (E * F % p, G * H % p, F * G % p, E * H % p)
+
+def _ed_mul(k, P):
+    Q = (0, 1, 1, 0)
+    while k:
+        if k & 1:
+            Q = _ed_add(Q, P)
+        P = _ed_add(P, P)
+        k >>= 1
+    return Q
+
+def _ed_decode(b):
+    if len(b) != 32:
+        return None
+    y = int.from_bytes(b, 'little')
+    sign = y >> 255
+    y &= (1 << 255) - 1
+    if y >= _ED_P:
+        return None
+    x2 = (y * y - 1) * pow(_ED_D * y * y + 1, _ED_P - 2, _ED_P) % _ED_P
+    if x2 == 0:
+        if sign:
+            return None
+        x = 0
+    else:
+        x = pow(x2, (_ED_P + 3) // 8, _ED_P)
+        if (x * x - x2) % _ED_P:
+            x = x * _ED_I % _ED_P
+        if (x * x - x2) % _ED_P:
+            return None
+        if (x & 1) != sign:
+            x = _ED_P - x
+    return (x, y, 1, x * y % _ED_P)
+
+def _ed_equal(P, Q):
+    p = _ED_P
+    return (P[0] * Q[2] - Q[0] * P[2]) % p == 0 and (P[1] * Q[2] - Q[1] * P[2]) % p == 0
+
+_ED_G = _ed_decode(bytes.fromhex("5866666666666666666666666666666666666666666666666666666666666666"))
+
+def ed25519_verify(public, msg, sig):
+    """True when sig is a valid Ed25519 signature of msg by public (32 bytes)."""
+    if len(public) != 32 or len(sig) != 64:
+        return False
+    A = _ed_decode(public)
+    R = _ed_decode(sig[:32])
+    s = int.from_bytes(sig[32:], 'little')
+    if A is None or R is None or s >= _ED_L:
+        return False
+    h = int.from_bytes(hashlib.sha512(sig[:32] + public + msg).digest(), 'little') % _ED_L
+    return _ed_equal(_ed_mul(s, _ED_G), _ed_add(R, _ed_mul(h, A)))
+
+def _ssh_string(buf, pos):
+    if pos + 4 > len(buf):
+        raise ValueError("truncated")
+    n = int.from_bytes(buf[pos:pos + 4], 'big')
+    if pos + 4 + n > len(buf):
+        raise ValueError("truncated")
+    return buf[pos + 4:pos + 4 + n], pos + 4 + n
+
+def _ssh_pack(b):
+    return len(b).to_bytes(4, 'big') + b
+
+def verify_sshsig(message, armored, allowed_keys=None, namespace=None):
+    """(ok, reason) for an OpenSSH SSHSIG signature (ssh-keygen -Y sign) of
+    message by one of allowed_keys (base64 ssh-ed25519 public key blobs)."""
+    import base64
+    allowed_keys = UPDATE_SIGNING_KEYS if allowed_keys is None else allowed_keys
+    namespace = UPDATE_SIG_NAMESPACE if namespace is None else namespace
+    try:
+        text = armored.decode('ascii') if isinstance(armored, bytes) else armored
+        lines = [l.strip() for l in text.strip().splitlines()]
+        if not lines or lines[0] != "-----BEGIN SSH SIGNATURE-----" or lines[-1] != "-----END SSH SIGNATURE-----":
+            return False, "not an SSH signature"
+        blob = base64.b64decode("".join(lines[1:-1]), validate=True)
+        if blob[:6] != b"SSHSIG" or int.from_bytes(blob[6:10], 'big') != 1:
+            return False, "unsupported signature format"
+        pos = 10
+        pubkey, pos = _ssh_string(blob, pos)
+        ns, pos = _ssh_string(blob, pos)
+        reserved, pos = _ssh_string(blob, pos)
+        hash_alg, pos = _ssh_string(blob, pos)
+        sigblob, pos = _ssh_string(blob, pos)
+        if ns.decode('utf-8', 'replace') != namespace:
+            return False, f"signed for '{ns.decode('utf-8', 'replace')}', not '{namespace}'"
+        if pubkey not in [base64.b64decode(k) for k in allowed_keys]:
+            return False, "signed with a key this worker does not trust"
+        ktype, kp = _ssh_string(pubkey, 0)
+        kraw, _ = _ssh_string(pubkey, kp)
+        stype, sp = _ssh_string(sigblob, 0)
+        sraw, _ = _ssh_string(sigblob, sp)
+        if ktype != b"ssh-ed25519" or stype != b"ssh-ed25519":
+            return False, "only ssh-ed25519 signatures are accepted"
+        if hash_alg == b"sha512":
+            digest = hashlib.sha512(message).digest()
+        elif hash_alg == b"sha256":
+            digest = hashlib.sha256(message).digest()
+        else:
+            return False, "unsupported hash"
+        signed = (b"SSHSIG" + _ssh_pack(ns) + _ssh_pack(reserved) + _ssh_pack(hash_alg) + _ssh_pack(digest))
+        if not ed25519_verify(kraw, signed, sraw):
+            return False, "the signature does not match the script"
+        return True, ""
+    except Exception as e:
+        return False, f"unreadable signature ({type(e).__name__})"
+
+# The manager writes its worker token into this one line when it is not the
+# stock one (see _worker_script_bytes in manager.py); the signature covers the
+# stock line, so put it back before checking. The token is only ever a plain
+# string literal here, so nothing else can hide in that line.
+# (Built in two parts so this file contains the stock line only once: the
+# manager substitutes the token only when it finds exactly one.)
+_STOCK_SECRET_LINE = b'WORKER_SECRET = os.environ.get("WORKER_SECRET", ' + b'"DefaultInsecureSecret")'
+_SECRET_LINE_RE = re.compile(rb'^WORKER_SECRET = os.environ.get\("WORKER_SECRET", "(?:[^"\\\r\n]|\\[^\r\n])*"\)$', re.M)
+
+def _signed_form(body):
+    return _SECRET_LINE_RE.sub(lambda m: _STOCK_SECRET_LINE, body, count=1)
+
+def _version_tuple(v):
+    try:
+        return tuple(int(x) for x in str(v).split('.'))
+    except ValueError:
+        return None
+
+def _verify_update(manager_url, body, new_version):
+    """(ok, reason): may this downloaded script replace the running one?"""
+    nv, cv = _version_tuple(new_version), _version_tuple(WORKER_VERSION)
+    if nv is None or cv is None or nv <= cv:
+        return False, f"{new_version} is not newer than {WORKER_VERSION}"
+    try:
+        r = requests.get(f"{manager_url}/dl/worker.sig", headers=get_auth_headers(), timeout=30)
+    except Exception as e:
+        return False, f"could not download its signature ({type(e).__name__})"
+    if r.status_code != 200:
+        return False, f"it is not signed (no signature on the manager, HTTP {r.status_code})"
+    return verify_sshsig(_signed_form(body), r.content)
+
+def install_update_file(path, manager_url):
+    """--install-update PATH: let THIS (already trusted) worker decide whether
+    a freshly downloaded script may replace it. For launchers that download
+    worker.py on every start, which would otherwise skip the signature check.
+    Exit code 0: installed, or the same script; 1: rejected (this one stays)."""
+    try:
+        with open(path, 'rb') as f:
+            body = f.read()
+    except OSError as e:
+        print(f"[!] Cannot read {path}: {e}")
+        return 1
+    target = os.path.abspath(sys.argv[0])
+    try:
+        with open(target, 'rb') as f:
+            current = f.read()
+    except OSError:
+        current = b''
+    try:
+        if _signed_form(body) == _signed_form(current):
+            os.remove(path)
+            return 0
+    except OSError:
+        pass
+    new_version = _vet_update(body)
+    ok, why = (False, "not a complete worker script") if new_version is None else \
+        _verify_update(manager_url.rstrip('/'), body, new_version)
+    if not ok:
+        print(f"[!] NOT installing the downloaded worker ({new_version or '?'}): {why}. Keeping {WORKER_VERSION}.")
+        try: os.remove(path)
+        except OSError: pass
+        return 1
+    os.replace(path, target)
+    print(f"[*] Installed worker {new_version} (signature OK).")
+    return 0
+
 def check_version(manager_url):
     global LAST_UPDATE_CHECK
     with CHECK_LOCK:
@@ -1072,14 +1277,21 @@ def check_version(manager_url):
             new_version = match.group(1).decode('ascii', 'replace')
             if new_version == WORKER_VERSION: return False
             if os.environ.get(_UPDATE_FAILED_ENV) == new_version: return False
+            if _vet_update(body) != new_version:
+                safe_print(f"[!] Update {new_version} offered by the manager is incomplete or invalid. Ignoring it.")
+                return False
+            ok, why = _verify_update(manager_url, body, new_version)
+            if not ok:
+                if new_version not in _ANNOUNCED_UPDATES:
+                    _ANNOUNCED_UPDATES.add(new_version)
+                    safe_print(f"[!] NOT installing worker {new_version} from the manager: {why}. "
+                               f"Staying on {WORKER_VERSION}. (Updates must be signed by the project's key.)")
+                return False
             if NO_AUTO_UPDATE:
                 if new_version not in _ANNOUNCED_UPDATES:
                     _ANNOUNCED_UPDATES.add(new_version)
                     safe_print(f"[!] Worker {new_version} is available (this is {WORKER_VERSION}). Auto-update is off; "
                                f"to update, download {manager_url}/dl/worker over this script and restart.")
-                return False
-            if _vet_update(body) != new_version:
-                safe_print(f"[!] Update {new_version} offered by the manager is incomplete or invalid. Ignoring it.")
                 return False
             _PENDING_UPDATE["body"] = body; _PENDING_UPDATE["version"] = new_version
             safe_print(f"[!] Update found: {WORKER_VERSION} -> {new_version}")
@@ -1095,13 +1307,8 @@ def apply_update(manager_url):
     try:
         body = _PENDING_UPDATE.get("body")
         if body is None:
-            r = requests.get(f"{manager_url}/dl/worker", headers=get_auth_headers(), timeout=30)
-            if r.status_code != 200:
-                raise RuntimeError(f"HTTP {r.status_code}")
-            body = r.content
-            version = _vet_update(body)
-            if version is None:
-                raise RuntimeError("downloaded script is incomplete or invalid")
+            # Only a script check_version() downloaded AND verified is installed.
+            raise RuntimeError("no verified update to install")
         tmp_path = target_path + '.tmp'
         with open(tmp_path, 'wb') as f:
             f.write(body)
@@ -4904,6 +5111,7 @@ if __name__ == "__main__":
                         help="Path to the source media directory on this machine. When set and the "
                              "source file exists locally, it is read directly instead of streaming "
                              "over HTTP (useful when this worker runs on the server itself).")
+    parser.add_argument("--install-update", default=None, metavar="FILE", help=argparse.SUPPRESS)
     parser.add_argument("--no-auto-update", action="store_true", default=False,
                         help="Never replace this script with a newer version from the manager; just say when one is available")
     parser.add_argument("--no-chunks", action="store_true", default=False,
@@ -4914,4 +5122,8 @@ if __name__ == "__main__":
                              "this address on the manager so encoding rewards can be paid out. "
                              "Saved to worker_config.json after first use.")
     args = parser.parse_args()
+    if args.install_update:
+        if args.secret:
+            WORKER_SECRET = args.secret
+        sys.exit(install_update_file(args.install_update, (args.manager or DEFAULT_MANAGER_URL)))
     run_worker(args)
