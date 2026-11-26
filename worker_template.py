@@ -138,7 +138,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.15.0"
+WORKER_VERSION = "3.15.1"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -1971,7 +1971,6 @@ def _compute_source_hash(dl_url, is_local):
 #   FFMPEG_REFRESH_SEC (each download is 100-200 MB).
 _FFMPEG_FALLBACK_VERSIONS = ("9.0", "8.1")  # newest first; used only when discovery fails
 _FFMPEG_DL_BASE = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/"
-_FFMPEG_MIRROR = "https://vsv.fractumseraph.net/"   # Windows fallback when GitHub is unreachable
 _FFMPEG_BUILDS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ffmpeg_builds')
 FFMPEG_BRANCH_CHECK_SEC = 24 * 3600
 FFMPEG_REFRESH_SEC = 7 * 24 * 3600
@@ -2124,12 +2123,15 @@ def _ffmpeg_selftest(ffmpeg, ffprobe):
             pass
 
 def _extract_ffmpeg_binaries(archive, dest):
-    """Copy just ffmpeg and ffprobe out of a BtbN archive into dest."""
+    """Copy just ffmpeg and ffprobe out of a BtbN archive into dest. The
+    format is read from the file itself (Windows builds are .zip, Linux
+    .tar.xz); the downloaded file's name does not say."""
     os.makedirs(dest, exist_ok=True)
-    exe = ".exe" if archive.endswith('.zip') else ""
+    is_zip = zipfile.is_zipfile(archive)
+    exe = ".exe" if is_zip else ""
     want = {f"ffmpeg{exe}", f"ffprobe{exe}"}
     got = set()
-    if archive.endswith('.zip'):
+    if is_zip:
         with zipfile.ZipFile(archive) as z:
             for n in z.namelist():
                 base = n.rsplit('/', 1)[-1]
@@ -2157,8 +2159,6 @@ def _install_ffmpeg_build(version):
         return None
     name = _ffmpeg_asset_name(version)
     urls = [_FFMPEG_DL_BASE + name]
-    if platform.system() == "Windows":
-        urls.append(_FFMPEG_MIRROR + name)
     os.makedirs(_FFMPEG_BUILDS_DIR, exist_ok=True)
     dest = os.path.join(_FFMPEG_BUILDS_DIR, f"n{version}-{time.strftime('%Y%m%d-%H%M%S')}")
     archive = dest + ".download"
