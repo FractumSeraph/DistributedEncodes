@@ -1,4 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="ic_launcher_background">#1F3A5F</color>
+    <!-- The site's palette (templates/dashboard.html) -->
+    <color name="bg_dark">#FF000000</color>
+    <color name="neon_purple">#FFCC00FF</color>
+    <color name="neon_pink">#FFFF00AA</color>
+    <color name="neon_green">#FF00FF41</color>
+    <color name="text_light">#FFE0E0E0</color>
+    <color name="text_dim">#FF888888</color>
+    <color name="ic_launcher_background">#FF000000</color>
 </resources>

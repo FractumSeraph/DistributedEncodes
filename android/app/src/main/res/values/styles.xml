@@ -2,24 +2,116 @@
 <resources>
     <string name="app_name">Fractum Worker</string>
 
-    <style name="Section">
+    <style name="AppTheme" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@drawable/bg_grid</item>
+        <item name="android:colorAccent">@color/neon_purple</item>
+        <item name="android:colorPrimary">@color/bg_dark</item>
+        <item name="android:colorPrimaryDark">@color/bg_dark</item>
+        <item name="android:statusBarColor">@color/bg_dark</item>
+        <item name="android:navigationBarColor">@color/bg_dark</item>
+        <item name="android:textColorPrimary">@color/text_light</item>
+        <item name="android:textColorSecondary">@color/text_dim</item>
+        <item name="android:textColorHint">#66888888</item>
+        <item name="android:colorControlNormal">#99CC00FF</item>
+        <item name="android:colorControlActivated">@color/neon_pink</item>
+    </style>
+
+    <style name="Panel">
         <item name="android:layout_width">match_parent</item>
         <item name="android:layout_height">wrap_content</item>
-        <item name="android:layout_marginTop">20dp</item>
-        <item name="android:textSize">16sp</item>
-        <item name="android:textStyle">bold</item>
+        <item name="android:orientation">vertical</item>
+        <item name="android:background">@drawable/panel</item>
+        <item name="android:padding">14dp</item>
+        <item name="android:layout_marginTop">14dp</item>
+    </style>
+
+    <style name="PanelTitle">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:textColor">@color/neon_pink</item>
+        <item name="android:textSize">15sp</item>
+        <item name="android:textAllCaps">true</item>
+        <item name="android:letterSpacing">0.1</item>
+        <item name="android:shadowColor">@color/neon_pink</item>
+        <item name="android:shadowRadius">8</item>
+        <item name="android:layout_marginBottom">8dp</item>
     </style>
 
     <style name="Label">
         <item name="android:layout_width">match_parent</item>
         <item name="android:layout_height">wrap_content</item>
-        <item name="android:layout_marginTop">8dp</item>
-        <item name="android:textSize">13sp</item>
+        <item name="android:layout_marginTop">10dp</item>
+        <item name="android:textSize">12sp</item>
+        <item name="android:textColor">@color/neon_purple</item>
+        <item name="android:textAllCaps">true</item>
+    </style>
+
+    <style name="Hint">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:textSize">12sp</item>
+        <item name="android:textColor">@color/text_dim</item>
     </style>
 
     <style name="Field">
         <item name="android:layout_width">match_parent</item>
         <item name="android:layout_height">wrap_content</item>
+        <item name="android:layout_marginTop">4dp</item>
         <item name="android:singleLine">true</item>
+        <item name="android:background">@drawable/field</item>
+        <item name="android:padding">10dp</item>
+        <item name="android:textColor">@color/text_light</item>
+        <item name="android:textSize">14sp</item>
+    </style>
+
+    <style name="Check">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:layout_marginTop">6dp</item>
+        <item name="android:textColor">@color/text_light</item>
+        <item name="android:textSize">14sp</item>
+        <item name="android:buttonTint">@color/neon_purple</item>
+    </style>
+
+    <style name="NeonButton">
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:background">@drawable/btn_neon</item>
+        <item name="android:textColor">@color/btn_neon_text</item>
+        <item name="android:textAllCaps">true</item>
+        <item name="android:textSize">13sp</item>
+        <item name="android:textStyle">bold</item>
+        <item name="android:minHeight">44dp</item>
+        <item name="android:paddingLeft">8dp</item>
+        <item name="android:paddingRight">8dp</item>
+        <item name="android:stateListAnimator">@null</item>
+    </style>
+
+    <style name="KpiBox">
+        <item name="android:layout_width">0dp</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:layout_weight">1</item>
+        <item name="android:orientation">vertical</item>
+        <item name="android:background">@drawable/kpi</item>
+        <item name="android:padding">8dp</item>
+        <item name="android:gravity">center_horizontal</item>
+    </style>
+
+    <style name="KpiValue">
+        <item name="android:layout_width">wrap_content</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:textSize">20sp</item>
+        <item name="android:textStyle">bold</item>
+        <item name="android:textColor">@color/text_light</item>
+        <item name="android:shadowColor">@color/text_light</item>
+        <item name="android:shadowRadius">5</item>
+    </style>
+
+    <style name="KpiLabel">
+        <item name="android:layout_width">wrap_content</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:textSize">10sp</item>
+        <item name="android:textColor">@color/neon_purple</item>
+        <item name="android:textAllCaps">true</item>
+        <item name="android:layout_marginTop">2dp</item>
     </style>
 </resources>

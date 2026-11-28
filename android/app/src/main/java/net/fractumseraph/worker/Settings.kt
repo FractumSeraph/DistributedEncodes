@@ -42,6 +42,12 @@ class Settings(context: Context) {
     var autoStart: Boolean
         get() = p.getBoolean("autoStart", false)
         set(v) = p.edit().putBoolean("autoStart", v).apply()
+    var autoUpdate: Boolean
+        get() = p.getBoolean("autoUpdate", true)
+        set(v) = p.edit().putBoolean("autoUpdate", v).apply()
+    var lastUpdateCheck: Long
+        get() = p.getLong("lastUpdateCheck", 0L)
+        set(v) = p.edit().putLong("lastUpdateCheck", v).apply()
     /** The user pressed Start and has not stopped it since. */
     var wantRunning: Boolean
         get() = p.getBoolean("wantRunning", false)

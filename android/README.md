@@ -6,6 +6,8 @@ An Android app that runs the regular worker (`worker_template.py`, the same scri
 - **Runs in the background** as a foreground service with a notification, with the screen off, and keeps the CPU and Wi-Fi awake while it works.
 - **Device-friendly by default.** It works only while charging, only on Wi-Fi (unmetered networks), and pauses above 40 °C battery temperature (resuming 3 °C lower). All three can be changed in the app. Pausing freezes the encode, and it continues where it stopped.
 - **Can work fully automatically.** With *Work automatically* ticked, the app starts when the device boots (and after app updates) and waits in the background, holding no wake lock, until the device is charging on Wi-Fi. Then it encodes by itself, every time it is plugged in. If it stays paused for more than 30 minutes (unplugged in the morning, say), it hands the unfinished work back to the server, so nothing waits half-done for hours, and it takes fresh work the next time.
+- **Updates itself.** Every change to the app on `main` is built by GitHub Actions and published as a release. The app checks for one every 6 hours on Wi-Fi (or when you tap *Check for app update*) and installs it, but never in the middle of an encode. Android asks you to confirm the first update; on Android 12+ later ones install by themselves. The worker script inside keeps updating itself from the manager as before.
+- **Looks like the site,** and shows its live numbers: completed, queued, encoding now, the last 24 hours, the leaderboard with your place on it, and what is being encoded right now.
 - **Same rules as every worker.** It updates itself from the manager, uses the same encoding settings, and shows on the dashboard as `<name>-<device>`.
 
 Requirements: a 64-bit ARM device (`arm64-v8a`) running Android 7.0 (API 24) or newer. Encoding at preset 2 is heavy: expect a 10-minute chunk to take hours on a tablet, and run one encode at a time unless the device has many fast cores.
@@ -48,7 +50,11 @@ echo "sdk.dir=$ANDROID_HOME" > local.properties
 
 Copy the APK next to `manager.py` as `FractumWorker.apk` (or set `ANDROID_APK_FILE` in `config.py`). The dashboard then offers it, and `/dl/android` serves it.
 
-**Signing.** Without the variables below, the release APK is signed with the build machine's debug key. That is fine for testing, but Android installs an update over an installed app only when both are signed with the same key. For releases, make one keystore, keep it safe, and build with:
+**Automatic builds.** `.github/workflows/android.yml` builds the app on every push to `main` that touches `android/`, `worker_template.py` or the workflow, or when started by hand (Actions -> Android app -> Run workflow). It caches the FFmpeg build, which is rebuilt only when `ffmpeg/build.sh` changes. Each run gets versionCode 100 + the run number and versionName `1.2.<versionCode>`. With the signing secrets set, it publishes a release `android-v1.2.<n>` containing `FractumWorker.apk` and `update.json`, marked latest. The app's updater reads `releases/latest/download/update.json`. Without the secrets, the APK is kept only as a workflow artifact.
+
+The secrets (Settings -> Secrets and variables -> Actions): `ANDROID_KEYSTORE_B64` (the keystore file, base64), `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS` and `ANDROID_KEY_PASSWORD`. **Keep the keystore safe and backed up.** Android installs an update only when it is signed with the same key as the installed app; with a new key, everyone has to uninstall and reinstall.
+
+**Signing locally.** Without the variables below, the release APK is signed with the build machine's debug key. That is fine for testing, but Android installs an update over an installed app only when both are signed with the same key. For releases, make one keystore, keep it safe, and build with:
 
 ```
 FRACTUM_KEYSTORE=/path/release.jks FRACTUM_KEYSTORE_PASSWORD=... \
