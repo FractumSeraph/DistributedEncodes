@@ -140,6 +140,19 @@ def _run(cfg):
             spec = importlib.util.spec_from_file_location(f"fractum_worker_{n}", script)
             m = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(m)
+            if not all(hasattr(m, a) for a in ("EMBEDDED", "build_arg_parser", "embedded_pause", "RestartForUpdate")):
+                # A worker older than 3.18.0 cannot run inside the app (it would
+                # restart the whole process to update, and has no app pause).
+                # Go back to the copy shipped in the app, and never take that
+                # version again in this run.
+                bad = getattr(m, "WORKER_VERSION", "?")
+                _add_line(f"[!] Worker {bad} cannot run in the app (it needs 3.18.0 or newer); "
+                          f"using the app's own copy instead.")
+                os.environ["FRACTUM_UPDATE_FAILED"] = str(bad)
+                if n > 3 or not os.path.exists(cfg["bundled"]):
+                    raise RuntimeError(f"no usable worker script (got {bad})")
+                shutil.copyfile(cfg["bundled"], script)
+                continue
             m.EMBEDDED = True
             m.FFPROBE_OVERRIDE = cfg["ffprobe"]
             argv = ["--no-tui", "--manager", cfg["manager"], "--username", cfg["username"],
