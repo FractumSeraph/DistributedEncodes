@@ -1,0 +1,120 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/scroll"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="16dp">
+
+        <TextView
+            android:id="@+id/status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textSize="18sp"
+            android:textStyle="bold"
+            android:text="Stopped" />
+
+        <TextView
+            android:id="@+id/statusDetail"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:textSize="14sp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:orientation="horizontal">
+
+            <Button
+                android:id="@+id/btnStart"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="Start" />
+
+            <Button
+                android:id="@+id/btnFinish"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="Finish &amp; stop" />
+
+            <Button
+                android:id="@+id/btnAbort"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="Stop now" />
+        </LinearLayout>
+
+        <TextView style="@style/Section" android:text="Account" />
+
+        <TextView style="@style/Label" android:text="Your name (shown on the scoreboard)" />
+        <EditText android:id="@+id/username" style="@style/Field" android:inputType="text" />
+
+        <TextView style="@style/Label" android:text="This device's name" />
+        <EditText android:id="@+id/workerName" style="@style/Field" android:inputType="text" />
+
+        <TextView style="@style/Label" android:text="FractumCoin wallet (optional)" />
+        <EditText android:id="@+id/wallet" style="@style/Field" android:inputType="text" />
+
+        <TextView style="@style/Section" android:text="When to work" />
+
+        <CheckBox
+            android:id="@+id/chargingOnly"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Only while charging" />
+
+        <CheckBox
+            android:id="@+id/wifiOnly"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Only on Wi-Fi (unmetered networks)" />
+
+        <TextView style="@style/Label" android:text="Pause above this battery temperature (°C)" />
+        <EditText android:id="@+id/maxTemp" style="@style/Field" android:inputType="number" />
+
+        <TextView style="@style/Section" android:text="Work" />
+
+        <TextView style="@style/Label" android:text="Encodes at once (1 is best for most tablets)" />
+        <EditText android:id="@+id/jobs" style="@style/Field" android:inputType="number" />
+
+        <TextView style="@style/Label" android:text="Skip whole files larger than (MB, 0 = no limit)" />
+        <EditText android:id="@+id/maxSize" style="@style/Field" android:inputType="number" />
+
+        <TextView style="@style/Section" android:text="Server" />
+
+        <TextView style="@style/Label" android:text="Manager address" />
+        <EditText android:id="@+id/manager" style="@style/Field" android:inputType="textUri" />
+
+        <TextView style="@style/Label" android:text="Worker token (leave empty unless the server owner gave you one)" />
+        <EditText android:id="@+id/secret" style="@style/Field" android:inputType="textPassword" />
+
+        <Button
+            android:id="@+id/btnBattery"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="Let it keep running in the background" />
+
+        <TextView style="@style/Section" android:text="Log" />
+
+        <TextView
+            android:id="@+id/log"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:background="#11000000"
+            android:fontFamily="monospace"
+            android:padding="8dp"
+            android:textIsSelectable="true"
+            android:textSize="11sp" />
+    </LinearLayout>
+</ScrollView>

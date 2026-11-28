@@ -89,6 +89,14 @@ try:
     except ImportError:
         CHUNK_DURATION_SEC = 300
 
+    # The Android app's APK, offered on the dashboard and at /dl/android when
+    # the file exists (build it with android/ffmpeg/build.sh + gradlew, see
+    # android/README.md, and copy it here).
+    try:
+        from config import ANDROID_APK_FILE
+    except ImportError:
+        ANDROID_APK_FILE = "FractumWorker.apk"
+
     # [SECURITY] When True, worker endpoints require a valid X-Worker-Token
     # (or ?token=). Requests with NO token are rejected, not waved through.
     # Regular workers already send the token, so they are unaffected.
@@ -3358,6 +3366,15 @@ def download_worker_signature():
     if not os.path.exists(sig):
         return abort(404)
     return send_file(os.path.abspath(sig), mimetype='text/plain')
+
+@app.route('/dl/android', methods=['GET', 'HEAD'])
+def download_android_app():
+    """The Android worker app (a sideloaded APK), when the server has one."""
+    path = os.path.abspath(ANDROID_APK_FILE)
+    if not os.path.isfile(path):
+        return abort(404)
+    return send_file(path, mimetype='application/vnd.android.package-archive',
+                     as_attachment=True, download_name='FractumWorker.apk')
 
 # [ADDED] Route to serve the watermark font to workers
 @app.route('/dl/font')

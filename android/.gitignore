@@ -1,0 +1,8 @@
+.gradle/
+build/
+app/build/
+local.properties
+*.keystore
+*.jks
+# Built by ffmpeg/build.sh (about 50 MB); not kept in git
+app/src/main/jniLibs/
