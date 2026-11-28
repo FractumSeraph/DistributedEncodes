@@ -228,6 +228,7 @@ class WorkerService : Service() {
                 else -> "Running"
             }
             updateNotification(text)
+            Updater.maybeCheck(this@WorkerService)
             handler.postDelayed(this, 5000)
         }
     }

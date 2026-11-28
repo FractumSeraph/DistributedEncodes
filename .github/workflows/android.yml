@@ -1,0 +1,126 @@
+# Builds the Android app and publishes it as a GitHub release, which the app's
+# updater (android/app/src/main/java/net/fractumseraph/worker/Updater.kt)
+# checks: it downloads releases/latest/download/update.json and, when the
+# versionCode there is higher than its own, FractumWorker.apk.
+#
+# Publishing needs the app signing key as repository secrets (Settings ->
+# Secrets and variables -> Actions): ANDROID_KEYSTORE_B64 (the .jks file,
+# base64), ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD.
+# Android installs an update only when it is signed with the same key as the
+# installed app, so every release must use that one key. Without the secrets
+# the APK is still built (debug key) and kept as a workflow artifact, but no
+# release is made.
+name: Android app
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "android/**"
+      - "worker_template.py"
+      - ".github/workflows/android.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-app
+  cancel-in-progress: false
+
+env:
+  NDK_VERSION: "28.2.13676358"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # Chaquopy builds with a Python of the app's version (3.11).
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Version numbers
+        id: ver
+        run: |
+          # Above every hand-made build so far (versionCode 1-4).
+          CODE=$((100 + GITHUB_RUN_NUMBER))
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+          echo "name=1.2.$CODE" >> "$GITHUB_OUTPUT"
+
+      - name: FFmpeg build cache
+        id: ffcache
+        uses: actions/cache@v4
+        with:
+          path: android/app/src/main/jniLibs
+          key: android-ffmpeg-${{ env.NDK_VERSION }}-${{ hashFiles('android/ffmpeg/build.sh') }}
+
+      - name: Install the NDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$NDK_VERSION" "platforms;android-35" "build-tools;35.0.0" > /dev/null
+          echo "sdk.dir=$ANDROID_HOME" > android/local.properties
+
+      - name: Build FFmpeg (only when build.sh changed)
+        if: steps.ffcache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q ninja-build nasm pkg-config
+          ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$NDK_VERSION" android/ffmpeg/build.sh "$RUNNER_TEMP/ffbuild"
+
+      - name: Signing key
+        id: key
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            echo "path=$RUNNER_TEMP/release.jks" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::No ANDROID_KEYSTORE_B64 secret: building with a debug key, not publishing a release."
+          fi
+
+      - name: Build the APK
+        working-directory: android
+        env:
+          FRACTUM_VERSION_CODE: ${{ steps.ver.outputs.code }}
+          FRACTUM_VERSION_NAME: ${{ steps.ver.outputs.name }}
+          FRACTUM_KEYSTORE: ${{ steps.key.outputs.path }}
+          FRACTUM_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          FRACTUM_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          FRACTUM_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          [ -n "$FRACTUM_KEYSTORE" ] || unset FRACTUM_KEYSTORE
+          ./gradlew assembleRelease --console=plain --no-daemon
+          cp app/build/outputs/apk/release/app-release.apk "$RUNNER_TEMP/FractumWorker.apk"
+          SHA=$(sha256sum "$RUNNER_TEMP/FractumWorker.apk" | cut -d' ' -f1)
+          printf '{"versionCode": %s, "versionName": "%s", "sha256": "%s", "apk": "%s"}\n' \
+            "$FRACTUM_VERSION_CODE" "$FRACTUM_VERSION_NAME" "$SHA" \
+            "https://github.com/${GITHUB_REPOSITORY}/releases/download/android-v${FRACTUM_VERSION_NAME}/FractumWorker.apk" \
+            > "$RUNNER_TEMP/update.json"
+          cat "$RUNNER_TEMP/update.json"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FractumWorker-${{ steps.ver.outputs.name }}
+          path: |
+            ${{ runner.temp }}/FractumWorker.apk
+            ${{ runner.temp }}/update.json
+
+      - name: Publish the release
+        if: steps.key.outputs.path != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NAME: ${{ steps.ver.outputs.name }}
+        run: |
+          gh release create "android-v$NAME" \
+            "$RUNNER_TEMP/FractumWorker.apk" "$RUNNER_TEMP/update.json" \
+            --title "Android app $NAME" --latest \
+            --notes "Fractum Worker for Android $NAME (64-bit ARM, Android 7+), built from ${GITHUB_SHA::7}. Installed apps update themselves; to install it fresh, download FractumWorker.apk below."

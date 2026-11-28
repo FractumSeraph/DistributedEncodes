@@ -3,129 +3,232 @@
     android:id="@+id/scroll"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
+    android:clipToPadding="false"
     android:fillViewport="true">
 
     <LinearLayout
+        android:id="@+id/content"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:orientation="vertical"
-        android:padding="16dp">
+        android:padding="14dp">
 
+        <!-- Header, like the dashboard's -->
         <TextView
-            android:id="@+id/status"
+            android:id="@+id/title"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:textSize="18sp"
+            android:text="Fractum Encoder"
+            android:textAllCaps="true"
+            android:textColor="@color/neon_pink"
+            android:textSize="24sp"
             android:textStyle="bold"
-            android:text="Stopped" />
+            android:letterSpacing="0.08"
+            android:shadowColor="@color/neon_pink"
+            android:shadowRadius="10" />
 
         <TextView
-            android:id="@+id/statusDetail"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="4dp"
-            android:textSize="14sp" />
+            android:id="@+id/subtitle"
+            style="@style/Hint"
+            android:layout_marginTop="2dp"
+            android:text="Android worker" />
 
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
-            android:orientation="horizontal">
+        <!-- ===== Status ===== -->
+        <LinearLayout style="@style/Panel">
+            <TextView style="@style/PanelTitle" android:text=":: This device" />
 
-            <Button
-                android:id="@+id/btnStart"
-                android:layout_width="0dp"
+            <TextView
+                android:id="@+id/status"
+                android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:text="Start" />
+                android:textColor="@color/neon_purple"
+                android:shadowColor="@color/neon_purple"
+                android:shadowRadius="6"
+                android:textSize="18sp"
+                android:textStyle="bold"
+                android:text="Stopped" />
 
-            <Button
-                android:id="@+id/btnFinish"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:text="Finish &amp; stop" />
+            <TextView
+                android:id="@+id/job"
+                style="@style/Hint"
+                android:layout_marginTop="6dp"
+                android:ellipsize="middle"
+                android:singleLine="true" />
 
-            <Button
-                android:id="@+id/btnAbort"
-                android:layout_width="0dp"
+            <ProgressBar
+                android:id="@+id/progress"
+                style="@android:style/Widget.ProgressBar.Horizontal"
+                android:layout_width="match_parent"
+                android:layout_height="8dp"
+                android:layout_marginTop="6dp"
+                android:max="100"
+                android:progressDrawable="@drawable/progress"
+                android:visibility="gone" />
+
+            <TextView
+                android:id="@+id/statusDetail"
+                style="@style/Hint"
+                android:layout_marginTop="6dp" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:text="Stop now" />
+                android:layout_marginTop="12dp"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/btnStart"
+                    style="@style/NeonButton"
+                    android:layout_width="0dp"
+                    android:layout_weight="1"
+                    android:text="Start" />
+
+                <Button
+                    android:id="@+id/btnFinish"
+                    style="@style/NeonButton"
+                    android:layout_width="0dp"
+                    android:layout_weight="1"
+                    android:layout_marginLeft="8dp"
+                    android:text="Finish" />
+
+                <Button
+                    android:id="@+id/btnAbort"
+                    style="@style/NeonButton"
+                    android:layout_width="0dp"
+                    android:layout_weight="1"
+                    android:layout_marginLeft="8dp"
+                    android:text="Stop now" />
+            </LinearLayout>
+
+            <TextView
+                android:id="@+id/updateInfo"
+                style="@style/Hint"
+                android:layout_marginTop="10dp" />
         </LinearLayout>
 
-        <TextView style="@style/Section" android:text="Account" />
+        <!-- ===== Live numbers from the site (/api/stats) ===== -->
+        <LinearLayout style="@style/Panel">
+            <TextView style="@style/PanelTitle" android:text=":: Network" />
 
-        <TextView style="@style/Label" android:text="Your name (shown on the scoreboard)" />
-        <EditText android:id="@+id/username" style="@style/Field" android:inputType="text" />
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+                <LinearLayout style="@style/KpiBox">
+                    <TextView android:id="@+id/kpiDone" style="@style/KpiValue" android:text="-" />
+                    <TextView style="@style/KpiLabel" android:text="Completed" />
+                </LinearLayout>
+                <LinearLayout style="@style/KpiBox" android:layout_marginLeft="6dp">
+                    <TextView android:id="@+id/kpiQueue" style="@style/KpiValue" android:text="-" />
+                    <TextView style="@style/KpiLabel" android:text="Queued" />
+                </LinearLayout>
+                <LinearLayout style="@style/KpiBox" android:layout_marginLeft="6dp">
+                    <TextView android:id="@+id/kpiActive" style="@style/KpiValue" android:text="-" />
+                    <TextView style="@style/KpiLabel" android:text="Encoding" />
+                </LinearLayout>
+                <LinearLayout style="@style/KpiBox" android:layout_marginLeft="6dp">
+                    <TextView android:id="@+id/kpi24h" style="@style/KpiValue" android:text="-" />
+                    <TextView style="@style/KpiLabel" android:text="Last 24h" />
+                </LinearLayout>
+            </LinearLayout>
 
-        <TextView style="@style/Label" android:text="This device's name" />
-        <EditText android:id="@+id/workerName" style="@style/Field" android:inputType="text" />
+            <TextView
+                android:id="@+id/you"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:textColor="@color/neon_green"
+                android:textSize="13sp" />
 
-        <TextView style="@style/Label" android:text="FractumCoin wallet (optional)" />
-        <EditText android:id="@+id/wallet" style="@style/Field" android:inputType="text" />
+            <TextView style="@style/Label" android:text="Leaderboard" />
+            <TextView
+                android:id="@+id/leaderboard"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:textColor="@color/text_light"
+                android:textSize="12sp" />
 
-        <TextView style="@style/Section" android:text="When to work" />
+            <TextView style="@style/Label" android:text="Encoding now" />
+            <TextView
+                android:id="@+id/activeList"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:textColor="@color/text_dim"
+                android:textSize="12sp" />
+        </LinearLayout>
 
-        <CheckBox
-            android:id="@+id/autoStart"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="Work automatically: whenever the conditions below are met, also after a restart" />
+        <!-- ===== Settings ===== -->
+        <LinearLayout style="@style/Panel">
+            <TextView style="@style/PanelTitle" android:text=":: Settings" />
 
-        <TextView
-            style="@style/Label"
-            android:layout_marginTop="0dp"
-            android:text="The app then waits in the background (a small notification stays) and starts encoding by itself when you plug in on Wi-Fi. Allow background running below so Android does not stop it." />
+            <TextView style="@style/Label" android:layout_marginTop="0dp" android:text="Your name (scoreboard)" />
+            <EditText android:id="@+id/username" style="@style/Field" android:inputType="text" android:hint="e.g. FractumSeraph" />
 
-        <CheckBox
-            android:id="@+id/chargingOnly"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="Only while charging" />
+            <TextView style="@style/Label" android:text="This device's name" />
+            <EditText android:id="@+id/workerName" style="@style/Field" android:inputType="text" />
 
-        <CheckBox
-            android:id="@+id/wifiOnly"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="Only on Wi-Fi (unmetered networks)" />
+            <TextView style="@style/Label" android:text="FractumCoin wallet (optional)" />
+            <EditText android:id="@+id/wallet" style="@style/Field" android:inputType="text" />
 
-        <TextView style="@style/Label" android:text="Pause above this battery temperature (°C)" />
-        <EditText android:id="@+id/maxTemp" style="@style/Field" android:inputType="number" />
+            <CheckBox
+                android:id="@+id/autoStart"
+                style="@style/Check"
+                android:layout_marginTop="14dp"
+                android:text="Work automatically: whenever the conditions below are met, also after a restart" />
+            <TextView
+                style="@style/Hint"
+                android:text="It then waits in the background (a small notification stays) and starts by itself when the device is plugged in on Wi-Fi." />
 
-        <TextView style="@style/Section" android:text="Work" />
+            <CheckBox android:id="@+id/chargingOnly" style="@style/Check" android:text="Only while charging" />
+            <CheckBox android:id="@+id/wifiOnly" style="@style/Check" android:text="Only on Wi-Fi (unmetered networks)" />
 
-        <TextView style="@style/Label" android:text="Encodes at once (1 is best for most tablets)" />
-        <EditText android:id="@+id/jobs" style="@style/Field" android:inputType="number" />
+            <TextView style="@style/Label" android:text="Pause above battery temperature (°C)" />
+            <EditText android:id="@+id/maxTemp" style="@style/Field" android:inputType="number" />
 
-        <TextView style="@style/Label" android:text="Skip whole files larger than (MB, 0 = no limit)" />
-        <EditText android:id="@+id/maxSize" style="@style/Field" android:inputType="number" />
+            <TextView style="@style/Label" android:text="Encodes at once (1 suits most tablets)" />
+            <EditText android:id="@+id/jobs" style="@style/Field" android:inputType="number" />
 
-        <TextView style="@style/Section" android:text="Server" />
+            <TextView style="@style/Label" android:text="Skip whole files larger than (MB, 0 = no limit)" />
+            <EditText android:id="@+id/maxSize" style="@style/Field" android:inputType="number" />
 
-        <TextView style="@style/Label" android:text="Manager address" />
-        <EditText android:id="@+id/manager" style="@style/Field" android:inputType="textUri" />
+            <CheckBox android:id="@+id/autoUpdate" style="@style/Check" android:layout_marginTop="14dp"
+                android:text="Update the app automatically (never in the middle of an encode)" />
 
-        <TextView style="@style/Label" android:text="Worker token (leave empty unless the server owner gave you one)" />
-        <EditText android:id="@+id/secret" style="@style/Field" android:inputType="textPassword" />
+            <TextView style="@style/Label" android:text="Manager address" />
+            <EditText android:id="@+id/manager" style="@style/Field" android:inputType="textUri" />
 
-        <Button
-            android:id="@+id/btnBattery"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
-            android:text="Let it keep running in the background" />
+            <TextView style="@style/Label" android:text="Worker token (only if the server owner gave you one)" />
+            <EditText android:id="@+id/secret" style="@style/Field" android:inputType="textPassword" />
 
-        <TextView style="@style/Section" android:text="Log" />
+            <Button
+                android:id="@+id/btnBattery"
+                style="@style/NeonButton"
+                android:layout_width="match_parent"
+                android:layout_marginTop="16dp"
+                android:text="Let it keep running in the background" />
 
-        <TextView
-            android:id="@+id/log"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:background="#11000000"
-            android:fontFamily="monospace"
-            android:padding="8dp"
-            android:textIsSelectable="true"
-            android:textSize="11sp" />
+            <Button
+                android:id="@+id/btnUpdate"
+                style="@style/NeonButton"
+                android:layout_width="match_parent"
+                android:layout_marginTop="10dp"
+                android:text="Check for app update" />
+        </LinearLayout>
+
+        <!-- ===== Log ===== -->
+        <LinearLayout style="@style/Panel">
+            <TextView style="@style/PanelTitle" android:text=":: Log" />
+            <TextView
+                android:id="@+id/log"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:background="#FF000000"
+                android:padding="8dp"
+                android:textColor="@color/neon_green"
+                android:textIsSelectable="true"
+                android:textSize="10sp" />
+        </LinearLayout>
     </LinearLayout>
 </ScrollView>

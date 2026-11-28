@@ -15,7 +15,9 @@ class BootReceiver : BroadcastReceiver() {
         when (intent.action) {
             Intent.ACTION_BOOT_COMPLETED, Intent.ACTION_MY_PACKAGE_REPLACED -> {
                 val settings = Settings(context)
-                if (settings.autoStart && settings.username.isNotBlank()) {
+                // After an app update, also resume a worker the user had started by hand.
+                val resume = intent.action == Intent.ACTION_MY_PACKAGE_REPLACED && settings.wantRunning
+                if ((settings.autoStart || resume) && settings.username.isNotBlank()) {
                     try {
                         WorkerService.start(context)
                     } catch (_: Exception) {

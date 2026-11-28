@@ -22,8 +22,11 @@ android {
         applicationId = "net.fractumseraph.worker"
         minSdk = 24
         targetSdk = 35
-        versionCode = 3
-        versionName = "1.1.1"
+        // CI (.github/workflows/android.yml) sets these so every published
+        // build has a higher versionCode, which is what the app's updater
+        // compares. Local builds use the defaults.
+        versionCode = (System.getenv("FRACTUM_VERSION_CODE") ?: "4").toInt()
+        versionName = System.getenv("FRACTUM_VERSION_NAME") ?: "1.2.0"
         ndk { abiFilters += listOf("arm64-v8a") }
     }
 
