@@ -573,7 +573,9 @@ snapshots print a warning (unreleased builds have produced broken uploads).
 
 ### Signed worker updates (worker 3.17.0+)
 
-Workers install a new `worker.py` from the manager only when it is **signed by the project owner's key** and is **newer** than the one running. The signing key never lives on the manager server, so someone who breaks into the server, or into the git checkout it serves from, cannot push code onto volunteers' machines: workers refuse the update, keep running their current version, and say why.
+> **Not enforced yet (worker 3.17.1+).** Workers check a signature when the manager has one and say what they found, but still install unsigned updates. Enforcement is switched on later with `ENFORCE_UPDATE_SIGNATURES = True` in `worker_template.py`, once every release is being signed. Workers that already run **3.17.0** do enforce: they accept 3.17.1 only once it is signed (one `ssh-keygen` run, below), or after `worker.py` is downloaded again by hand.
+
+When enforced, workers install a new `worker.py` from the manager only when it is **signed by the project owner's key** and is **newer** than the one running. The signing key never lives on the manager server, so someone who breaks into the server, or into the git checkout it serves from, cannot push code onto volunteers' machines: workers refuse the update, keep running their current version, and say why.
 
 - The trusted public key(s) are built into the worker (`UPDATE_SIGNING_KEYS` in `worker_template.py`, Ed25519 only, checked in pure Python with no extra package). Add a second, backup key there while you still can sign: if the only private key is lost, workers can only be updated by reinstalling them.
 - The signature is an ordinary OpenSSH signature, kept next to the script as `worker_template.py.sig` and served at `/dl/worker.sig`. If the manager fills a custom `WORKER_SECRET` into the script it serves, workers undo that one line before checking, so one signature works for every manager.

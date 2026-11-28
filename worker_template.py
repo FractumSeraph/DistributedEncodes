@@ -138,7 +138,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.17.0"
+WORKER_VERSION = "3.17.1"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -1073,6 +1073,12 @@ UPDATE_SIGNING_KEYS = [
     "AAAAC3NzaC1lZDI1NTE5AAAAIHH/vpS1Q+KoSPBObtdZYEztRqC8Nppg/mkkTsBQGG7c",  # FractumEncodes
 ]
 UPDATE_SIG_NAMESPACE = "fractum-worker"
+# While False, a signature is checked when the manager has one and the result
+# is shown, but an update without a valid signature is still installed (as
+# before 3.17.0). Set True once every release is being signed. A worker that
+# enforces cannot be moved back by an unsigned update, so turning this on is
+# a one-way door for the workers that run it.
+ENFORCE_UPDATE_SIGNATURES = False
 
 # Ed25519 verification (RFC 8032), pure Python so no extra package is needed.
 _ED_P = 2 ** 255 - 19
@@ -1213,7 +1219,15 @@ def _version_tuple(v):
         return None
 
 def _verify_update(manager_url, body, new_version):
-    """(ok, reason): may this downloaded script replace the running one?"""
+    """(ok, reason): may this downloaded script replace the running one?
+    Without ENFORCE_UPDATE_SIGNATURES the answer is always yes; reason then
+    says what the signature check found."""
+    ok, why = _check_update_signature(manager_url, body, new_version)
+    if ENFORCE_UPDATE_SIGNATURES or ok:
+        return ok, why
+    return True, f"installed without a valid signature ({why}); signatures are not enforced yet"
+
+def _check_update_signature(manager_url, body, new_version):
     nv, cv = _version_tuple(new_version), _version_tuple(WORKER_VERSION)
     if nv is None or cv is None or nv <= cv:
         return False, f"{new_version} is not newer than {WORKER_VERSION}"
@@ -1257,7 +1271,7 @@ def install_update_file(path, manager_url):
         except OSError: pass
         return 1
     os.replace(path, target)
-    print(f"[*] Installed worker {new_version} (signature OK).")
+    print(f"[*] Installed worker {new_version} ({why or 'signature OK'}).")
     return 0
 
 def check_version(manager_url):
@@ -1281,6 +1295,8 @@ def check_version(manager_url):
                 safe_print(f"[!] Update {new_version} offered by the manager is incomplete or invalid. Ignoring it.")
                 return False
             ok, why = _verify_update(manager_url, body, new_version)
+            if ok and why:
+                safe_print(f"[*] Worker {new_version}: {why}")
             if not ok:
                 if new_version not in _ANNOUNCED_UPDATES:
                     _ANNOUNCED_UPDATES.add(new_version)
