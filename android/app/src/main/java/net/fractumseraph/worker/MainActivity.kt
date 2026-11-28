@@ -54,6 +54,14 @@ class MainActivity : Activity() {
         bindText(R.id.maxTemp, settings.maxTempC.toString()) { settings.maxTempC = it.toIntOrNull() ?: 40 }
         bindCheck(R.id.chargingOnly, settings.chargingOnly) { settings.chargingOnly = it }
         bindCheck(R.id.wifiOnly, settings.wifiOnly) { settings.wifiOnly = it }
+        findViewById<CheckBox>(R.id.autoStart).apply {
+            isChecked = settings.autoStart
+            setOnCheckedChangeListener { _, v ->
+                settings.autoStart = v
+                // Turning it on starts waiting right away, not just after a restart.
+                if (v && !settings.wantRunning) startWorker()
+            }
+        }
 
         btnStart.setOnClickListener { startWorker() }
         btnFinish.setOnClickListener { WorkerService.send(this, WorkerService.ACTION_FINISH) }
@@ -132,6 +140,7 @@ class MainActivity : Activity() {
                 running && pause != null -> "Paused: $pause"
                 running -> "Running"
                 settings.wantRunning && pause != null -> "Waiting: $pause"
+                settings.autoStart -> "Stopped (auto-start is on: it starts again after a restart, or press Start)"
                 else -> "Stopped"
             }
             val detail = StringBuilder()
@@ -139,6 +148,10 @@ class MainActivity : Activity() {
             if (running && state.optString("job").isNotEmpty()) detail.append("\n").append(state.optString("job"))
             if (running && state.optString("status").isNotEmpty()) detail.append("\n").append(state.optString("status"))
             if (state.optString("error").isNotEmpty()) detail.append("\n").append(state.optString("error"))
+            if (settings.autoStart &&
+                !(getSystemService(POWER_SERVICE) as PowerManager).isIgnoringBatteryOptimizations(packageName)) {
+                detail.append("\nTap \"Let it keep running in the background\" so Android lets auto-start work.")
+            }
             statusDetail.text = detail.toString().trim()
             val busy = running || settings.wantRunning
             btnStart.isEnabled = !busy
