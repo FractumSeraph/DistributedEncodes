@@ -138,7 +138,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.18.0"
+WORKER_VERSION = "3.18.1"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -1230,8 +1230,14 @@ def _version_tuple(v):
 
 def _verify_update(manager_url, body, new_version):
     """(ok, reason): may this downloaded script replace the running one?
-    Without ENFORCE_UPDATE_SIGNATURES the answer is always yes; reason then
-    says what the signature check found."""
+    Never an older version (a manager serving an old script, e.g. one not
+    updated yet, would otherwise downgrade every worker, and the Android app
+    cannot run scripts older than 3.18.0). Otherwise, without
+    ENFORCE_UPDATE_SIGNATURES the answer is yes; reason then says what the
+    signature check found."""
+    nv, cv = _version_tuple(new_version), _version_tuple(WORKER_VERSION)
+    if nv is None or cv is None or nv <= cv:
+        return False, f"{new_version} is not newer than {WORKER_VERSION} (the manager serves an older worker)"
     ok, why = _check_update_signature(manager_url, body, new_version)
     if ENFORCE_UPDATE_SIGNATURES or ok:
         return ok, why
@@ -1311,7 +1317,8 @@ def check_version(manager_url):
                 if new_version not in _ANNOUNCED_UPDATES:
                     _ANNOUNCED_UPDATES.add(new_version)
                     safe_print(f"[!] NOT installing worker {new_version} from the manager: {why}. "
-                               f"Staying on {WORKER_VERSION}. (Updates must be signed by the project's key.)")
+                               f"Staying on {WORKER_VERSION}."
+                               + (" (Updates must be signed by the project's key.)" if ENFORCE_UPDATE_SIGNATURES else ""))
                 return False
             if NO_AUTO_UPDATE:
                 if new_version not in _ANNOUNCED_UPDATES:
