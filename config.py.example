@@ -89,6 +89,9 @@ COMPLETED_DIRECTORY = "./completed_media"
 REMOTE_SOURCE_URL = None
 
 WORKER_TEMPLATE_FILE = "worker_template.py"
+# The Android app (APK) offered on the dashboard and at /dl/android. The
+# section is hidden while this file does not exist. See android/README.md.
+ANDROID_APK_FILE = "FractumWorker.apk"
 VIDEO_EXTENSIONS = ('.mkv', '.mp4', '.avi', '.mov')
 
 # ==============================================================================

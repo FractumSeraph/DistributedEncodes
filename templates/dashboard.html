@@ -316,6 +316,22 @@
                 <div style="text-align: center; margin-top: 30px;">
                     <a href="/dl/worker" target="_blank" class="modal-btn">DOWNLOAD WORKER.PY</a>
                 </div>
+                <!-- Android app: shown only when the server has the APK. -->
+                <div class="os-section" id="android-section" style="margin-top: 30px; display: none;">
+                    <span class="os-title">:: ANDROID TABLETS &amp; PHONES (APP)</span>
+                    The worker as an Android app (64-bit devices, Android 7 or newer). It encodes
+                    natively, much faster than the browser option, keeps working with the screen off,
+                    and by default only works while the device is charging, on Wi-Fi and not too warm.
+                    Install the downloaded file (allow installing from your browser when Android asks).
+                    <div style="text-align: center; margin-top: 12px;">
+                        <a href="/dl/android" class="modal-btn">DOWNLOAD THE ANDROID APP</a>
+                    </div>
+                </div>
+                <script>
+                    fetch('/dl/android', {method: 'HEAD'}).then(function (r) {
+                        if (r.ok) document.getElementById('android-section').style.display = '';
+                    }).catch(function () {});
+                </script>
                 <!-- Browser worker: offered last and described as the slower
                      option on purpose. The installed app is several times
                      faster, so it is what volunteers should use if they can. -->

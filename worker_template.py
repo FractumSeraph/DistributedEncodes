@@ -138,7 +138,7 @@ except ImportError as _e:
 DEFAULT_MANAGER_URL = "https://encode.fractumseraph.net/"
 DEFAULT_USERNAME = "Anonymous"
 DEFAULT_WORKERNAME = f"Node-{int(time.time())}"
-WORKER_VERSION = "3.17.1"
+WORKER_VERSION = "3.18.0"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "DefaultInsecureSecret")
 
 SHUTDOWN_EVENT = threading.Event()
@@ -146,6 +146,16 @@ SHUTDOWN_EVENT = threading.Event()
 # SHUTDOWN_EVENT alone the worker is draining: active work is allowed to finish.
 ABORT_EVENT = threading.Event()
 UPDATE_AVAILABLE = False
+# Set by a host app that runs the worker inside its own process (the Android
+# app): no self-restart via execv (the app reloads the script instead), no
+# keyboard pause menu (the app pauses and resumes), no signal handlers.
+EMBEDDED = False
+# Android (the app, or Python in Termux): no BtbN FFmpeg build runs there.
+IS_ANDROID = hasattr(sys, 'getandroidapilevel') or 'ANDROID_ROOT' in os.environ
+
+class RestartForUpdate(Exception):
+    """Raised instead of os.execv in EMBEDDED mode once a new script has been
+    written: the host app loads it and starts again."""
 NO_AUTO_UPDATE = False       # --no-auto-update: announce new versions, never install them
 _ANNOUNCED_UPDATES = set()
 LAST_UPDATE_CHECK = 0
@@ -1340,6 +1350,8 @@ def apply_update(manager_url):
         os.environ[_UPDATE_FAILED_ENV] = str(version)
         safe_print("[*] Continuing on the current version.")
     safe_print("[*] Restarting worker...")
+    if EMBEDDED:
+        raise RestartForUpdate(version)
     try:
         os.execv(sys.executable, [sys.executable] + sys.argv)
     except Exception as e:
@@ -2251,6 +2263,8 @@ def _ffmpeg_platform_tag():
     """(platform_tag, archive_ext) for BtbN asset names, or (None, None) when
     BtbN has no build for this OS/CPU (macOS, 32-bit, other architectures)."""
     system = platform.system()
+    if IS_ANDROID:
+        return None, None
     if system == "Windows":
         arch = _windows_native_arch()
         if arch == 'arm64': return "winarm64", "zip"
@@ -2866,6 +2880,8 @@ def _sibling_ffprobe(ffmpeg_path):
                 return p
     return "ffprobe"
 
+FFPROBE_OVERRIDE = None   # --ffprobe PATH (with --ffmpeg), for binaries not named ffprobe
+
 def check_ffmpeg(override=None, manager_url=None):
     """Pick the FFmpeg to use at start. Returns True when _ffmpeg_update_loop()
     should run: on the worker's own managed build (kept current) or on a
@@ -2894,6 +2910,8 @@ def check_ffmpeg(override=None, manager_url=None):
             sys.exit(1)
         FFMPEG_CMD = os.path.abspath(cmd) if os.path.exists(cmd) else cmd
         FFPROBE_CMD = _sibling_ffprobe(FFMPEG_CMD)
+        if FFPROBE_OVERRIDE:
+            FFPROBE_CMD = FFPROBE_OVERRIDE
         print(f"[*] Using the FFmpeg chosen with --ffmpeg: {FFMPEG_CMD}")
         _FFMPEG_ORIGIN = "override"
         return False
@@ -4862,8 +4880,9 @@ def run_worker(args):
     if num_jobs > 32: num_jobs = 32
     ENC_USAGE["slots"] = num_jobs
     
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+    if not EMBEDDED:
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
     
     threads = []
     worker_ids = []
@@ -4994,6 +5013,14 @@ def run_worker(args):
         # the end of it ("[1: Idle] [2: Idle]Fractum Worker v...").
         safe_print(f"Fractum Worker v{WORKER_VERSION} — TUI disabled ({_tui_reason})")
         while True:
+            if EMBEDDED and PAUSE_REQUESTED:
+                # The host app paused us (embedded_pause) and resumes us;
+                # there is no keyboard here to ask.
+                if SHUTDOWN_EVENT.is_set() and ABORT_EVENT.is_set():
+                    _grace_join(threads, 8)
+                    break
+                time.sleep(0.5)
+                continue
             if not PAUSE_REQUESTED:
                 all_dead = True
                 for t in threads:
@@ -5105,7 +5132,29 @@ def run_worker(args):
         time.sleep(1)  # let the OS reap terminated ffmpeg children
         apply_update(manager_url)
 
-if __name__ == "__main__":
+def embedded_pause():
+    """Host app: stop taking new work and freeze running encodes (as the
+    keyboard pause does). Leases stay with this worker."""
+    global PAUSE_REQUESTED
+    PAUSE_REQUESTED = True
+    toggle_processes(suspend=True)
+
+def embedded_resume():
+    global PAUSE_REQUESTED
+    toggle_processes(suspend=False)
+    PAUSE_REQUESTED = False
+
+def embedded_stop(abort=False):
+    """Host app: finish the work in hand and stop (abort=True: stop now and
+    hand the work back)."""
+    global PAUSE_REQUESTED
+    if PAUSE_REQUESTED:
+        embedded_resume()
+    SHUTDOWN_EVENT.set()
+    if abort:
+        kill_processes()
+
+def build_arg_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--manager", default=DEFAULT_MANAGER_URL)
     parser.add_argument("--username", default=DEFAULT_USERNAME)
@@ -5137,9 +5186,17 @@ if __name__ == "__main__":
                         help="FractumCoin wallet address. Every verified upload is credited to "
                              "this address on the manager so encoding rewards can be paid out. "
                              "Saved to worker_config.json after first use.")
-    args = parser.parse_args()
+    parser.add_argument("--ffprobe", default=None, metavar="PATH",
+                        help="With --ffmpeg: the ffprobe to use when it is not next to that ffmpeg "
+                             "or not named ffprobe.")
+    return parser
+
+if __name__ == "__main__":
+    args = build_arg_parser().parse_args()
     if args.install_update:
         if args.secret:
             WORKER_SECRET = args.secret
         sys.exit(install_update_file(args.install_update, (args.manager or DEFAULT_MANAGER_URL)))
+    if args.ffprobe:
+        FFPROBE_OVERRIDE = args.ffprobe
     run_worker(args)

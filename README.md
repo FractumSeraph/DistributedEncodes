@@ -461,6 +461,10 @@ Config: `PAYOUT_TOKEN` (shared secret for the daemon; `None` disables the token 
 
 ---
 
+## Android App
+
+Tablets and phones (64-bit ARM, Android 7+) can run the worker as an app: the same `worker.py`, run inside the app with its own FFmpeg build (SVT-AV1, Opus, HTTPS). It is much faster than the browser worker, keeps working in the background, and by default only works while charging, on Wi-Fi and below 40 °C. The dashboard offers it when `FractumWorker.apk` (or `ANDROID_APK_FILE`) sits next to `manager.py`, served at `/dl/android`. Building and details: [`android/README.md`](android/README.md).
+
 ## Browser Worker (no install)
 
 Volunteers can encode small files directly in their browser — no Python, no FFmpeg install. The manager serves an in-browser node at **`/web`** (linked from the dashboard) that runs a purpose-built FFmpeg WebAssembly bundle with **SVT-AV1 + Opus** compiled in, using the same targets as the native worker (preset 2, CRF 57, 480p, mono Opus).
