@@ -5,6 +5,7 @@ An Android app that runs the regular worker (`worker_template.py`, the same scri
 - **Much faster than the browser worker.** Native ARM code with NEON/SVE instead of WebAssembly. No 4 GB memory limit, and sources are streamed from the server like on a PC.
 - **Runs in the background** as a foreground service with a notification, with the screen off, and keeps the CPU and Wi-Fi awake while it works.
 - **Device-friendly by default.** It works only while charging, only on Wi-Fi (unmetered networks), and pauses above 40 °C battery temperature (resuming 3 °C lower). All three can be changed in the app. Pausing freezes the encode, and it continues where it stopped.
+- **Can work fully automatically.** With *Work automatically* ticked, the app starts when the device boots (and after app updates) and waits in the background, holding no wake lock, until the device is charging on Wi-Fi. Then it encodes by itself, every time it is plugged in. If it stays paused for more than 30 minutes (unplugged in the morning, say), it hands the unfinished work back to the server, so nothing waits half-done for hours, and it takes fresh work the next time.
 - **Same rules as every worker.** It updates itself from the manager, uses the same encoding settings, and shows on the dashboard as `<name>-<device>`.
 
 Requirements: a 64-bit ARM device (`arm64-v8a`) running Android 7.0 (API 24) or newer. Encoding at preset 2 is heavy: expect a 10-minute chunk to take hours on a tablet, and run one encode at a time unless the device has many fast cores.
@@ -14,7 +15,7 @@ Requirements: a 64-bit ARM device (`arm64-v8a`) running Android 7.0 (API 24) or 
 1. Install the APK (from the manager's dashboard, `/dl/android`, when the server has one). Android asks to allow installing apps from your browser the first time.
 2. Enter your name (shown on the scoreboard) and, if you like, a device name and FractumCoin wallet.
 3. Press **Let it keep running in the background** once and allow it. Without this, some manufacturers' battery savers stop the app after a while.
-4. Press **Start**. The notification shows what it is doing. **Finish & stop** completes the work in hand first (this can take a while). **Stop now** hands it back to the server straight away.
+4. Either tick **Work automatically** (it then runs whenever it is charging on Wi-Fi, also after a restart; a small notification stays while it waits), or press **Start** to run it now. The notification shows what it is doing. **Finish & stop** completes the work in hand first (this can take a while). **Stop now** hands it back to the server straight away.
 
 ## How it fits together
 
@@ -22,6 +23,7 @@ Requirements: a 64-bit ARM device (`arm64-v8a`) running Android 7.0 (API 24) or 
 |---|---|
 | `app/src/main/python/android_worker.py` | Loads `worker.py` inside the app (embedded Python, [Chaquopy](https://chaquo.com/chaquopy/)) in *embedded* mode: no `os.execv` self-restart (the driver reloads the script after an update), no keyboard pause menu, and no signal handlers. It also captures the output for the screen and gives FFmpeg its CA bundle. |
 | `app/src/main/java/.../WorkerService.kt` | Foreground service: wake lock and Wi-Fi lock, and the charging, Wi-Fi and temperature rules (it calls the driver's `pause()` and `resume()`, which freeze FFmpeg just like the keyboard pause on a PC). |
+| `app/src/main/java/.../BootReceiver.kt` | With auto-start on, starts the service after boot and after app updates. Android allows a foreground service to be started from these broadcasts. |
 | `app/src/main/java/.../MainActivity.kt` | Settings, start/stop buttons, status, and the live log. |
 | `ffmpeg/build.sh` | Builds `ffmpeg` and `ffprobe` for arm64. |
 | `worker_template.py` (repository root) | Copied into the APK at build time. The app installs it into its files folder, and from then on the worker updates itself from the manager. |

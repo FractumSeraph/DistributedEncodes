@@ -37,6 +37,11 @@ class Settings(context: Context) {
     var maxTempC: Int
         get() = p.getInt("maxTempC", 40)
         set(v) = p.edit().putInt("maxTempC", v.coerceIn(30, 50)).apply()
+    /** Start the service at boot (and after app updates); it then waits for
+     *  the charging / Wi-Fi / temperature conditions by itself. */
+    var autoStart: Boolean
+        get() = p.getBoolean("autoStart", false)
+        set(v) = p.edit().putBoolean("autoStart", v).apply()
     /** The user pressed Start and has not stopped it since. */
     var wantRunning: Boolean
         get() = p.getBoolean("wantRunning", false)

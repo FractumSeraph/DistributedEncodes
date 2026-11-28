@@ -68,6 +68,17 @@
         <TextView style="@style/Section" android:text="When to work" />
 
         <CheckBox
+            android:id="@+id/autoStart"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Work automatically: whenever the conditions below are met, also after a restart" />
+
+        <TextView
+            style="@style/Label"
+            android:layout_marginTop="0dp"
+            android:text="The app then waits in the background (a small notification stays) and starts encoding by itself when you plug in on Wi-Fi. Allow background running below so Android does not stop it." />
+
+        <CheckBox
             android:id="@+id/chargingOnly"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"

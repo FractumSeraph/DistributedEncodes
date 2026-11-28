@@ -22,8 +22,8 @@ android {
         applicationId = "net.fractumseraph.worker"
         minSdk = 24
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.1.0"
         ndk { abiFilters += listOf("arm64-v8a") }
     }
 
