@@ -588,7 +588,7 @@ When enforced, workers install a new `worker.py` from the manager only when it i
 - `launch_worker.ps1` hands each fresh download to the worker already installed (`worker.py --install-update worker.py.new`), which applies the same check. The `/install` one-liners and the Docker image download the worker from the manager every time they start, and the one-liners are themselves served by the manager, so those cannot protect a first install from a compromised server; once installed, every update is checked.
 - Running your own manager with your own changes to the worker? Put your own public key in `UPDATE_SIGNING_KEYS` and sign with it, or start workers with `--no-auto-update`.
 
-**Releasing a worker update** (after the change is merged into `main`), on the machine that holds the private key:
+**Releasing a worker update** (after the change is merged into `main`), on the machine that holds the private key: on Windows, double-click **`sign_worker.bat`** in your clone of the repository (or run `.\sign_worker.ps1 [-KeyFile path]`). It pulls `main`, makes sure `worker_template.py` has Unix line endings, signs it (asking for your key's passphrase), checks the signature against the key built into the worker, then commits and pushes `worker_template.py.sig`. It looks for the key as `FractumEncodes` in `.ssh`, next to the script, in Documents or in Downloads, and asks if it is elsewhere. By hand, anywhere:
 
 ```
 git pull
